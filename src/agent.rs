@@ -8006,6 +8006,7 @@ pub struct AgentSession {
     /// Public handles to retired runtimes must not retain this lease.
     extension_message_fetcher_lifetime: Option<Arc<()>>,
     extension_ai_completion: Arc<StdMutex<ExtensionAiCompletionHostState>>,
+    extension_model_catalog: ExtensionModelCatalog,
     compaction_settings: ResolvedCompactionSettings,
     compaction_runtime: Option<Runtime>,
     /// The advisor runtime (bd-cv653.3.3): Some only when the advisor role
@@ -8662,11 +8663,13 @@ impl ExtensionAiCompletionHostState {
     }
 }
 
-/// Live model selection state shared by extension session adapters. Reading this
-/// handle never acquires the outer AgentSession lock held during a turn.
+/// Live model selection state shared by extension session adapters. Retained
+/// frontend handles follow accepted activations through a stable target. A
+/// candidate runtime owns a private target until its startup succeeds.
+/// Reading this handle never acquires the outer AgentSession lock held during a turn.
 #[derive(Clone)]
 pub(crate) struct ExtensionModelCatalog {
-    state: Arc<StdMutex<ExtensionAiCompletionHostState>>,
+    state: Arc<StdMutex<Arc<StdMutex<ExtensionAiCompletionHostState>>>>,
 }
 
 pub(crate) struct ExtensionModelCatalogSnapshot {
@@ -8678,13 +8681,42 @@ pub(crate) struct ExtensionModelCatalogSnapshot {
 }
 
 impl ExtensionModelCatalog {
+    fn new(state: Arc<StdMutex<ExtensionAiCompletionHostState>>) -> Self {
+        Self {
+            state: Arc::new(StdMutex::new(state)),
+        }
+    }
+
+    /// Publish a completely accepted activation without retaining a retired
+    /// runtime through frontend handles. Replacing this pointer also repairs
+    /// a poisoned pointer lock; the actual catalog state remains fail-closed.
+    fn publish(&self, state: Arc<StdMutex<ExtensionAiCompletionHostState>>) {
+        let retired = {
+            let mut target = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let retired = std::mem::replace(&mut *target, state);
+            self.state.clear_poison();
+            retired
+        };
+        drop(retired);
+    }
+
     pub(crate) fn registry_snapshot(&self) -> Result<Option<Arc<ModelRegistry>>> {
         Ok(self.snapshot()?.registry)
     }
 
     pub(crate) fn snapshot(&self) -> Result<ExtensionModelCatalogSnapshot> {
-        let mut state = self
-            .state
+        // Release the publication lock before consulting the runtime catalog.
+        // Runtime refresh and host-state writers only acquire the inner lock.
+        let state = Arc::clone(
+            &self
+                .state
+                .lock()
+                .map_err(|_| Error::session("setModel: the live model catalog is unavailable"))?,
+        );
+        let mut state = state
             .lock()
             .map_err(|_| Error::session("setModel: the live model catalog is unavailable"))?;
         state.refresh_provider_catalog()?;
@@ -12268,6 +12300,354 @@ mod extensions_integration_tests {
         )
     }
 
+    fn extension_catalog_test_provider(provider: &str, model: &str) -> Value {
+        json!({
+            "id": provider,
+            "api": "openai-completions",
+            "baseUrl": "http://127.0.0.1:1/v1",
+            "apiKey": "catalog-test-key",
+            "models": [{
+                "id": model,
+                "name": model,
+                "input": ["text"],
+                "contextWindow": 4096,
+                "maxTokens": 512,
+            }],
+        })
+    }
+
+    #[test]
+    fn extension_rejected_candidate_preserves_installed_catalog_state() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let installed = temp.path().join("installed-catalog.native.json");
+            std::fs::write(&installed, "{}").expect("installed descriptor");
+            let mut session = extension_activation_test_session(temp.path());
+            session
+                .enable_extensions(&[], temp.path(), None, &[installed])
+                .await
+                .expect("installed activation");
+            let retained = session.extension_model_catalog();
+            let installed_state = Arc::clone(&session.extension_ai_completion);
+            let installed_manager = session.extensions.as_ref().unwrap().manager().clone();
+            installed_manager
+                .register_provider(extension_catalog_test_provider("installed", "chat"));
+            let before = retained.snapshot().expect("live installed catalog");
+            assert!(before.find("installed", "chat").is_some());
+
+            let candidate = temp.path().join("rejected-catalog.native.json");
+            std::fs::write(
+                &candidate,
+                json!({
+                    "providers": [extension_catalog_test_provider("rejected", "chat")],
+                    "flags": [{"name": "candidate-enabled", "type": "boolean", "default": false}],
+                })
+                .to_string(),
+            )
+            .expect("candidate descriptor");
+            let error = session
+                .enable_extensions_with_policy(
+                    &[],
+                    temp.path(),
+                    None,
+                    &[candidate],
+                    None,
+                    None,
+                    None,
+                    ExtensionHostConfiguration {
+                        cli_flags: vec![crate::cli::ExtensionCliFlag {
+                            name: "candidate-enabled".to_string(),
+                            value: Some("invalid".to_string()),
+                        }],
+                        ..ExtensionHostConfiguration::default()
+                    },
+                )
+                .await
+                .expect_err("reject malformed registered flag");
+            assert!(error.to_string().contains("Invalid boolean value"));
+            assert!(Arc::ptr_eq(&installed_state, &session.extension_ai_completion));
+            {
+                // Inspect before a read refresh could hide an early reset.
+                let state = installed_state.lock().expect("installed state");
+                assert!(Arc::ptr_eq(
+                    before.registry.as_ref().unwrap(),
+                    state.compaction_models.registry.as_ref().unwrap(),
+                ));
+                assert_eq!(
+                    state.compaction_models.provider_revision,
+                    before.extension_revision,
+                );
+                assert!(state
+                    .compaction_models
+                    .provider_manager
+                    .same_manager(&installed_manager.handle()));
+            }
+            let visible = retained.snapshot().expect("retained frontend catalog");
+            assert!(visible.find("installed", "chat").is_some());
+            assert!(visible.find("rejected", "chat").is_none());
+        }));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn extension_cancelled_startup_never_publishes_candidate_catalog() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let installed = temp.path().join("installed-catalog.native.json");
+            std::fs::write(&installed, "{}").expect("installed descriptor");
+            let mut session = extension_activation_test_session(temp.path());
+            session
+                .enable_extensions(&[], temp.path(), None, &[installed])
+                .await
+                .expect("installed activation");
+            let retained = session.extension_model_catalog();
+            let installed_state = Arc::clone(&session.extension_ai_completion);
+            let installed_manager = session.extensions.as_ref().unwrap().manager().clone();
+            installed_manager
+                .register_provider(extension_catalog_test_provider("installed", "chat"));
+            let before = retained.snapshot().expect("live installed catalog");
+
+            let candidate = temp.path().join("cancelled-catalog.mjs");
+            std::fs::write(
+                &candidate,
+                r#"
+                export default function init(pi) {
+                  pi.registerProvider("candidate-catalog", {
+                    api: "openai-completions",
+                    baseUrl: "http://127.0.0.1:1/v1",
+                    models: [{ id: "candidate-model", name: "Candidate", contextWindow: 4096, maxTokens: 512 }]
+                  });
+                  pi.on("startup", async () => {
+                    await pi.events("sendUserMessage", { text: "candidate startup" });
+                  });
+                }
+                "#,
+            )
+            .expect("candidate extension");
+            let gate = session.session_action_admission.clone();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let permit = gate.acquire(cx.cx()).await.expect("hold startup host action");
+            let entries = [candidate];
+            let enabling = Box::pin(session.enable_extensions(&[], temp.path(), None, &entries));
+            let reached_startup = Box::pin(wait_for_session_action_generation_capture(&gate));
+            let enabling = match futures::future::select(enabling, reached_startup).await {
+                futures::future::Either::Left((result, _)) => {
+                    panic!("startup must wait for its host action: {result:?}");
+                }
+                futures::future::Either::Right(((), enabling)) => enabling,
+            };
+
+            // Startup is after candidate provider projection. A frontend can
+            // read its retained handle while enable still borrows AgentSession.
+            let during = retained.snapshot().expect("catalog during candidate startup");
+            assert!(during.find("installed", "chat").is_some());
+            assert!(during.find("candidate-catalog", "candidate-model").is_none());
+            assert!(Arc::ptr_eq(
+                before.registry.as_ref().unwrap(),
+                during.registry.as_ref().unwrap(),
+            ));
+            drop(enabling);
+            drop(permit);
+            wait_for_session_action_generation_release(&gate).await;
+
+            assert!(Arc::ptr_eq(&installed_state, &session.extension_ai_completion));
+            assert!(!session.has_pending_extension_idle_actions());
+            installed_manager
+                .register_provider(extension_catalog_test_provider("installed-late", "chat"));
+            let after = retained.snapshot().expect("installed catalog remains live");
+            assert!(after.find("installed", "chat").is_some());
+            assert!(after.find("installed-late", "chat").is_some());
+            assert!(after.find("candidate-catalog", "candidate-model").is_none());
+        }));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn extension_replacement_publishes_to_retained_catalog_and_rebuilds_provider() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let first = temp.path().join("first-catalog.native.json");
+            std::fs::write(
+                &first,
+                json!({
+                    "providers": [extension_catalog_test_provider("test-provider", "test-model")],
+                })
+                .to_string(),
+            )
+            .expect("first descriptor");
+            let mut session = extension_activation_test_session(temp.path());
+            // ACP/TUI adapters may retain this handle even before activation.
+            let retained = session.extension_model_catalog();
+            session
+                .enable_extensions(&[], temp.path(), None, &[first])
+                .await
+                .expect("first activation");
+            session
+                .set_provider_model("test-provider", "test-model")
+                .await
+                .expect("select the first registered provider");
+            let before = retained.snapshot().expect("first catalog");
+            assert!(before.active_extension_model);
+            assert_eq!(before.active_provider_revision, before.extension_revision);
+            assert!(before.extension_revision.is_some());
+            let retired_provider = Arc::clone(&before.active_provider);
+            let retired_state = Arc::clone(&session.extension_ai_completion);
+            let retired_manager = session.extensions.as_ref().unwrap().manager().clone();
+
+            let second = temp.path().join("second-catalog.native.json");
+            let mut replacement = extension_catalog_test_provider("test-provider", "test-model");
+            replacement["models"][0]["name"] = json!("Replacement model");
+            replacement["baseUrl"] = json!("http://127.0.0.1:2/v2");
+            replacement["apiKey"] = json!("replacement-catalog-test-key");
+            std::fs::write(&second, json!({"providers": [replacement]}).to_string())
+                .expect("replacement descriptor");
+            session
+                .enable_extensions(&[], temp.path(), None, &[second])
+                .await
+                .expect("replacement activation");
+            assert!(!Arc::ptr_eq(&retired_state, &session.extension_ai_completion));
+            let after = retained.snapshot().expect("retained handle follows replacement");
+            assert_eq!(after.extension_revision, before.extension_revision);
+            assert_eq!(after.active_provider_revision, None);
+            assert!(after.active_extension_model);
+            assert!(Arc::ptr_eq(&retired_provider, &after.active_provider));
+            assert_eq!(
+                after.find("test-provider", "test-model").unwrap().model.name,
+                "Replacement model",
+            );
+
+            session
+                .set_provider_model("test-provider", "test-model")
+                .await
+                .expect("same identity must reconstruct against the new manager");
+            let selected = retained.snapshot().expect("replacement selection");
+            assert_eq!(
+                session.agent.stream_options().api_key.as_deref(),
+                Some("replacement-catalog-test-key"),
+            );
+            assert!(!Arc::ptr_eq(&retired_provider, &selected.active_provider));
+            assert_eq!(selected.active_provider_revision, selected.extension_revision);
+
+            retired_manager
+                .register_provider(extension_catalog_test_provider("retired-late", "chat"));
+            let active_manager = session.extensions.as_ref().unwrap().manager().clone();
+            active_manager
+                .register_provider(extension_catalog_test_provider("active-late", "chat"));
+            let refreshed = retained.snapshot().expect("accepted runtime refresh stays live");
+            assert!(refreshed.find("active-late", "chat").is_some());
+            assert!(refreshed.find("retired-late", "chat").is_none());
+            let native = session
+                .model_registry_snapshot()
+                .expect("native selector")
+                .expect("native registry");
+            assert!(Arc::ptr_eq(refreshed.registry.as_ref().unwrap(), &native));
+        }));
+    }
+
+    #[test]
+    fn extension_replacement_rejects_installed_prewarmed_manager() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let installed = temp.path().join("installed-catalog.native.json");
+            std::fs::write(&installed, "{}").expect("installed descriptor");
+            let mut session = extension_activation_test_session(temp.path());
+            session
+                .enable_extensions(&[], temp.path(), None, &[installed])
+                .await
+                .expect("installed activation");
+            let retained = session.extension_model_catalog();
+            let installed_state = Arc::clone(&session.extension_ai_completion);
+            let manager = session.extensions.as_ref().unwrap().manager().clone();
+            manager.register_provider(extension_catalog_test_provider("installed", "chat"));
+            let before = retained.snapshot().expect("installed catalog");
+            let pre_warmed = PreWarmedExtensionRuntime {
+                runtime: manager.runtime().expect("installed runtime"),
+                manager,
+                tools: session.agent.shared_tools(),
+            };
+            let candidate = temp.path().join("aliased-catalog.native.json");
+            std::fs::write(
+                &candidate,
+                json!({"providers": [extension_catalog_test_provider("aliased", "chat")]})
+                    .to_string(),
+            )
+            .expect("candidate descriptor");
+            let error = session
+                .enable_extensions_with_policy(
+                    &[],
+                    temp.path(),
+                    None,
+                    &[candidate],
+                    None,
+                    None,
+                    Some(pre_warmed),
+                    ExtensionHostConfiguration::default(),
+                )
+                .await
+                .expect_err("a candidate must not load into the installed manager");
+            assert!(error.to_string().contains("already installed"));
+            assert!(Arc::ptr_eq(&installed_state, &session.extension_ai_completion));
+            let after = retained.snapshot().expect("installed activation remains live");
+            assert!(Arc::ptr_eq(
+                before.registry.as_ref().unwrap(),
+                after.registry.as_ref().unwrap(),
+            ));
+            assert!(after.find("installed", "chat").is_some());
+            assert!(after.find("aliased", "chat").is_none());
+        }));
+    }
+
+    #[test]
+    fn extension_disable_restores_retained_catalog_to_native_baseline() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let entry = temp.path().join("retired-catalog.native.json");
+            std::fs::write(&entry, "{}").expect("extension descriptor");
+            let mut session = extension_activation_test_session(temp.path());
+            let mut baseline = ModelRegistry::default();
+            baseline.merge_entries(vec![compaction_override_entry(
+                "native-baseline",
+                "native-model",
+                false,
+            )]);
+            session.set_model_registry(baseline);
+            let retained = session.extension_model_catalog();
+            session
+                .enable_extensions(&[], temp.path(), None, &[entry])
+                .await
+                .expect("installed activation");
+            let retired_manager = session.extensions.as_ref().unwrap().manager().clone();
+            retired_manager.register_provider(extension_catalog_test_provider("retired", "chat"));
+            assert!(retained.snapshot().unwrap().find("retired", "chat").is_some());
+
+            session
+                .enable_extensions(&[], temp.path(), None, &[])
+                .await
+                .expect("disable extensions");
+            retired_manager
+                .register_provider(extension_catalog_test_provider("retired-late", "chat"));
+            let visible = retained.snapshot().expect("retained frontend catalog");
+            let native = session
+                .model_registry_snapshot()
+                .expect("native selector")
+                .expect("configured native baseline");
+            assert!(Arc::ptr_eq(visible.registry.as_ref().unwrap(), &native));
+            assert!(visible.find("native-baseline", "native-model").is_some());
+            assert!(visible.find("retired", "chat").is_none());
+            assert!(visible.find("retired-late", "chat").is_none());
+            assert!(
+                visible
+                    .resolve_selection("test-provider", "test-model")
+                    .is_ok()
+            );
+        }));
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn extension_activation_failure_preserves_installed_queues() {
@@ -14994,9 +15374,7 @@ mod extensions_integration_tests {
 
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
-                model_catalog: ExtensionModelCatalog {
-                    state: extension_session_model_state(),
-                },
+                model_catalog: ExtensionModelCatalog::new(extension_session_model_state()),
                 session_action_admission: SessionActionAdmissionGate::default(),
                 is_streaming: Arc::new(AtomicBool::new(true)),
                 is_compacting: Arc::new(AtomicBool::new(true)),
@@ -15058,9 +15436,7 @@ mod extensions_integration_tests {
 
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
-                model_catalog: ExtensionModelCatalog {
-                    state: extension_session_model_state(),
-                },
+                model_catalog: ExtensionModelCatalog::new(extension_session_model_state()),
                 session_action_admission: SessionActionAdmissionGate::default(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
@@ -15094,9 +15470,7 @@ mod extensions_integration_tests {
             let session_action_admission = SessionActionAdmissionGate::default();
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
-                model_catalog: ExtensionModelCatalog {
-                    state: extension_session_model_state(),
-                },
+                model_catalog: ExtensionModelCatalog::new(extension_session_model_state()),
                 session_action_admission: session_action_admission.clone(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
@@ -20211,6 +20585,8 @@ impl AgentSession {
             compaction_models: ExtensionCompactionModelState::default(),
             compaction_privacy: Arc::clone(&agent.compaction_privacy_state),
         }));
+        let extension_model_catalog =
+            ExtensionModelCatalog::new(Arc::clone(&extension_ai_completion));
 
         Self {
             agent,
@@ -20229,6 +20605,7 @@ impl AgentSession {
             extension_injected_queue: None,
             extension_message_fetcher_lifetime: None,
             extension_ai_completion,
+            extension_model_catalog,
             compaction_settings,
             compaction_runtime: None,
             advisor: None,
@@ -20564,9 +20941,60 @@ impl AgentSession {
     }
 
     pub(crate) fn extension_model_catalog(&self) -> ExtensionModelCatalog {
-        ExtensionModelCatalog {
-            state: Arc::clone(&self.extension_ai_completion),
+        self.extension_model_catalog.clone()
+    }
+
+    /// Stage model state without changing the catalog retained by frontends.
+    /// An empty manager handle restores the configured native baseline.
+    fn extension_completion_state_for(
+        &self,
+        provider_manager: crate::extensions::ExtensionManagerHandle,
+    ) -> Result<Arc<StdMutex<ExtensionAiCompletionHostState>>> {
+        let mut state = self
+            .extension_ai_completion
+            .lock()
+            .map_err(|_| Error::extension("Failed to stage the extension model catalog"))?
+            .clone();
+        let provider = self.agent.provider();
+        if !Arc::ptr_eq(&state.provider, &provider) {
+            state.compaction_models.active_extension_model = state
+                .compaction_models
+                .registry
+                .as_ref()
+                .is_some_and(|registry| {
+                    registry.extension_provider_was_registered(provider.name())
+                });
         }
+        state.provider = provider;
+        state.stream_options = self.agent.stream_options().clone();
+        state.models = self
+            .model_registry
+            .as_deref()
+            .map(pi_ai_model_registry_values)
+            .unwrap_or_default();
+        state.compaction_models.registry = self.model_registry.clone();
+        // Bind a candidate to its own manager before any factory hostcall.
+        // Disable uses no manager, so retained retired handles cannot refresh it.
+        state.compaction_models.provider_manager = provider_manager;
+        state.compaction_models.provider_revision = None;
+        // Revision numbers are local to each manager. The old provider cannot
+        // be fresh merely because the replacement reuses its number.
+        state.compaction_models.active_provider_revision = None;
+        state.compaction_models.js_provider_ids.clear();
+        state.compaction_models.auth = self.auth_storage.clone().map(Arc::new);
+        state
+            .compaction_models
+            .api_key_override
+            .clone_from(&self.api_key_override);
+        state
+            .compaction_models
+            .api_key_override_provider
+            .clone_from(&self.api_key_override_provider);
+        state
+            .compaction_models
+            .recovery_cli_api_key
+            .clone_from(&self.recovery_cli_api_key);
+        Ok(Arc::new(StdMutex::new(state)))
     }
 
     #[must_use]
@@ -24314,6 +24742,7 @@ impl AgentSession {
 
         #[cfg(feature = "wasm-host")]
         if js_specs.is_empty() && native_specs.is_empty() && wasm_specs.is_empty() {
+            let disabled_ai_completion = self.extension_completion_state_for(Default::default())?;
             self.agent.extension_tool_catalog.clear(&self.agent.tools);
             self.extensions = None;
             self.agent.extensions = None;
@@ -24322,11 +24751,15 @@ impl AgentSession {
             self.extension_message_fetcher_lifetime = None;
             self.agent.prune_expired_message_fetchers();
             self.extensions_pending_idle_actions = Arc::new(StdMutex::new(VecDeque::new()));
+            self.extension_ai_completion = disabled_ai_completion;
+            self.extension_model_catalog
+                .publish(Arc::clone(&self.extension_ai_completion));
             return Ok(());
         }
 
         #[cfg(not(feature = "wasm-host"))]
         if js_specs.is_empty() && native_specs.is_empty() {
+            let disabled_ai_completion = self.extension_completion_state_for(Default::default())?;
             self.agent.extension_tool_catalog.clear(&self.agent.tools);
             self.extensions = None;
             self.agent.extensions = None;
@@ -24335,7 +24768,23 @@ impl AgentSession {
             self.extension_message_fetcher_lifetime = None;
             self.agent.prune_expired_message_fetchers();
             self.extensions_pending_idle_actions = Arc::new(StdMutex::new(VecDeque::new()));
+            self.extension_ai_completion = disabled_ai_completion;
+            self.extension_model_catalog
+                .publish(Arc::clone(&self.extension_ai_completion));
             return Ok(());
+        }
+
+        if let Some(pre_warmed) = pre_warmed.as_ref()
+            && self.extensions.as_ref().is_some_and(|installed| {
+                installed
+                    .manager()
+                    .handle()
+                    .same_manager(&pre_warmed.manager.handle())
+            })
+        {
+            return Err(Error::extension(
+                "The pre-warmed extension manager is already installed; replacement requires a separate runtime",
+            ));
         }
 
         // Factories and startup hooks can make model requests. Their bills
@@ -24507,20 +24956,10 @@ impl AgentSession {
             follow_up_mode,
         )));
         manager.set_session_action_origin_source(self.session_action_admission.origin_source());
-        {
-            let mut state = self
-                .extension_ai_completion
-                .lock()
-                .map_err(|_| Error::extension("Failed to initialize the live model catalog"))?;
-            // Startup hooks can select models before `self.extensions` is
-            // installed. Seed the same catalog that subsequent registry refreshes
-            // keep current for runtime model selection and compaction.
-            state.compaction_models.registry = self.model_registry.clone();
-            state.compaction_models.provider_revision = None;
-        }
+        let candidate_ai_completion = self.extension_completion_state_for(manager.handle())?;
         manager.set_session(Arc::new(AgentExtensionSession {
             handle: SessionHandle(self.session.clone()),
-            model_catalog: self.extension_model_catalog(),
+            model_catalog: ExtensionModelCatalog::new(Arc::clone(&candidate_ai_completion)),
             session_action_admission: self.session_action_admission.clone(),
             is_streaming: Arc::clone(&self.extensions_is_streaming),
             is_compacting: Arc::clone(&self.extensions_is_compacting),
@@ -24555,7 +24994,7 @@ impl AgentSession {
             is_streaming: Arc::clone(&self.extensions_is_streaming),
             is_turn_active: Arc::clone(&self.extensions_turn_active),
             pending_idle_actions: Arc::clone(&pending_idle_actions),
-            ai_completion: Arc::clone(&self.extension_ai_completion),
+            ai_completion: Arc::clone(&candidate_ai_completion),
             provider_admission: self.provider_admission.clone(),
             session_action_admission: self.session_action_admission.clone(),
         };
@@ -24600,8 +25039,7 @@ impl AgentSession {
         let hook_models = pi_ai_model_registry_values(&hook_registry);
         manager.set_extension_models(hook_models.clone());
         {
-            let mut state = self
-                .extension_ai_completion
+            let mut state = candidate_ai_completion
                 .lock()
                 .map_err(|_| Error::extension("Failed to publish the startup model catalog"))?;
             state.compaction_models.registry = Some(Arc::new(hook_registry));
@@ -24717,7 +25155,10 @@ impl AgentSession {
         self.agent.extensions = Some(manager.clone());
         self.extensions = Some(ExtensionRegion::new(manager));
         self.extension_startup_timeout_ms = extension_startup_timeout_ms;
+        self.extension_ai_completion = candidate_ai_completion;
         self.refresh_extension_compaction_models();
+        self.extension_model_catalog
+            .publish(Arc::clone(&self.extension_ai_completion));
         Ok(())
     }
 
