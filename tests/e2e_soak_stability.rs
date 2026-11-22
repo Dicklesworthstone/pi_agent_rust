@@ -3241,7 +3241,10 @@ fn soak_mutation_sensitivity_flags_injected_fd_and_vector_leaks() {
             max_duration: None,
             sample_every_turns: 2,
             abort_after_turns: None,
-            mutation_fault: SoakMutationFault::LeakFileDescriptors(6),
+            // Leak 24 FDs/turn (+120 FDs between turn-0 sample and turn 5, well above
+            // the 16-FD provisional budget) so concurrent sibling tests in this binary
+            // closing transient files/sockets cannot mask the injected process FD leak.
+            mutation_fault: SoakMutationFault::LeakFileDescriptors(24),
             budgets: ProvisionalGrowthBudgets::default(),
             artifact_dir: None,
         };
@@ -3249,7 +3252,8 @@ fn soak_mutation_sensitivity_flags_injected_fd_and_vector_leaks() {
             run_parameterized_session_soak(&fd_harness, "soak_mutation_leak_fd", &fd_cfg);
         assert!(
             !fd_outcome.passed,
-            "injected FD leak mutation MUST fail soak"
+            "injected FD leak mutation MUST fail soak: {:?}",
+            fd_outcome.verdicts
         );
         assert!(
             fd_outcome

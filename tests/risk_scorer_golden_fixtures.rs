@@ -170,9 +170,19 @@ fn golden_multi_step_replay_determinism() {
             e1.call_id
         );
 
-        // Triggers must match exactly
+        // Deterministic triggers must match exactly (excluding wall-clock
+        // `feature_budget_exceeded` jitter under loaded workers, matching
+        // `src/extensions/tests/baseline.rs`).
+        fn deterministic_triggers(triggers: &[String]) -> Vec<&str> {
+            triggers
+                .iter()
+                .map(String::as_str)
+                .filter(|trigger| *trigger != "feature_budget_exceeded")
+                .collect()
+        }
         assert_eq!(
-            e1.triggers, e2.triggers,
+            deterministic_triggers(&e1.triggers),
+            deterministic_triggers(&e2.triggers),
             "triggers mismatch for {}",
             e1.call_id
         );

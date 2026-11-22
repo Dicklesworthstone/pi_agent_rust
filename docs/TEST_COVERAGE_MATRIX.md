@@ -658,6 +658,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/subagents/worker/output_contract/native_tests.rs` | Actual SubagentTool admission, RPC children, retained results and privacy | Test module (12 tests). |
 | `src/subagents/worker/pool.rs` | A session-owned pool is one native job, including its idle RPC children, admission queue and ordered result manifest | Unit (17 in-module tests). |
 | `src/subagents/worker/pool/exchange.rs` | Compound workpool turn (`pool_exchange`): atomic batch admission, optional seal, and bounded result observation | Unit (3 in-module tests). |
+| `src/subagents/worker/yield_tool.rs` | Native, ordered receipts (`yield` tool) for early terminal workpool item results | Unit (5 in-module tests); exercised by grouped workpool suites in `src/subagents/execution/worker.rs` and `src/subagents/worker/pool.rs`. |
 | `src/subagents/workflow.rs` | Dependency-ordered native delegation, not a second child runtime | `src/subagents/workflow/background_tests.rs` (8 tests); `src/subagents/workflow/tests.rs` (25 tests). |
 | `src/subagents/workflow/background_tests.rs` | Exercise actual background admission, jobs and the native DAG runner | Test module (8 tests). |
 | `src/subagents/workflow/decision.rs` | Typed branch selection over settled native results | `src/subagents/workflow/decision/tests.rs` (19 tests). |

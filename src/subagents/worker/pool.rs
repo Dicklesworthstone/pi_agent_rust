@@ -2230,11 +2230,17 @@ done
                     .expect_err("unsupported yield configuration");
                 assert!(error.to_string().contains("yieldResults"));
             }
-            assert!(crate::jobs::list(&fixture.owner).expect("owned jobs").is_empty());
+            assert!(
+                crate::jobs::list(&fixture.owner)
+                    .expect("owned jobs")
+                    .is_empty()
+            );
             assert!(!fixture.root.path().join("launches").exists());
 
-            let started = fixture.call(json!({"operation":"pool_start","agent":"worker",
-                "concurrency":2,"maxBatchSize":2,"yieldResults":true,"isolation":"none"})).await;
+            let started = fixture
+                .call(json!({"operation":"pool_start","agent":"worker",
+                "concurrency":2,"maxBatchSize":2,"yieldResults":true,"isolation":"none"}))
+                .await;
             let pool = field(&started, "poolId");
             assert_eq!(started["yieldResults"], true);
             let shared = lookup(&fixture.owner, &pool).expect("owned native pool");
@@ -2257,17 +2263,30 @@ done
                     .expect_err("a control cannot change the frozen yield mode");
                 assert!(error.to_string().contains("yieldResults"));
             }
-            for operation in ["pool_status", "pool_drain", "pool_exchange", "pool_finish", "pool_close"] {
-                let observed = fixture.call(json!({"operation":operation,"poolId":pool})).await;
+            for operation in [
+                "pool_status",
+                "pool_drain",
+                "pool_exchange",
+                "pool_finish",
+                "pool_close",
+            ] {
+                let observed = fixture
+                    .call(json!({"operation":operation,"poolId":pool}))
+                    .await;
                 assert_eq!(observed["yieldResults"], true);
-                for member in observed["workerWorkspaces"].as_array().expect("member receipts") {
+                for member in observed["workerWorkspaces"]
+                    .as_array()
+                    .expect("member receipts")
+                {
                     assert_eq!(member["yieldResults"], true);
                 }
                 if operation == "pool_exchange" {
                     assert_eq!(observed["snapshot"]["yieldResults"], true);
                 }
             }
-            let drained = fixture.call(json!({"operation":"pool_drain","poolId":pool})).await;
+            let drained = fixture
+                .call(json!({"operation":"pool_drain","poolId":pool}))
+                .await;
             assert_eq!(drained["yieldResults"], true);
             assert_eq!(drained["done"], true);
             if fixture.root.path().join("launches").exists() {

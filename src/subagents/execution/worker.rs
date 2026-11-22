@@ -54,10 +54,10 @@ use {
     super::{ChildProcessGuard, check_budget},
     crate::agent_cx::AgentCx,
     crate::model::{ContentBlock, TextContent},
+    crate::subagents::worker::output_contract::{BatchAnswer, OutputContract},
     crate::subagents::{
         SchemaMode, SubagentResult, SubagentStatus, SubagentTask, protocol, result_output,
     },
-    crate::subagents::worker::output_contract::{BatchAnswer, OutputContract},
     serde_json::{Value, json},
     std::collections::{BTreeMap, BTreeSet},
     std::future::Future,
@@ -260,21 +260,12 @@ impl Actor {
             .runner
             .workspace_roots
             .as_ref()
-            .map(|roots| {
-                roots.prepare(
-                    self.isolation.as_ref(),
-                    &self.owner,
-                    self.runner.deadline,
-                )
-            })
+            .map(|roots| roots.prepare(self.isolation.as_ref(), &self.owner, self.runner.deadline))
             .transpose()?;
         if let Some(transport) = &self.workspace_transport {
             transport.append_prompt(&mut args)?;
             self.lifecycle.workspace_roots = Some(transport.metadata.clone());
-            crate::subagents::worker::bind_workspace_roots(
-                &self.state,
-                json!(transport.metadata),
-            )?;
+            crate::subagents::worker::bind_workspace_roots(&self.state, json!(transport.metadata))?;
         }
         self.prompt_snapshot = crate::subagents::task_file::snapshot_prompt(
             &mut args,
@@ -762,7 +753,9 @@ impl Actor {
             let output = turn_output(
                 result,
                 turn.id,
-                pending.keyed.then_some((request_id.as_str(), ids.as_slice())),
+                pending
+                    .keyed
+                    .then_some((request_id.as_str(), ids.as_slice())),
             );
             // Each original ID keeps its own privacy projection, dependency,
             // retention budget and cancellation-linearized publication fence.
@@ -809,11 +802,7 @@ impl Actor {
 }
 
 #[cfg(any(unix, windows))]
-fn turn_output(
-    result: SubagentResult,
-    key: u64,
-    batch: Option<(&str, &[u64])>,
-) -> ToolOutput {
+fn turn_output(result: SubagentResult, key: u64, batch: Option<(&str, &[u64])>) -> ToolOutput {
     let mut output = result_output(&[result], "worker", false);
     if let Some(details) = output.details.as_mut() {
         details["sessionIsolation"] = json!("persistent_rpc_worker");
@@ -1063,7 +1052,10 @@ impl TurnReply {
         if event.get("toolName").and_then(Value::as_str) != Some("yield") {
             return Ok(None);
         }
-        let kind = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if !matches!(kind, "tool_execution_start" | "tool_execution_end") {
             return Ok(None);
         }
@@ -1345,56 +1337,92 @@ done
             .build()
             .unwrap();
         runtime.block_on(async {
-            let started = fixture.call(json!({
-                "operation":"pool_start", "agent":"worker", "concurrency":1,
-                "maxBatchSize":2, "yieldResults":true,
-                "tasks":["first-task", "second-task", "third-task"],
-                "outputSchema":{"type":"object", "required":["value"],
-                    "additionalProperties":false, "properties":{"value":{"type":"string"}}}
-            })).await;
+            let started = fixture
+                .call(json!({
+                    "operation":"pool_start", "agent":"worker", "concurrency":1,
+                    "maxBatchSize":2, "yieldResults":true,
+                    "tasks":["first-task", "second-task", "third-task"],
+                    "outputSchema":{"type":"object", "required":["value"],
+                        "additionalProperties":false, "properties":{"value":{"type":"string"}}}
+                }))
+                .await;
             let pool = field(&started, "poolId");
-            let page = fixture.call(json!({"operation":"pool_drain", "poolId":pool,
-                "timeoutMs":5000})).await;
+            let page = fixture
+                .call(json!({"operation":"pool_drain", "poolId":pool,
+                "timeoutMs":5000}))
+                .await;
             assert_eq!(page["items"].as_array().unwrap().len(), 1);
             assert_eq!(page["items"][0]["id"], 1);
-            assert_eq!(page["items"][0]["result"]["details"]["results"][0]["data"],
-                json!({"value":"first"}));
-            assert_eq!(page["items"][0]["result"]["details"]["workerBatch"]["yielded"], true);
+            assert_eq!(
+                page["items"][0]["result"]["details"]["results"][0]["data"],
+                json!({"value":"first"})
+            );
+            assert_eq!(
+                page["items"][0]["result"]["details"]["workerBatch"]["yielded"],
+                true
+            );
             assert_eq!(page["done"], false);
             assert!(!fixture.root.path().join("release-tail").exists());
-            let busy = fixture.call(json!({"operation":"pool_status", "poolId":pool})).await;
+            let busy = fixture
+                .call(json!({"operation":"pool_status", "poolId":pool}))
+                .await;
             assert_eq!(busy["completedItems"], 1);
             assert_eq!(busy["runningItems"], 1);
             assert_eq!(busy["queuedItems"], 1);
-            fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
+            fixture
+                .call(json!({"operation":"pool_finish", "poolId":pool}))
+                .await;
             std::fs::write(fixture.root.path().join("release-tail"), "ready").unwrap();
             fixture.await_file("idle-blocked").await;
-            let waiting = fixture.call(json!({"operation":"pool_result", "poolId":pool,
-                "itemId":2})).await;
+            let waiting = fixture
+                .call(json!({"operation":"pool_result", "poolId":pool,
+                "itemId":2}))
+                .await;
             assert_eq!(waiting["item"]["status"], "running");
-            assert_eq!(std::fs::read_to_string(fixture.root.path().join("prompts"))
-                .unwrap().lines().count(), 1);
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.path().join("prompts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
             std::fs::write(fixture.root.path().join("release-idle"), "ready").unwrap();
-            let settled = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                "timeoutMs":5000})).await;
+            let settled = fixture
+                .call(json!({"operation":"pool_wait", "poolId":pool,
+                "timeoutMs":5000}))
+                .await;
             assert_eq!(settled["status"], "completed");
             assert_eq!(settled["completedItems"], 3);
             for (id, expected) in [(1, "first"), (2, "second"), (3, "third")] {
-                let item = fixture.call(json!({"operation":"pool_result", "poolId":pool,
-                    "itemId":id})).await;
+                let item = fixture
+                    .call(json!({"operation":"pool_result", "poolId":pool,
+                    "itemId":id}))
+                    .await;
                 assert_eq!(pool_native_result(&item)["data"], json!({"value":expected}));
                 assert_eq!(pool_native_result(&item)["schemaValid"], true);
-                assert_eq!(pool_native_result(&item)["task"], format!("{expected}-task"));
+                assert_eq!(
+                    pool_native_result(&item)["task"],
+                    format!("{expected}-task")
+                );
             }
-            let prompts = std::fs::read_to_string(fixture.root.path().join("prompts"))
-                .unwrap();
-            let prompts: Vec<Value> = prompts.lines()
-                .map(|line| serde_json::from_str(line).unwrap()).collect();
+            let prompts = std::fs::read_to_string(fixture.root.path().join("prompts")).unwrap();
+            let prompts: Vec<Value> = prompts
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
             assert_eq!(prompts.len(), 2);
-            assert!(prompts[0]["message"].as_str().unwrap().contains("native yield tool"));
-            let arguments = std::fs::read_to_string(fixture.root.path().join("arguments"))
-                .unwrap();
-            assert!(arguments.lines().any(|argument| argument == "--worker-yield"));
+            assert!(
+                prompts[0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("native yield tool")
+            );
+            let arguments = std::fs::read_to_string(fixture.root.path().join("arguments")).unwrap();
+            assert!(
+                arguments
+                    .lines()
+                    .any(|argument| argument == "--worker-yield")
+            );
         });
     }
 
@@ -1407,32 +1435,48 @@ done
             .build()
             .unwrap();
         runtime.block_on(async {
-            let started = fixture.call(json!({"operation":"pool_start", "agent":"worker",
+            let started = fixture
+                .call(json!({"operation":"pool_start", "agent":"worker",
                 "concurrency":1, "maxBatchSize":2, "yieldResults":true,
-                "tasks":["first-task", "second-task"]})).await;
+                "tasks":["first-task", "second-task"]}))
+                .await;
             let pool = field(&started, "poolId");
-            let second = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                "itemId":2, "timeoutMs":5000})).await;
+            let second = fixture
+                .call(json!({"operation":"pool_wait", "poolId":pool,
+                "itemId":2, "timeoutMs":5000}))
+                .await;
             assert_eq!(second["item"]["status"], "completed");
             let pid = std::fs::read_to_string(fixture.root.path().join("launches"))
-                .unwrap().trim().parse::<i32>().ok()
-                .and_then(rustix::process::Pid::from_raw).unwrap();
-            let sealed = fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .unwrap();
+            let sealed = fixture
+                .call(json!({"operation":"pool_finish", "poolId":pool}))
+                .await;
             assert_eq!(sealed["status"], "draining");
-            let still_running = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                "timeoutMs":40})).await;
+            let still_running = fixture
+                .call(json!({"operation":"pool_wait", "poolId":pool,
+                "timeoutMs":40}))
+                .await;
             assert_eq!(still_running["status"], "draining");
             assert_eq!(still_running["completedItems"], 2);
             assert!(rustix::process::test_kill_process(pid).is_ok());
             std::fs::write(fixture.root.path().join("release-tail"), "ready").unwrap();
             fixture.await_file("idle-blocked").await;
-            let compacting = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                "timeoutMs":40})).await;
+            let compacting = fixture
+                .call(json!({"operation":"pool_wait", "poolId":pool,
+                "timeoutMs":40}))
+                .await;
             assert_eq!(compacting["status"], "draining");
             assert!(rustix::process::test_kill_process(pid).is_ok());
             std::fs::write(fixture.root.path().join("release-idle"), "ready").unwrap();
-            let completed = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                "timeoutMs":5000})).await;
+            let completed = fixture
+                .call(json!({"operation":"pool_wait", "poolId":pool,
+                "timeoutMs":5000}))
+                .await;
             assert_eq!(completed["status"], "completed");
             assert_eq!(completed["completedItems"], 2);
             assert!(rustix::process::test_kill_process(pid).is_err());
@@ -1442,7 +1486,12 @@ done
     #[test]
     fn late_failure_duplicate_receipt_and_cancellation_preserve_accepted_yields() {
         let _guard = crate::jobs::process_test_guard();
-        for failure in ["cancel", "fail-after-yield", "duplicate-tail", "malformed-final"] {
+        for failure in [
+            "cancel",
+            "fail-after-yield",
+            "duplicate-tail",
+            "malformed-final",
+        ] {
             let fixture = Fixture::new(YIELD_RPC_CHILD);
             std::fs::write(fixture.root.path().join(failure), "ready").unwrap();
             std::fs::write(fixture.root.path().join("release-idle"), "ready").unwrap();
@@ -1450,35 +1499,62 @@ done
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let started = fixture.call(json!({"operation":"pool_start", "agent":"worker",
+                let started = fixture
+                    .call(json!({"operation":"pool_start", "agent":"worker",
                     "concurrency":1, "maxBatchSize":2, "yieldResults":true,
-                    "tasks":["first-task", "second-task", "third-task"]})).await;
+                    "tasks":["first-task", "second-task", "third-task"]}))
+                    .await;
                 let pool = field(&started, "poolId");
-                let first = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                    "itemId":1, "timeoutMs":5000})).await;
+                let first = fixture
+                    .call(json!({"operation":"pool_wait", "poolId":pool,
+                    "itemId":1, "timeoutMs":5000}))
+                    .await;
                 assert_eq!(first["item"]["status"], "completed");
                 let original = first["item"]["result"].clone();
                 let settled = if failure == "cancel" {
-                    fixture.call(json!({"operation":"pool_close", "poolId":pool})).await
+                    fixture
+                        .call(json!({"operation":"pool_close", "poolId":pool}))
+                        .await
                 } else {
                     std::fs::write(fixture.root.path().join("release-tail"), "ready").unwrap();
-                    fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                        "timeoutMs":5000})).await
+                    fixture
+                        .call(json!({"operation":"pool_wait", "poolId":pool,
+                        "timeoutMs":5000}))
+                        .await
                 };
-                assert_eq!(settled["status"], if failure == "cancel" { "cancelled" } else { "failed" });
+                assert_eq!(
+                    settled["status"],
+                    if failure == "cancel" {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    }
+                );
                 assert_eq!(settled["completedItems"], 1);
                 assert_eq!(settled["failedItems"], 2);
-                let retained = fixture.call(json!({"operation":"pool_result", "poolId":pool,
-                    "itemId":1})).await;
+                let retained = fixture
+                    .call(json!({"operation":"pool_result", "poolId":pool,
+                    "itemId":1}))
+                    .await;
                 assert_eq!(retained["item"]["result"], original);
                 for id in [2, 3] {
-                    let item = fixture.call(json!({"operation":"pool_result", "poolId":pool,
-                        "itemId":id})).await;
-                    assert!(matches!(item["item"]["status"].as_str(), Some("failed" | "cancelled")));
+                    let item = fixture
+                        .call(json!({"operation":"pool_result", "poolId":pool,
+                        "itemId":id}))
+                        .await;
+                    assert!(matches!(
+                        item["item"]["status"].as_str(),
+                        Some("failed" | "cancelled")
+                    ));
                     assert!(!item.to_string().contains("replacement-canary"));
                 }
-                assert_eq!(std::fs::read_to_string(fixture.root.path().join("prompts"))
-                    .unwrap().lines().count(), 1);
+                assert_eq!(
+                    std::fs::read_to_string(fixture.root.path().join("prompts"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    1
+                );
             });
         }
     }
@@ -1495,23 +1571,33 @@ done
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let started = fixture.call(json!({"operation":"pool_start", "agent":"worker",
+                let started = fixture
+                    .call(json!({"operation":"pool_start", "agent":"worker",
                     "concurrency":1, "maxBatchSize":2, "yieldResults":true,
-                    "tasks":["first-task", "second-task"]})).await;
+                    "tasks":["first-task", "second-task"]}))
+                    .await;
                 let pool = field(&started, "poolId");
-                let second = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                    "itemId":2, "timeoutMs":5000})).await;
+                let second = fixture
+                    .call(json!({"operation":"pool_wait", "poolId":pool,
+                    "itemId":2, "timeoutMs":5000}))
+                    .await;
                 assert_eq!(second["item"]["status"], "completed");
-                fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
+                fixture
+                    .call(json!({"operation":"pool_finish", "poolId":pool}))
+                    .await;
                 std::fs::write(fixture.root.path().join("release-tail"), "ready").unwrap();
-                let settled = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                    "timeoutMs":5000})).await;
+                let settled = fixture
+                    .call(json!({"operation":"pool_wait", "poolId":pool,
+                    "timeoutMs":5000}))
+                    .await;
                 assert_eq!(settled["status"], "failed");
                 assert_eq!(settled["completedItems"], 2);
                 assert_eq!(settled["failedItems"], 0);
                 for id in [1, 2] {
-                    let item = fixture.call(json!({"operation":"pool_result", "poolId":pool,
-                        "itemId":id})).await;
+                    let item = fixture
+                        .call(json!({"operation":"pool_result", "poolId":pool,
+                        "itemId":id}))
+                        .await;
                     assert_eq!(item["item"]["status"], "completed");
                     assert!(!item.to_string().contains("replacement-canary"));
                 }
@@ -1543,35 +1629,58 @@ done
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let started = crate::subagents::worker::execute(&fixture.tool, json!({
-                    "operation":"pool_start", "agent":"worker", "concurrency":1,
-                    "maxBatchSize":2, "yieldResults":true,
-                    "tasks":["first-task", "second-task"],
-                    "outputSchema":{"type":"object", "required":["value"],
-                        "additionalProperties":false, "properties":{"value":{"type":"string"}}}
-                }), privacy).await.unwrap().details.unwrap();
+                let started = crate::subagents::worker::execute(
+                    &fixture.tool,
+                    json!({
+                        "operation":"pool_start", "agent":"worker", "concurrency":1,
+                        "maxBatchSize":2, "yieldResults":true,
+                        "tasks":["first-task", "second-task"],
+                        "outputSchema":{"type":"object", "required":["value"],
+                            "additionalProperties":false, "properties":{"value":{"type":"string"}}}
+                    }),
+                    privacy,
+                )
+                .await
+                .unwrap()
+                .details
+                .unwrap();
                 let pool = field(&started, "poolId");
-                let failed = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                    "itemId":1, "timeoutMs":5000})).await;
+                let failed = fixture
+                    .call(json!({"operation":"pool_wait", "poolId":pool,
+                    "itemId":1, "timeoutMs":5000}))
+                    .await;
                 assert_eq!(failed["item"]["status"], "failed");
                 assert!(!failed.to_string().contains("yield-privacy-secret"));
                 if failure == "schema-error" {
                     assert_eq!(pool_native_result(&failed)["schemaValid"], false);
                     assert_eq!(pool_native_result(&failed)["schemaRetries"], 0);
                 } else {
-                    assert!(failed.to_string().contains("PI_SUBAGENT_WORKER_RESULT_WITHHELD"));
+                    assert!(
+                        failed
+                            .to_string()
+                            .contains("PI_SUBAGENT_WORKER_RESULT_WITHHELD")
+                    );
                 }
-                fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
+                fixture
+                    .call(json!({"operation":"pool_finish", "poolId":pool}))
+                    .await;
                 std::fs::write(fixture.root.path().join("release-tail"), "ready").unwrap();
-                let settled = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                    "timeoutMs":5000})).await;
+                let settled = fixture
+                    .call(json!({"operation":"pool_wait", "poolId":pool,
+                    "timeoutMs":5000}))
+                    .await;
                 assert_eq!(settled["status"], "failed");
                 assert_eq!(settled["completedItems"], 1);
                 assert_eq!(settled["failedItems"], 1);
-                let second = fixture.call(json!({"operation":"pool_result", "poolId":pool,
-                    "itemId":2})).await;
+                let second = fixture
+                    .call(json!({"operation":"pool_result", "poolId":pool,
+                    "itemId":2}))
+                    .await;
                 assert_eq!(second["item"]["status"], "completed");
-                assert_eq!(pool_native_result(&second)["data"], json!({"value":"second"}));
+                assert_eq!(
+                    pool_native_result(&second)["data"],
+                    json!({"value":"second"})
+                );
             });
         }
     }
@@ -1810,11 +1919,15 @@ done
                 .unwrap();
             runtime.block_on(async {
                 let started = if pooled {
-                    fixture.call(json!({"operation":"pool_start","agent":"worker",
-                        "concurrency":1,"tasks":["remember silver"]})).await
+                    fixture
+                        .call(json!({"operation":"pool_start","agent":"worker",
+                        "concurrency":1,"tasks":["remember silver"]}))
+                        .await
                 } else {
-                    fixture.call(json!({"operation":"worker_start","agent":"worker",
-                        "task":"remember silver"})).await
+                    fixture
+                        .call(json!({"operation":"worker_start","agent":"worker",
+                        "task":"remember silver"}))
+                        .await
                 };
                 let id = field(&started, if pooled { "poolId" } else { "workerId" });
                 let result_path = if pooled {
@@ -1823,8 +1936,10 @@ done
                     "/turn/result/details/results/0"
                 };
                 let first = if pooled {
-                    fixture.call(json!({"operation":"pool_wait","poolId":id,
-                        "itemId":1,"timeoutMs":5000})).await
+                    fixture
+                        .call(json!({"operation":"pool_wait","poolId":id,
+                        "itemId":1,"timeoutMs":5000}))
+                        .await
                 } else {
                     fixture.wait(&id, 1).await
                 };
@@ -1846,27 +1961,40 @@ done
                 assert_eq!(manifest["roots"], roots);
                 workspace.add_root(later.path());
                 let second = if pooled {
-                    fixture.call(json!({"operation":"pool_push","poolId":id,
-                        "tasks":["recall the remembered word"]})).await;
-                    fixture.call(json!({"operation":"pool_wait","poolId":id,
-                        "itemId":2,"timeoutMs":5000})).await
+                    fixture
+                        .call(json!({"operation":"pool_push","poolId":id,
+                        "tasks":["recall the remembered word"]}))
+                        .await;
+                    fixture
+                        .call(json!({"operation":"pool_wait","poolId":id,
+                        "itemId":2,"timeoutMs":5000}))
+                        .await
                 } else {
-                    fixture.call(json!({"operation":"worker_send","workerId":id,
-                        "task":"recall the remembered word"})).await;
+                    fixture
+                        .call(json!({"operation":"worker_send","workerId":id,
+                        "task":"recall the remembered word"}))
+                        .await;
                     fixture.wait(&id, 2).await
                 };
                 let second = second.pointer(result_path).unwrap();
                 assert_eq!(second["output"], "silver");
                 assert_eq!(second["workspaceRoots"]["inherited"], roots);
-                assert!(manifest_path.is_file(), "live process still owns its manifest");
+                assert!(
+                    manifest_path.is_file(),
+                    "live process still owns its manifest"
+                );
                 assert!(workspace.remove_root(additional.path()));
                 workspace.add_root(additional.path());
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
                     let status = if pooled {
-                        fixture.call(json!({"operation":"pool_status","poolId":id})).await
+                        fixture
+                            .call(json!({"operation":"pool_status","poolId":id}))
+                            .await
                     } else {
-                        fixture.call(json!({"operation":"worker_status","workerId":id})).await
+                        fixture
+                            .call(json!({"operation":"worker_status","workerId":id}))
+                            .await
                     };
                     let retired = if pooled {
                         status["workerWorkspaces"][0]["closed"] == true
@@ -1876,11 +2004,17 @@ done
                     if retired {
                         break;
                     }
-                    assert!(Instant::now() < deadline, "idle child retained revoked access");
+                    assert!(
+                        Instant::now() < deadline,
+                        "idle child retained revoked access"
+                    );
                     AgentCx::for_request().time().sleep(POLL_INTERVAL).await;
                 }
                 assert!(rustix::process::test_kill_process(pid).is_err());
-                assert!(!manifest_path.exists(), "retirement releases private grants file");
+                assert!(
+                    !manifest_path.exists(),
+                    "retirement releases private grants file"
+                );
                 assert_eq!(
                     std::fs::read_to_string(fixture.root.path().join("launches"))
                         .unwrap()
@@ -2312,8 +2446,8 @@ exec sleep 30
     }
 
     fn yield_ended(call: &str, input: Value) -> String {
-        let receipt = crate::subagents::worker::output_contract::yield_receipt(call, input)
-            .unwrap();
+        let receipt =
+            crate::subagents::worker::output_contract::yield_receipt(call, input).unwrap();
         json!({"type":"tool_execution_end", "toolName":"yield", "toolCallId":call,
             "isError":false, "result":{"content":[], "details":receipt}})
         .to_string()
@@ -2324,15 +2458,34 @@ exec sleep 30
         let mut reply = yielding_reply();
         let mut output = String::new();
         for call in ["one", "two"] {
-            assert!(reply.ingest(&yield_started(call), true, &mut output).unwrap().is_none());
+            assert!(
+                reply
+                    .ingest(&yield_started(call), true, &mut output)
+                    .unwrap()
+                    .is_none()
+            );
         }
         let update = json!({"type":"tool_execution_update", "toolName":"yield", "toolCallId":"one",
             "partialResult":{"details":{"schema":"pi.subagent.worker.yield.v1",
                 "requestId":"warm-2", "key":1, "data":"preview-canary", "toolCallId":"one"}}});
-        assert!(reply.ingest(&update.to_string(), true, &mut output).unwrap().is_none());
-        let result = reply.ingest(&yield_ended("one", json!({
-            "requestId":"warm-2", "key":1, "data":null
-        })), true, &mut output).unwrap();
+        assert!(
+            reply
+                .ingest(&update.to_string(), true, &mut output)
+                .unwrap()
+                .is_none()
+        );
+        let result = reply
+            .ingest(
+                &yield_ended(
+                    "one",
+                    json!({
+                        "requestId":"warm-2", "key":1, "data":null
+                    }),
+                ),
+                true,
+                &mut output,
+            )
+            .unwrap();
         assert_eq!(result, Some((1, BatchAnswer::Data(Value::Null))));
         // Validation alone cannot release the key before the native owner
         // confirms its cancellation-linearized acceptance.
@@ -2340,9 +2493,19 @@ exec sleep 30
         reply.accept_yield(1).unwrap();
         let failed = json!({"type":"tool_execution_end", "toolName":"yield", "toolCallId":"two",
             "isError":true, "result":{"content":[], "isError":true}});
-        assert!(reply.ingest(&failed.to_string(), true, &mut output).unwrap().is_none());
+        assert!(
+            reply
+                .ingest(&failed.to_string(), true, &mut output)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(reply.yields.as_ref().unwrap().remaining, vec![2]);
-        reply.ingest(&ended(r#"{"items":[{"key":2,"data":false}]}"#), true, &mut output)
+        reply
+            .ingest(
+                &ended(r#"{"items":[{"key":2,"data":false}]}"#),
+                true,
+                &mut output,
+            )
             .unwrap();
         assert!(reply.complete);
         assert!(!output.contains("preview-canary"));
@@ -2355,44 +2518,87 @@ exec sleep 30
             json!({"requestId":"warm-2", "key":3, "data":true}),
         ] {
             let mut reply = yielding_reply();
-            reply.ingest(&yield_started("one"), true, &mut String::new()).unwrap();
-            assert!(reply.ingest(&yield_ended("one", input), true, &mut String::new()).is_err());
+            reply
+                .ingest(&yield_started("one"), true, &mut String::new())
+                .unwrap();
+            assert!(
+                reply
+                    .ingest(&yield_ended("one", input), true, &mut String::new())
+                    .is_err()
+            );
         }
         let mut reply = yielding_reply();
         let receipt = yield_ended("one", json!({"requestId":"warm-2", "key":1, "data":true}));
         assert!(reply.ingest(&receipt, true, &mut String::new()).is_err());
 
         let mut reply = yielding_reply();
-        reply.ingest(&yield_started("one"), true, &mut String::new()).unwrap();
+        reply
+            .ingest(&yield_started("one"), true, &mut String::new())
+            .unwrap();
         reply.ingest(&receipt, true, &mut String::new()).unwrap();
         reply.accept_yield(1).unwrap();
-        reply.ingest(&yield_started("another"), true, &mut String::new()).unwrap();
-        assert!(reply.ingest(&yield_ended("another", json!({
-            "requestId":"warm-2", "key":1, "data":"replacement-canary"
-        })), true, &mut String::new()).is_err());
+        reply
+            .ingest(&yield_started("another"), true, &mut String::new())
+            .unwrap();
+        assert!(
+            reply
+                .ingest(
+                    &yield_ended(
+                        "another",
+                        json!({
+                            "requestId":"warm-2", "key":1, "data":"replacement-canary"
+                        })
+                    ),
+                    true,
+                    &mut String::new()
+                )
+                .is_err()
+        );
         assert_eq!(reply.yields.as_ref().unwrap().remaining, vec![2]);
 
         let mut reply = yielding_reply();
         reply.started = false;
-        assert!(reply.ingest(&yield_started("one"), true, &mut String::new()).is_err());
+        assert!(
+            reply
+                .ingest(&yield_started("one"), true, &mut String::new())
+                .is_err()
+        );
         let mut reply = yielding_reply();
-        reply.ingest(&yield_started("one"), true, &mut String::new()).unwrap();
-        assert!(reply.ingest(&ended(r#"{"items":[]}"#), true, &mut String::new()).is_err());
+        reply
+            .ingest(&yield_started("one"), true, &mut String::new())
+            .unwrap();
+        assert!(
+            reply
+                .ingest(&ended(r#"{"items":[]}"#), true, &mut String::new())
+                .is_err()
+        );
     }
 
     #[test]
     fn yield_protocol_rejects_duplicate_json_fields_and_conflicting_result_error_flags() {
         let mut reply = yielding_reply();
-        reply.ingest(&yield_started("one"), true, &mut String::new()).unwrap();
+        reply
+            .ingest(&yield_started("one"), true, &mut String::new())
+            .unwrap();
         let duplicate = r#"{"type":"tool_execution_end","toolName":"yield","toolCallId":"one","isError":false,"result":{"content":[],"details":{"schema":"pi.subagent.worker.yield.v1","requestId":"warm-2","key":1,"data":{"n":1,"n":2},"toolCallId":"one"}}}"#;
         assert!(reply.ingest(duplicate, true, &mut String::new()).is_err());
         let mut reply = yielding_reply();
-        reply.ingest(&yield_started("one"), true, &mut String::new()).unwrap();
-        let mut conflicting: Value = serde_json::from_str(&yield_ended("one", json!({
-            "requestId":"warm-2", "key":1, "data":true
-        }))).unwrap();
+        reply
+            .ingest(&yield_started("one"), true, &mut String::new())
+            .unwrap();
+        let mut conflicting: Value = serde_json::from_str(&yield_ended(
+            "one",
+            json!({
+                "requestId":"warm-2", "key":1, "data":true
+            }),
+        ))
+        .unwrap();
         conflicting["result"]["isError"] = json!(true);
-        assert!(reply.ingest(&conflicting.to_string(), true, &mut String::new()).is_err());
+        assert!(
+            reply
+                .ingest(&conflicting.to_string(), true, &mut String::new())
+                .is_err()
+        );
     }
 
     #[test]

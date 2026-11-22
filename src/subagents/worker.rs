@@ -933,11 +933,7 @@ pub(super) fn complete_turn(
         let mut state = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.closed
-            || state.closing
-            || !state.active_batch
-            || state.deadline.check().is_err()
-        {
+        if state.closed || state.closing || !state.active_batch || state.deadline.check().is_err() {
             return false;
         }
         let Some(turn) = state.turns.get_mut(&id) else {
@@ -1304,8 +1300,8 @@ mod tests {
             let state = shared.lock().expect("worker fixture");
             assert_eq!(state.turns[&2].status, "failed");
             assert_eq!(state.turns[&3].status, "failed");
-            let withheld = serde_json::to_string(&state.turns[&2].result)
-                .expect("withheld yield result");
+            let withheld =
+                serde_json::to_string(&state.turns[&2].result).expect("withheld yield result");
             assert!(withheld.contains(WITHHELD));
             assert!(!withheld.contains("oversized-yield-marker"));
         }
@@ -1361,7 +1357,9 @@ mod tests {
         }
         next_batch(&shared).expect("active native batch");
         let output = ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new("accepted before revocation"))],
+            content: vec![ContentBlock::Text(TextContent::new(
+                "accepted before revocation",
+            ))],
             details: Some(json!({"value":"retained"})),
             is_error: false,
         };

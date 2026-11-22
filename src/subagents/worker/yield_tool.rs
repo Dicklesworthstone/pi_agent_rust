@@ -143,7 +143,10 @@ mod tests {
         assert_eq!(snapshot.tools().len(), 1);
         assert!(snapshot.get("yield").is_some());
         assert!(!snapshot.is_discoverable("yield"));
-        assert!(install(&tools).is_err(), "existing tools must not be replaced");
+        assert!(
+            install(&tools).is_err(),
+            "existing tools must not be replaced"
+        );
         assert_eq!(tools.snapshot().tools().len(), 1);
     }
 

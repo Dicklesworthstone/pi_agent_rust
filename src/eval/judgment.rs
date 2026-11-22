@@ -544,12 +544,12 @@ impl<'p> Invocation<'p> {
         // allowance even when no owning Agent supplies additional tools.
         let native = tool.standalone_bridge_tool(&name)?;
         let guard = self.cell_session(tool)?;
-        let (index, call) = self.reserve_tool_call(name, args)?;
-        let session = self.host_session.as_deref().ok_or_else(|| {
+        let session = self.host_session.clone().ok_or_else(|| {
             "EVAL_SESSION_UNAVAILABLE: native cell owner was not captured".to_string()
         })?;
+        let (index, call) = self.reserve_tool_call(name, args)?;
         let outcome =
-            tool_batch::execute_call(None, Some(native.as_ref()), call, session, &guard, false)
+            tool_batch::execute_call(None, Some(native.as_ref()), call, &session, &guard, false)
                 .await;
         self.finish_tool_receipt(index, &outcome)?;
         outcome

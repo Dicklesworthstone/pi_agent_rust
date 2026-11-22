@@ -1162,10 +1162,7 @@ fn main_impl() -> Result<()> {
         .into());
     }
     if cli.worker_yield && early_mode != "rpc" {
-        return Err(pi::error::Error::validation(
-            "--worker-yield requires RPC mode",
-        )
-        .into());
+        return Err(pi::error::Error::validation("--worker-yield requires RPC mode").into());
     }
     if cli.command.is_none()
         && cli.fetch_models.is_none()
@@ -14081,8 +14078,7 @@ mod tests {
             fs::create_dir(&outside).expect("outside root");
             fs::write(sibling.join("data.txt"), "inherited workspace data")
                 .expect("permitted file");
-            fs::write(outside.join("data.txt"), "ungranted workspace data")
-                .expect("refused file");
+            fs::write(outside.join("data.txt"), "ungranted workspace data").expect("refused file");
             // Additional roots carry access only; malformed executable
             // configuration there is not a startup configuration source.
             fs::write(sibling.join(".pi/settings.json"), "invalid configuration")
@@ -14105,7 +14101,11 @@ mod tests {
             assert!(!cli.trust);
             let read = pi::tools::ReadTool::new(&primary).with_workspace(workspace.clone());
             let result = read
-                .execute("inherited-read", json!({"path":sibling.join("data.txt")}), None)
+                .execute(
+                    "inherited-read",
+                    json!({"path":sibling.join("data.txt")}),
+                    None,
+                )
                 .await
                 .expect("read inherited root");
             assert!(!result.is_error);
@@ -14114,18 +14114,29 @@ mod tests {
                 pi::model::ContentBlock::Text(text) if text.text.contains("inherited workspace data")
             )));
             assert!(
-                read.execute("outside-read", json!({"path":outside.join("data.txt")}), None)
-                    .await
-                    .is_err()
+                read.execute(
+                    "outside-read",
+                    json!({"path":outside.join("data.txt")}),
+                    None
+                )
+                .await
+                .is_err()
             );
             assert!(workspace.remove_root(&sibling));
             assert!(
-                read.execute("revoked-read", json!({"path":sibling.join("data.txt")}), None)
-                    .await
-                    .is_err()
+                read.execute(
+                    "revoked-read",
+                    json!({"path":sibling.join("data.txt")}),
+                    None
+                )
+                .await
+                .is_err()
             );
-            fs::write(primary.join("roots.json"), r#"{"schema":"unknown","roots":[]}"#)
-                .expect("malformed manifest");
+            fs::write(
+                primary.join("roots.json"),
+                r#"{"schema":"unknown","roots":[]}"#,
+            )
+            .expect("malformed manifest");
             assert!(initial_workspace(&cli, &primary).is_err());
         });
     }

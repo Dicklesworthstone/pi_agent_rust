@@ -338,6 +338,8 @@ assert 'native payload' in answer
         transport::validate_bridge_owner(&bridge, 1, line.len()).unwrap();
         let mut judgments =
             super::super::judgment::Invocation::new(None, &json!({}), None).unwrap();
+        judgments.bind_host_session("bridge-owner");
+        judgments.bind_cell_session(session.clone());
         let pending = async {
             gate.await.unwrap();
             tool.run_bridge_call(&bridge["bridge"], &mut judgments)

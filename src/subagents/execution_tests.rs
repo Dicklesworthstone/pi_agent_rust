@@ -123,7 +123,10 @@ fn workspace_grants_are_frozen_through_queue_retry_and_revival_then_stay_revoked
         .expect("private manifest lifetimes")
         .lines()
     {
-        assert!(!Path::new(path).exists(), "reaped child retained a manifest");
+        assert!(
+            !Path::new(path).exists(),
+            "reaped child retained a manifest"
+        );
     }
     assert!(workspace.remove_root(additional.path()));
     workspace.add_root(additional.path());

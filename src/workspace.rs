@@ -194,8 +194,7 @@ impl WorkspaceHandle {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for root in roots {
-            if self.primary.as_ref() != Some(&root)
-                && !guard.iter().any(|grant| grant.path == root)
+            if self.primary.as_ref() != Some(&root) && !guard.iter().any(|grant| grant.path == root)
             {
                 guard.push(WorkspaceRootGrant::new(root));
             }
@@ -276,7 +275,9 @@ fn validate_child_root(root: &Path) -> Result<()> {
         || text.contains('\0')
         || !root.is_absolute()
     {
-        return Err(child_roots_error("root paths must be bounded absolute paths"));
+        return Err(child_roots_error(
+            "root paths must be bounded absolute paths",
+        ));
     }
     let canonical = std::fs::canonicalize(root)
         .map(crate::extensions::strip_unc_prefix)
@@ -298,7 +299,9 @@ fn parse_child_workspace_roots(bytes: &[u8]) -> Result<Vec<PathBuf>> {
     if manifest.schema != CHILD_WORKSPACE_ROOTS_SCHEMA
         || manifest.roots.len() > CHILD_WORKSPACE_ROOTS_MAX_ROOTS
     {
-        return Err(child_roots_error("unsupported schema or more than 128 roots"));
+        return Err(child_roots_error(
+            "unsupported schema or more than 128 roots",
+        ));
     }
     let mut roots = Vec::with_capacity(manifest.roots.len());
     for text in manifest.roots {
@@ -664,7 +667,10 @@ mod tests {
             .expect("duplicate installation is idempotent");
         assert!(cloned.contains_additional_root_grants(&grants));
         assert_eq!(workspace.roots(), vec![primary, extra]);
-        assert_eq!(std::fs::read(&manifest).expect("unmodified source"), encoded);
+        assert_eq!(
+            std::fs::read(&manifest).expect("unmodified source"),
+            encoded
+        );
     }
 
     #[test]
@@ -846,10 +852,9 @@ mod tests {
         let expected = workspace.additional_roots();
         assert!(workspace.replace_additional_roots_if_unchanged(&expected, vec![second.clone()]));
         let expected = workspace.additional_roots();
-        assert!(workspace.replace_additional_roots_if_unchanged(
-            &expected,
-            vec![first, second, third]
-        ));
+        assert!(
+            workspace.replace_additional_roots_if_unchanged(&expected, vec![first, second, third])
+        );
         assert!(!workspace.contains_additional_root_grants(&original));
         assert!(workspace.contains_additional_root_grants(&original[1..]));
     }

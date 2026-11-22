@@ -194,11 +194,7 @@ pub(in crate::subagents) fn remaining_answers(
     grouped_answers(text, expected, true)
 }
 
-fn grouped_answers(
-    text: &str,
-    expected: &[u64],
-    allow_empty: bool,
-) -> Result<Vec<BatchAnswer>> {
+fn grouped_answers(text: &str, expected: &[u64], allow_empty: bool) -> Result<Vec<BatchAnswer>> {
     if !(valid_batch_keys(expected) || allow_empty && expected.is_empty()) {
         return Err(Error::tool("subagent", BATCH_OUTPUT));
     }
@@ -331,7 +327,10 @@ pub(in crate::subagents) fn yield_receipt(tool_call_id: &str, input: Value) -> R
     {
         return Err(Error::tool("subagent", YIELD_INPUT));
     }
-    fields.insert("schema".to_string(), Value::String(YIELD_SCHEMA.to_string()));
+    fields.insert(
+        "schema".to_string(),
+        Value::String(YIELD_SCHEMA.to_string()),
+    );
     fields.insert(
         "toolCallId".to_string(),
         Value::String(tool_call_id.to_string()),
@@ -882,8 +881,7 @@ mod tests {
         }
         for call in ["".to_string(), "bad\0call".to_string(), "x".repeat(257)] {
             assert!(
-                yield_receipt(&call, json!({"requestId":"warm-2", "key":1, "data":null}))
-                    .is_err()
+                yield_receipt(&call, json!({"requestId":"warm-2", "key":1, "data":null})).is_err()
             );
         }
         let mut deep = Value::Null;
@@ -891,18 +889,14 @@ mod tests {
             deep = json!([deep]);
         }
         assert!(
-            yield_receipt("call", json!({"requestId":"warm-2", "key":1, "data":deep}))
-                .is_err()
+            yield_receipt("call", json!({"requestId":"warm-2", "key":1, "data":deep})).is_err()
         );
     }
 
     #[test]
     fn parent_rechecks_yield_receipt_shape_and_final_remaining_membership() {
-        let valid = yield_receipt(
-            "call",
-            json!({"requestId":"warm-2", "key":1, "data":null}),
-        )
-        .unwrap();
+        let valid =
+            yield_receipt("call", json!({"requestId":"warm-2", "key":1, "data":null})).unwrap();
         for (field, value) in [
             ("schema", json!("foreign.schema")),
             ("key", json!(2)),
@@ -922,16 +916,15 @@ mod tests {
             vec![BatchAnswer::Data(json!(false))],
         );
         assert!(
-            remaining_answers(r#"{"items":[{"key":2,"data":false}],"items":[]}"#, &[])
-                .is_err()
+            remaining_answers(r#"{"items":[{"key":2,"data":false}],"items":[]}"#, &[]).is_err()
         );
     }
 
     #[test]
     fn yielding_prompt_keeps_native_keys_and_explicit_remaining_final_contract() {
         let schema = contract(json!({"type":"boolean"}));
-        let prompt = yield_prompt(&[(7, "first"), (8, "second")], Some(&schema), "warm-19")
-            .unwrap();
+        let prompt =
+            yield_prompt(&[(7, "first"), (8, "second")], Some(&schema), "warm-19").unwrap();
         assert!(prompt.contains("Native yield requestId (JSON string): \"warm-19\""));
         assert!(prompt.contains("successful yield call"));
         assert!(prompt.contains("{\"items\":[]}"));

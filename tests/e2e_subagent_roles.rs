@@ -266,10 +266,16 @@ fn e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults() {
     let allowed_file = added.join("proof.txt");
     let excluded_file = excluded.join("private.txt");
     std::fs::write(&allowed_file, "delegated-added-root-content\n").expect("allowed evidence");
-    std::fs::write(&excluded_file, "ungranted-content-must-not-reach-provider\n")
-        .expect("negative control");
-    std::fs::write(added.join("AGENTS.md"), "SIBLING_INSTRUCTIONS_MUST_NOT_LOAD\n")
-        .expect("untrusted sibling instructions");
+    std::fs::write(
+        &excluded_file,
+        "ungranted-content-must-not-reach-provider\n",
+    )
+    .expect("negative control");
+    std::fs::write(
+        added.join("AGENTS.md"),
+        "SIBLING_INSTRUCTIONS_MUST_NOT_LOAD\n",
+    )
+    .expect("untrusted sibling instructions");
     server.add_route_queue(
         "POST",
         "/selected/v1/chat/completions",

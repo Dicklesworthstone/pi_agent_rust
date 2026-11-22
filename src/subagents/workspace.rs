@@ -56,7 +56,10 @@ pub(super) struct PreparedRoots {
 }
 
 fn root_error(message: &str) -> Error {
-    Error::tool("subagent", format!("PI_SUBAGENT_WORKSPACE_ROOTS: {message}"))
+    Error::tool(
+        "subagent",
+        format!("PI_SUBAGENT_WORKSPACE_ROOTS: {message}"),
+    )
 }
 
 fn check_preparation(owner: &AgentCx, deadline: Deadline) -> Result<()> {
@@ -79,7 +82,9 @@ impl CapturedRoots {
         let owner = AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| Error::Aborted)?;
         if !owner.capabilities().io {
-            return Err(root_error("capturing workspace roots requires I/O capability"));
+            return Err(root_error(
+                "capturing workspace roots requires I/O capability",
+            ));
         }
         let roots = grants
             .iter()
@@ -387,7 +392,10 @@ mod tests {
             &AgentCx::for_current_or_request(),
             Deadline::for_request(Some(std::time::Duration::from_secs(60)), None).unwrap(),
         );
-        assert!(refused.is_err(), "generated paths need the same owned policy");
+        assert!(
+            refused.is_err(),
+            "generated paths need the same owned policy"
+        );
     }
 
     #[cfg(unix)]
