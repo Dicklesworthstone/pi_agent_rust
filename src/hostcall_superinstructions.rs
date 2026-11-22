@@ -181,32 +181,38 @@ impl HostcallSuperinstructionCompiler {
 
     /// Borrowed-slice variant of [`Self::compile_plans`] for hot telemetry paths
     /// that already hold `&str` opcode identifiers. Avoids allocating per-window
-    /// `Vec<String>` clones until a motif actually meets `min_support`.
+    /// `Vec<String>` clones until a motif actually meets `min_support`, and tracks
+    /// `(support_count, last_trace_idx, next_valid_start)` in a single table with
+    /// FNV-1a hashing to eliminate redundant per-width hash maps and SipHash overhead.
     #[must_use]
     pub fn compile_plans_str(&self, traces: &[&[&str]]) -> Vec<HostcallSuperinstructionPlan> {
         if !self.enabled {
             return Vec::new();
         }
-        let mut windows: HashMap<&[&str], u32> = HashMap::new();
-        for &trace in traces {
+        let mut windows: HashMap<&[&str], (u32, usize, usize), FnvBuildHasher> =
+            HashMap::with_hasher(FnvBuildHasher);
+        for (trace_idx, &trace) in traces.iter().enumerate() {
             let trace_len = trace.len();
             if trace_len < 2 {
                 continue;
             }
+            let has_blank = trace.iter().any(|opcode| opcode.trim().is_empty());
             let max_width = self.max_window.min(trace_len);
             for width in 2..=max_width {
-                let mut next_valid: HashMap<&[&str], usize> = HashMap::new();
                 for start in 0..=trace_len - width {
                     let window_slice = &trace[start..start + width];
-                    if window_slice.iter().any(|opcode| opcode.trim().is_empty()) {
+                    if has_blank && window_slice.iter().any(|opcode| opcode.trim().is_empty()) {
                         continue;
                     }
 
-                    let min_start = *next_valid.get(window_slice).unwrap_or(&0);
-                    if start >= min_start {
-                        let entry = windows.entry(window_slice).or_insert(0);
-                        *entry = entry.saturating_add(1);
-                        next_valid.insert(window_slice, start + width);
+                    let entry = windows.entry(window_slice).or_insert((0, trace_idx, 0));
+                    if entry.1 != trace_idx {
+                        entry.1 = trace_idx;
+                        entry.2 = 0;
+                    }
+                    if start >= entry.2 {
+                        entry.0 = entry.0.saturating_add(1);
+                        entry.2 = start + width;
                     }
                 }
             }
@@ -214,7 +220,7 @@ impl HostcallSuperinstructionCompiler {
 
         let mut plans = windows
             .into_iter()
-            .filter_map(|(window_slice, support_count)| {
+            .filter_map(|(window_slice, (support_count, _, _))| {
                 if support_count < self.min_support {
                     return None;
                 }
@@ -256,6 +262,32 @@ impl HostcallSuperinstructionCompiler {
                 .then_with(|| left.plan_id.cmp(&right.plan_id))
         });
         plans
+    }
+}
+
+#[derive(Default)]
+struct FnvBuildHasher;
+
+impl std::hash::BuildHasher for FnvBuildHasher {
+    type Hasher = FnvHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        FnvHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+struct FnvHasher(u64);
+
+impl std::hash::Hasher for FnvHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
     }
 }
 
@@ -1024,6 +1056,21 @@ mod tests {
         let str_plans = compiler.compile_plans_str(&[&raw]);
         assert_eq!(str_plans, owned_plans);
         assert!(!str_plans.is_empty());
+
+        // Multi-trace and blank-opcode parity with compile_plans.
+        let raw_with_blanks = [
+            "tool.read",
+            "tool.write",
+            " ",
+            "tool.read",
+            "tool.write",
+            "tool.read",
+            "tool.write",
+        ];
+        let owned_multi =
+            compiler.compile_plans(&[opcode_trace(&raw), opcode_trace(&raw_with_blanks)]);
+        let str_multi = compiler.compile_plans_str(&[&raw, &raw_with_blanks]);
+        assert_eq!(str_multi, owned_multi);
 
         for window in [
             &["session.get_name", "session.get_model", "tool.read"][..],

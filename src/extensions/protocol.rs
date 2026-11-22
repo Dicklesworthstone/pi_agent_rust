@@ -370,6 +370,7 @@ fn egraph_fast_opcode_cost_for_engine(
 struct HostcallSuperinstructionRuntimeState {
     compiler: HostcallSuperinstructionCompiler,
     trace_history: VecDeque<&'static str>,
+    compiled_trace_snapshot: Vec<&'static str>,
     plans: Vec<HostcallSuperinstructionPlan>,
     observation_count: u64,
 }
@@ -428,7 +429,11 @@ fn hostcall_superinstruction_telemetry(
             || state.observation_count % HOSTCALL_SUPERINSTRUCTION_RECOMPILE_INTERVAL == 0)
     {
         let trace = state.trace_history.make_contiguous();
-        state.plans = state.compiler.compile_plans_str(&[trace]);
+        if state.compiled_trace_snapshot.as_slice() != trace {
+            state.plans = state.compiler.compile_plans_str(&[trace]);
+            state.compiled_trace_snapshot.clear();
+            state.compiled_trace_snapshot.extend_from_slice(trace);
+        }
     }
 
     let max_window = state.compiler.max_window().min(state.trace_history.len());
