@@ -686,6 +686,11 @@ pub struct Cli {
     /// paths outside all roots stay fail-closed.
     #[arg(long = "add-dir", value_name = "DIR")]
     pub add_dir: Vec<std::path::PathBuf>,
+
+    /// Native parent's bounded canonical-root manifest. This carries path
+    /// access only and never grants trust to additional project configuration.
+    #[arg(long, value_name = "FILE", hide = true)]
+    pub workspace_roots_file: Option<std::path::PathBuf>,
     // === Export & Listing ===
     /// Export session file to HTML
 
@@ -792,6 +797,37 @@ mod tests {
         assert_eq!(cli.theme.as_deref(), Some("dark"));
         assert_eq!(cli.theme_path, vec!["dark.ini".to_string()]);
         assert!(cli.no_themes);
+    }
+
+    #[test]
+    fn child_workspace_manifest_is_hidden_native_input_without_implied_trust() {
+        let parsed = parse_with_extension_flags(
+            [
+                "pi",
+                "--workspace-roots-file",
+                "native roots.json",
+                "--add-dir",
+                "explicit-root",
+                "--custom-feature",
+                "enabled",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .expect("native manifest flag survives extension extraction");
+        assert_eq!(
+            parsed.cli.workspace_roots_file,
+            Some(PathBuf::from("native roots.json"))
+        );
+        assert_eq!(parsed.cli.add_dir, vec![PathBuf::from("explicit-root")]);
+        assert!(!parsed.cli.trust);
+        assert_eq!(parsed.extension_flags.len(), 1);
+        assert_eq!(parsed.extension_flags[0].name, "custom-feature");
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--workspace-roots-file"));
+        assert!(help.contains("--add-dir"));
+        assert!(known_long_option("workspace-roots-file").is_some());
     }
 
     #[test]

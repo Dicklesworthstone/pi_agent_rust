@@ -84,6 +84,142 @@ fn identity(pending: &PendingRun) -> (String, PathBuf) {
 }
 
 #[test]
+fn isolated_roots_map_into_the_capture_and_disclose_external_and_missing_exclusions() {
+    let (root, runner, mut request) = fixture();
+    let nested = runner.cwd.join("library");
+    let empty = runner.cwd.join("empty-library");
+    let external = root.path().join("other-repository");
+    for directory in [&nested, &empty, &external] {
+        fs::create_dir(directory).unwrap();
+    }
+    fs::write(nested.join("source.txt"), "captured library\n").unwrap();
+    fs::write(external.join("source.txt"), "live external repository\n").unwrap();
+    let mut workspace = crate::workspace::WorkspaceHandle::single(&runner.cwd);
+    for directory in [
+        nested.as_path(),
+        external.as_path(),
+        empty.as_path(),
+        root.path(),
+    ] {
+        workspace.add_root(directory);
+    }
+    let privacy = crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(
+        crate::text_completion::AuxiliaryPrivacy::from_settings(None),
+    );
+    let runner = runner.with_workspace_roots(
+        crate::subagents::workspace::CapturedRoots::capture(&workspace, privacy).unwrap(),
+    );
+    fs::write(
+        &runner.child_binary,
+        concat!(
+            "#!/bin/sh\nset -eu\n",
+            "while [ \"$#\" -gt 0 ]; do\n",
+            "case \"$1\" in\n",
+            "--workspace-roots-file) shift; cat \"$1\" > child-roots.json ;;\n",
+            "--append-system-prompt) shift; cat \"$1\" > child-system.txt ;;\n",
+            "esac\nshift\ndone\n",
+            "printf 'child edit\\n' > tracked.txt\n",
+            "printf '%s\\n' '{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"finished edit\"}]}]}'\n",
+        ),
+    )
+    .unwrap();
+    request.iso_apply = Some("keep".to_string());
+    let agents = BTreeMap::from([("tan".to_string(), super::super::tan_agent_definition())]);
+    let result = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(runner.run_one(&agents, request, None, None));
+    assert!(!result.is_error, "{:?}", result.error);
+    let metadata = serde_json::to_value(result.workspace_roots.as_ref().unwrap()).unwrap();
+    let captured = PathBuf::from(&result.iso.as_ref().unwrap().worktree_path);
+    let mapped = crate::extensions::safe_canonicalize(&captured.join("library"));
+    let source = crate::extensions::safe_canonicalize(&nested);
+    assert_eq!(metadata["inherited"], json!([]));
+    assert_eq!(metadata["mapped"], json!([{"source":source,"path":mapped}]));
+    let excluded = metadata["excluded"].as_array().unwrap();
+    assert_eq!(excluded.len(), 3);
+    assert!(excluded.iter().any(|entry| {
+        entry["source"] == json!(crate::extensions::safe_canonicalize(&empty))
+            && entry["reason"] == "absent_from_captured_workspace"
+    }));
+    assert_eq!(
+        excluded
+            .iter()
+            .filter(|entry| entry["reason"] == "outside_isolated_repository")
+            .count(),
+        2
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(captured.join("child-roots.json")).unwrap()).unwrap();
+    assert_eq!(manifest["roots"], json!([mapped]));
+    let mut child_workspace = crate::workspace::WorkspaceHandle::single(&captured);
+    child_workspace
+        .load_child_workspace_roots(&captured.join("child-roots.json"))
+        .unwrap();
+    assert!(child_workspace.is_within(&captured.join("library/source.txt")));
+    assert!(!child_workspace.is_within(&nested.join("source.txt")));
+    assert!(!child_workspace.is_within(&external.join("source.txt")));
+    let prompt = fs::read_to_string(captured.join("child-system.txt")).unwrap();
+    assert!(prompt.contains("Delegated workspace access"));
+    assert!(prompt.contains("outside_isolated_repository"));
+    assert_eq!(
+        fs::read(runner.cwd.join("tracked.txt")).unwrap(),
+        b"original\n"
+    );
+}
+
+#[test]
+fn revoked_and_regranted_root_cannot_authorize_queued_isolated_writeback() {
+    let (_root, runner, request) = fixture();
+    let nested = runner.cwd.join("library");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("source.txt"), "captured library\n").unwrap();
+    let mut workspace = crate::workspace::WorkspaceHandle::single(&runner.cwd);
+    workspace.add_root(&nested);
+    let privacy = crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(
+        crate::text_completion::AuxiliaryPrivacy::from_settings(None),
+    );
+    let runner = runner.with_workspace_roots(
+        crate::subagents::workspace::CapturedRoots::capture(&workspace, privacy).unwrap(),
+    );
+    let agents = BTreeMap::from([("tan".to_string(), super::super::tan_agent_definition())]);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let pending = runner.run_pending(&agents, request, None, None, None).await;
+        let (_, worktree) = identity(&pending);
+        let held = HeldApply::new();
+        let mut finishing = Box::pin(pending.finish(None));
+        assert!(futures::poll!(&mut finishing).is_pending());
+        assert!(workspace.remove_root(&nested));
+        workspace.add_root(&nested);
+        let result = finishing.await;
+        held.release();
+        assert!(result.is_error);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("PI_SUBAGENT_WORKSPACE_REVOKED")
+        );
+        let isolation = result.iso.unwrap();
+        assert!(!isolation.applied);
+        assert_eq!(isolation.apply_mode, "keep");
+        assert!(isolation.patch.contains("child edit"));
+        assert_eq!(
+            fs::read(runner.cwd.join("tracked.txt")).unwrap(),
+            b"original\n"
+        );
+        assert_eq!(
+            fs::read(worktree.join("tracked.txt")).unwrap(),
+            b"child edit\n"
+        );
+    });
+}
+
+#[test]
 fn parent_cancel_and_hub_kill_reject_queued_native_writeback_and_preserve_edits() {
     for operator_killed in [false, true] {
         let (_root, runner, request) = fixture();

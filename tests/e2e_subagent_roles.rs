@@ -54,6 +54,25 @@ fn sse_response(body: String) -> MockHttpResponse {
     }
 }
 
+fn workspace_read_sse_body(allowed: &std::path::Path, excluded: &std::path::Path) -> String {
+    let calls = [("root_allowed", allowed), ("root_excluded", excluded)]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (id, path))| {
+            serde_json::json!({
+                "index":index,"id":id,"type":"function",
+                "function":{"name":"read","arguments":serde_json::json!({"path":path}).to_string()}
+            })
+        })
+        .collect::<Vec<_>>();
+    let call = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":calls}}]});
+    let done = serde_json::json!({
+        "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],
+        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+    });
+    format!("data: {call}\n\ndata: {done}\n\ndata: [DONE]\n\n")
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_subagent_child_uses_task_role_model() {
@@ -224,15 +243,6 @@ fn e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults() {
     let harness =
         TestHarness::new("e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults");
     let server = harness.start_mock_http_server();
-    server.add_route_queue(
-        "POST",
-        "/selected/v1/chat/completions",
-        vec![
-            sse_response(tool_call_sse_body()),
-            sse_response(text_sse_body("child used selected model")),
-            sse_response(text_sse_body("parent done")),
-        ],
-    );
     server.add_route(
         "POST",
         "/configured/v1/chat/completions",
@@ -242,9 +252,34 @@ fn e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults() {
     let agent_dir = root.join("agent");
     let home = root.join("home");
     let workspace = root.join("workspace");
-    for directory in [agent_dir.join("agents"), home.clone(), workspace.clone()] {
+    let added = root.join("added repository 雪");
+    let excluded = root.join("ungranted");
+    for directory in [
+        agent_dir.join("agents"),
+        home.clone(),
+        workspace.clone(),
+        added.clone(),
+        excluded.clone(),
+    ] {
         std::fs::create_dir_all(directory).expect("create isolated environment");
     }
+    let allowed_file = added.join("proof.txt");
+    let excluded_file = excluded.join("private.txt");
+    std::fs::write(&allowed_file, "delegated-added-root-content\n").expect("allowed evidence");
+    std::fs::write(&excluded_file, "ungranted-content-must-not-reach-provider\n")
+        .expect("negative control");
+    std::fs::write(added.join("AGENTS.md"), "SIBLING_INSTRUCTIONS_MUST_NOT_LOAD\n")
+        .expect("untrusted sibling instructions");
+    server.add_route_queue(
+        "POST",
+        "/selected/v1/chat/completions",
+        vec![
+            sse_response(tool_call_sse_body()),
+            sse_response(workspace_read_sse_body(&allowed_file, &excluded_file)),
+            sse_response(text_sse_body("child used selected model")),
+            sse_response(text_sse_body("parent done")),
+        ],
+    );
     std::fs::write(
         agent_dir.join("agents/scout.md"),
         "---\nname: scout\ndescription: unpinned scout\ntools: read\n---\nYou are the child scout.\n",
@@ -291,6 +326,8 @@ fn e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults() {
             "--tools",
             "subagent",
         ])
+        .arg("--add-dir")
+        .arg(&added)
         .arg("run the scout")
         .current_dir(&workspace)
         .env("HOME", &home)
@@ -353,8 +390,8 @@ fn e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults() {
         .collect();
     assert_eq!(
         bodies.len(),
-        3,
-        "parent, child, and parent follow-up requests"
+        4,
+        "parent, child, child tool continuation, and parent follow-up requests"
     );
     assert!(bodies.iter().all(|body| body["model"] == model_id));
     assert!(
@@ -370,6 +407,29 @@ fn e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults() {
         }),
         "the selected provider must actually receive the child's assignment"
     );
+    let child_messages = bodies[2]["messages"]
+        .as_array()
+        .expect("real child continuation messages");
+    let allowed_result = child_messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "root_allowed")
+        .expect("native read result for inherited root");
+    assert!(
+        allowed_result["content"]
+            .to_string()
+            .contains("delegated-added-root-content")
+    );
+    let excluded_result = child_messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "root_excluded")
+        .expect("native read refusal outside inherited roots");
+    assert!(excluded_result["content"].to_string().contains("outside"));
+    for body in &bodies {
+        let serialized = body.to_string();
+        assert!(!serialized.contains("ungranted-content-must-not-reach-provider"));
+        assert!(!serialized.contains("SIBLING_INSTRUCTIONS_MUST_NOT_LOAD"));
+    }
+    assert!(bodies[1].to_string().contains("Delegated workspace access"));
 }
 
 #[cfg(unix)]

@@ -245,7 +245,9 @@ pub(super) async fn start(
     let job_deadline = std::time::Instant::now() + deadline.remaining();
     let session_id = resolve_session(&tool.job_session_scope, &owner, deadline).await?;
     let admission = crate::jobs::admit_owned_task(&session_id)?.with_deadline(job_deadline);
-    let prepared = request.prepare(tool, deadline)?;
+    let mut invocation_tool = tool.clone();
+    invocation_tool.workspace_privacy = Some(privacy.clone());
+    let prepared = request.prepare(&invocation_tool, deadline)?;
     let mode = prepared.mode();
     if resolve_session(&tool.job_session_scope, &owner, deadline).await? != session_id {
         return Err(Error::tool(

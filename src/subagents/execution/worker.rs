@@ -108,6 +108,7 @@ struct Actor {
     lifecycle: SubagentResult,
     child: Option<ChildProcessGuard>,
     prompt_snapshot: Option<tempfile::NamedTempFile>,
+    workspace_transport: Option<crate::subagents::workspace::PreparedRoots>,
     stdin: Option<WorkerStdin>,
     stdout: Option<FramedPipe<WorkerStdout>>,
     stderr: Option<FramedPipe<WorkerStderr>>,
@@ -139,6 +140,7 @@ impl Actor {
             lifecycle,
             child: None,
             prompt_snapshot: None,
+            workspace_transport: None,
             stdin: None,
             stdout: None,
             stderr: None,
@@ -157,6 +159,9 @@ impl Actor {
                 "subagent",
                 self.lifecycle.error.as_deref().unwrap_or(CANCELLED),
             ));
+        }
+        if let Some(transport) = &self.workspace_transport {
+            transport.lease.check()?;
         }
         if crate::subagents::worker::should_close(&self.state) {
             return Err(Error::tool("subagent", CANCELLED));
@@ -249,11 +254,34 @@ impl Actor {
             ),
             self.runner.worker_fallback_policy.as_deref(),
         );
+        self.workspace_transport = self
+            .runner
+            .workspace_roots
+            .as_ref()
+            .map(|roots| {
+                roots.prepare(
+                    self.isolation.as_ref(),
+                    &self.owner,
+                    self.runner.deadline,
+                )
+            })
+            .transpose()?;
+        if let Some(transport) = &self.workspace_transport {
+            transport.append_prompt(&mut args)?;
+            self.lifecycle.workspace_roots = Some(transport.metadata.clone());
+            crate::subagents::worker::bind_workspace_roots(
+                &self.state,
+                json!(transport.metadata),
+            )?;
+        }
         self.prompt_snapshot = crate::subagents::task_file::snapshot_prompt(
             &mut args,
             &self.owner,
             self.runner.deadline,
         )?;
+        if let Some(transport) = &self.workspace_transport {
+            transport.append_args(&mut args)?;
+        }
         let mut command = Command::new(&self.runner.child_binary);
         crate::agent_hub::ipc::ChildChannel::configure_child(&mut command, channel.as_ref());
         self.runner
@@ -536,6 +564,9 @@ impl Actor {
         result.status = SubagentStatus::Completed;
         result.stderr.clone_from(&self.diagnostic);
         result
+            .workspace_roots
+            .clone_from(&self.lifecycle.workspace_roots);
+        result
     }
 
     async fn turn(&mut self, pending: crate::subagents::worker::PendingBatch) -> Result<()> {
@@ -614,6 +645,9 @@ impl Actor {
             }
             // Each original ID keeps its own privacy projection, dependency,
             // retention budget and cancellation-linearized publication fence.
+            if let Some(transport) = &self.workspace_transport {
+                transport.lease.check()?;
+            }
             crate::subagents::worker::complete_turn(&self.state, turn.id, Ok(output));
         }
         Ok(())
@@ -656,6 +690,7 @@ impl Drop for Actor {
         drop(self.stderr.take());
         drop(self.child.take());
         drop(self.prompt_snapshot.take());
+        drop(self.workspace_transport.take());
         if self.failure.is_some() && !self.lifecycle.is_error {
             self.lifecycle.status = SubagentStatus::Cancelled;
             self.lifecycle.is_error = true;
@@ -1197,6 +1232,126 @@ done
                 .unwrap().lines().count(), 1);
             assert!(rustix::process::test_kill_process(pid).is_err());
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn retained_workers_and_pools_keep_root_grants_until_revocation_reaps_them() {
+        let _guard = crate::jobs::process_test_guard();
+        let script = format!(
+            r#"set -eu
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --workspace-roots-file)
+            shift
+            test -f "$1"
+            printf '%s' "$1" > root-manifest-path
+            cat "$1" > root-manifest
+            ;;
+        --append-system-prompt)
+            shift
+            cat "$1" > root-system-prompt
+            ;;
+    esac
+    shift
+done
+{RPC_CHILD}
+"#,
+        );
+        for pooled in [false, true] {
+            let mut fixture = Fixture::new(&script);
+            let additional = tempfile::tempdir().expect("additional repository");
+            let later = tempfile::tempdir().expect("later repository");
+            let mut workspace = crate::workspace::WorkspaceHandle::single(fixture.root.path());
+            workspace.add_root(additional.path());
+            fixture.tool.workspace = workspace.clone();
+            std::fs::write(fixture.root.path().join("release"), "ready").unwrap();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let started = if pooled {
+                    fixture.call(json!({"operation":"pool_start","agent":"worker",
+                        "concurrency":1,"tasks":["remember silver"]})).await
+                } else {
+                    fixture.call(json!({"operation":"worker_start","agent":"worker",
+                        "task":"remember silver"})).await
+                };
+                let id = field(&started, if pooled { "poolId" } else { "workerId" });
+                let result_path = if pooled {
+                    "/item/result/details/results/0"
+                } else {
+                    "/turn/result/details/results/0"
+                };
+                let first = if pooled {
+                    fixture.call(json!({"operation":"pool_wait","poolId":id,
+                        "itemId":1,"timeoutMs":5000})).await
+                } else {
+                    fixture.wait(&id, 1).await
+                };
+                let record = first.pointer(result_path).expect("native completed child");
+                assert_eq!(record["output"], "silver");
+                let roots = json!([crate::extensions::safe_canonicalize(additional.path())]);
+                assert_eq!(record["workspaceRoots"]["inherited"], roots);
+                let pid = i32::try_from(record["pid"].as_u64().unwrap()).unwrap();
+                let pid = rustix::process::Pid::from_raw(pid).unwrap();
+                let manifest_path = std::path::PathBuf::from(
+                    std::fs::read_to_string(fixture.root.path().join("root-manifest-path"))
+                        .unwrap(),
+                );
+                assert!(manifest_path.is_file());
+                let manifest: Value = serde_json::from_slice(
+                    &std::fs::read(fixture.root.path().join("root-manifest")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(manifest["roots"], roots);
+                workspace.add_root(later.path());
+                let second = if pooled {
+                    fixture.call(json!({"operation":"pool_push","poolId":id,
+                        "tasks":["recall the remembered word"]})).await;
+                    fixture.call(json!({"operation":"pool_wait","poolId":id,
+                        "itemId":2,"timeoutMs":5000})).await
+                } else {
+                    fixture.call(json!({"operation":"worker_send","workerId":id,
+                        "task":"recall the remembered word"})).await;
+                    fixture.wait(&id, 2).await
+                };
+                let second = second.pointer(result_path).unwrap();
+                assert_eq!(second["output"], "silver");
+                assert_eq!(second["workspaceRoots"]["inherited"], roots);
+                assert!(manifest_path.is_file(), "live process still owns its manifest");
+                assert!(workspace.remove_root(additional.path()));
+                workspace.add_root(additional.path());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let status = if pooled {
+                        fixture.call(json!({"operation":"pool_status","poolId":id})).await
+                    } else {
+                        fixture.call(json!({"operation":"worker_status","workerId":id})).await
+                    };
+                    let retired = if pooled {
+                        status["workerWorkspaces"][0]["closed"] == true
+                    } else {
+                        status["status"] == "failed"
+                    };
+                    if retired {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "idle child retained revoked access");
+                    AgentCx::for_request().time().sleep(POLL_INTERVAL).await;
+                }
+                assert!(rustix::process::test_kill_process(pid).is_err());
+                assert!(!manifest_path.exists(), "retirement releases private grants file");
+                assert_eq!(
+                    std::fs::read_to_string(fixture.root.path().join("launches"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    1,
+                    "revocation must never relaunch a worker under fresh grants"
+                );
+            });
+        }
     }
 
     #[test]

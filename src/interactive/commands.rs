@@ -4241,6 +4241,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         let tool = pi::subagents::SubagentTool::new(&self.cwd)
+            .with_workspace(self.workspace.clone())
+            .with_secrets_settings(self.config.secrets.as_ref())
             .with_role_model_selection(pi::app::subagent_role_selection(&self.config))
             .with_model_config(Some(self.config.clone()))
             .with_parent_model(parent_model)
@@ -6313,6 +6315,7 @@ mod tests {
             output: output_marker.to_string(),
             error: None,
             is_error: false,
+            workspace_roots: None,
         };
         let expected_card = completion.card_text();
         let expected_follow_up = completion.follow_up_text();

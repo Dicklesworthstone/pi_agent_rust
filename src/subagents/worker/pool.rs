@@ -165,6 +165,7 @@ fn worker(owner: &str, agent: &str, deadline: Deadline, max_batch_size: usize) -
         context_tokens: None,
         context_window: None,
         workspace: None,
+        workspace_roots: None,
     }))
 }
 
@@ -238,6 +239,7 @@ async fn start(
     let admission = crate::jobs::admit_owned_task(&owner_id)?;
     let parent_model = tool.capture_parent_model();
     let cost_budget = tool.cost_scope.current();
+    let workspace_roots = workspace::CapturedRoots::capture(&tool.workspace, privacy.clone())?;
     let mut agent = tool
         .discover(scope)?
         .remove(&name)
@@ -311,6 +313,7 @@ async fn start(
                 )
                 .with_parent_model(parent_model.clone())
                 .with_cost_budget(cost_budget.clone())
+                .with_workspace_roots(workspace_roots.clone())
                 .with_worker_model_selection(model_selection.clone())
                 .with_worker_fallback_policy(fallback_policy.clone())
                 .with_worker_isolation(isolation.clone()),
@@ -921,6 +924,7 @@ fn drain_snapshot(
             "timedOut":expired && items.is_empty() && !done,"items":items,
             "workerWorkspaces":workers.iter().enumerate().map(|(index, worker)| json!({
                 "workerIndex":index + 1, "workspace":worker.workspace, "closed":worker.closed,
+                "workspaceRoots":worker.workspace_roots,
             })).collect::<Vec<_>>(),
         });
         (value, state.privacy.clone())
@@ -1181,6 +1185,7 @@ fn manifest(state: &PoolState, selected: Option<u64>, terminal: bool) -> Result<
         })).collect::<Vec<_>>(),
         "workerWorkspaces":workers.iter().enumerate().map(|(index, worker)| json!({
             "workerIndex":index + 1, "workspace":worker.workspace, "closed":worker.closed,
+            "workspaceRoots":worker.workspace_roots,
         })).collect::<Vec<_>>(),
     });
     if let Some(id) = selected {

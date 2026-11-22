@@ -61,6 +61,7 @@ pub(super) struct ChildRunner {
     role_model_spec: Option<String>,
     parent_model: Option<crate::tools::ToolModelSelection>,
     cost_budget: Option<crate::cost::CostBudget>,
+    workspace_roots: Option<super::workspace::CapturedRoots>,
     worker_model_selection: Option<super::model_selection::Selection>,
     worker_fallback_policy: Option<String>,
     worker_isolation: Option<Arc<super::worker::isolation::Capture>>,
@@ -89,6 +90,7 @@ impl ChildRunner {
             role_model_spec,
             parent_model: None,
             cost_budget: None,
+            workspace_roots: None,
             worker_model_selection: None,
             worker_fallback_policy: None,
             worker_isolation: None,
@@ -150,6 +152,14 @@ impl ChildRunner {
 
     pub(super) fn with_cost_budget(mut self, budget: Option<crate::cost::CostBudget>) -> Self {
         self.cost_budget = budget;
+        self
+    }
+
+    pub(super) fn with_workspace_roots(
+        mut self,
+        roots: Option<super::workspace::CapturedRoots>,
+    ) -> Self {
+        self.workspace_roots = roots;
         self
     }
 
@@ -360,6 +370,7 @@ impl ChildRunner {
                 public_task: self.public_task.clone(),
                 launch_admission: self.launch_admission.clone(),
                 cost_budget: self.cost_budget.clone(),
+                workspace_roots: self.workspace_roots.clone(),
             },
             |(_, launch)| launch.clone(),
         );
@@ -495,14 +506,13 @@ impl ChildRunner {
         baseline: Option<&BaselineCapture>,
     ) -> Attempt {
         let cwd = self.task_cwd(&task);
-        let mut args = child_args(
+        let args = child_args(
             agent,
             self.role_model_spec.as_deref(),
             launch.parent_model.as_ref(),
             task.model_selection.as_ref(),
             schema,
         );
-        let prompt_snapshot = super::task_file::snapshot_prompt(&mut args, owner, self.deadline);
         // Every assignment uses the same private regular-file transport.
         // Inline instructions, predecessor output and corrective retries can
         // exceed argv limits just as captured taskFile instructions can.
@@ -517,20 +527,13 @@ impl ChildRunner {
         } else {
             super::task_file::stdin(&task.task, owner, self.deadline)
         };
-        let args = super::with_fallback_policy_args(args, task.fallback_policy.as_deref());
+        let mut args = super::with_fallback_policy_args(args, task.fallback_policy.as_deref());
         let policy = isolation_policy(&task);
         let mut attempt = Attempt::new(
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args),
             self.deadline,
         );
         attempt.result.task = launch.display_task().to_string();
-        let _prompt_snapshot = match prompt_snapshot {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                attempt.result.fail(error.to_string());
-                return attempt;
-            }
-        };
         let stdin = match stdin {
             Ok(stdin) => stdin,
             Err(error) => {
@@ -645,6 +648,51 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
+        // Only concrete paths in this captured worktree may be granted. The
+        // private transport outlives the child, including cancellation cleanup.
+        let workspace_transport = match launch
+            .workspace_roots
+            .as_ref()
+            .map(|roots| {
+                roots.prepare(
+                    attempt.isolation.as_ref().map(|(handle, _)| handle),
+                    owner,
+                    self.deadline,
+                )
+            })
+            .transpose()
+        {
+            Ok(transport) => transport,
+            Err(error) => {
+                attempt.result.fail(error.to_string());
+                return attempt;
+            }
+        };
+        if let Some(transport) = &workspace_transport {
+            attempt.workspace_roots = Some(transport.lease.clone());
+            attempt.result.workspace_roots = Some(transport.metadata.clone());
+            if let Err(error) = transport.append_prompt(&mut args) {
+                attempt.result.fail(error.to_string());
+                return attempt;
+            }
+        }
+        let _prompt_snapshot =
+            match super::task_file::snapshot_prompt(&mut args, owner, self.deadline) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    attempt.result.fail(error.to_string());
+                    return attempt;
+                }
+            };
+        if let Some(transport) = &workspace_transport
+            && let Err(error) = transport.append_args(&mut args)
+        {
+            attempt.result.fail(error.to_string());
+            return attempt;
+        }
+        if !attempt.check(owner) {
+            return attempt;
+        }
         let messaging = attempt.result.tools.iter().any(|tool| tool == "hub");
         let hub_channel = if messaging || launch.cost_budget.is_some() {
             match crate::agent_hub::ipc::ChildChannel::bind(
@@ -699,7 +747,7 @@ impl ChildRunner {
             }
         };
         // Check after callbacks and setup, immediately before dispatch.
-        if !check_budget(owner, self.deadline, &mut attempt.result) {
+        if !attempt.check(owner) {
             return attempt;
         }
         // Scope can change during host progress callbacks. Retain this policy
@@ -709,7 +757,7 @@ impl ChildRunner {
                 attempt.result.fail(error.to_string());
                 return attempt;
             }
-            if !check_budget(owner, self.deadline, &mut attempt.result) {
+            if !attempt.check(owner) {
                 return attempt;
             }
         }
@@ -733,7 +781,7 @@ impl ChildRunner {
         attempt.result.pid = Some(child.id());
         // Close the registration-to-spawn race. A kill observed after OS spawn
         // still owns a reaper and must not be announced as a new running task.
-        if !check_budget(owner, self.deadline, &mut attempt.result) {
+        if !attempt.check(owner) {
             return attempt;
         }
         if !attempt.hub.mark_running(child.id(), &mut attempt.result) {
@@ -776,7 +824,7 @@ impl ChildRunner {
         };
         let mut protocol = protocol::ChildProtocol::default();
         loop {
-            if !check_budget(owner, self.deadline, &mut attempt.result) {
+            if !attempt.check(owner) {
                 child.terminate();
                 break;
             }
@@ -787,7 +835,7 @@ impl ChildRunner {
             pipes.drain(&mut protocol, &mut attempt.result, update);
             #[cfg(not(any(unix, windows)))]
             drain_child_frames(&rx, &mut protocol, &mut attempt.result, update);
-            if !check_budget(owner, self.deadline, &mut attempt.result) {
+            if !attempt.check(owner) {
                 // Invalid frames and expired budgets must stop the producer,
                 // including one that continues writing after agent_end.
                 child.terminate();
@@ -834,7 +882,7 @@ impl ChildRunner {
             self.deadline,
         )
         .await;
-        if check_budget(owner, self.deadline, &mut attempt.result) {
+        if attempt.check(owner) {
             if attempt.result.exit_code != Some(0) {
                 attempt.result.fail(format!(
                     "Child exited with code {}.",
@@ -892,6 +940,19 @@ fn check_budget(owner: &AgentCx, deadline: Deadline, result: &mut SubagentResult
     !result.is_error
 }
 
+fn check_workspace_roots(
+    roots: Option<&super::workspace::CapturedRoots>,
+    result: &mut SubagentResult,
+) -> bool {
+    if let Some(roots) = roots
+        && let Err(error) = roots.check()
+    {
+        result.fail(error.to_string());
+        return false;
+    }
+    true
+}
+
 #[allow(clippy::large_enum_variant)]
 enum PendingRun {
     Settled(SubagentResult),
@@ -921,6 +982,7 @@ struct Attempt {
     hub: HubLease,
     deadline: Deadline,
     parent_wait: Option<Arc<crate::agent_hub::DependencyHold>>,
+    workspace_roots: Option<super::workspace::CapturedRoots>,
 }
 
 impl Attempt {
@@ -931,7 +993,13 @@ impl Attempt {
             hub: HubLease::empty(),
             deadline,
             parent_wait: None,
+            workspace_roots: None,
         }
+    }
+
+    fn check(&mut self, owner: &AgentCx) -> bool {
+        check_budget(owner, self.deadline, &mut self.result)
+            && check_workspace_roots(self.workspace_roots.as_ref(), &mut self.result)
     }
 
     async fn defer(
@@ -965,7 +1033,7 @@ impl Attempt {
         accepted: bool,
         update: Option<&UpdateCallback>,
     ) -> SubagentResult {
-        check_budget(owner, self.deadline, &mut self.result);
+        self.check(owner);
         let accepted = accepted
             && !self.result.is_error
             && matches!(self.result.status, SubagentStatus::Completed);
@@ -994,15 +1062,22 @@ impl Attempt {
                     // Recheck after snapshot collection, immediately before
                     // mutation dispatch. Once apply begins it is not rolled
                     // back or misreported merely because the clock advances.
-                    let in_budget = check_budget(owner, self.deadline, &mut self.result);
+                    let in_budget = self.check(owner);
                     if !in_budget {
                         outcome.apply_mode = "keep".to_string();
                     } else if mode == IsoApplyMode::Apply {
+                        let workspace_roots = self.workspace_roots.clone();
                         let applied = crate::worktree_iso::apply_to_parent_owned(
                             &handle,
                             &outcome.patch,
                             owner,
-                            || check_budget(owner, self.deadline, &mut self.result),
+                            || {
+                                check_budget(owner, self.deadline, &mut self.result)
+                                    && check_workspace_roots(
+                                        workspace_roots.as_ref(),
+                                        &mut self.result,
+                                    )
+                            },
                         )
                         .await;
                         match applied {

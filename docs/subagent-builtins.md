@@ -96,6 +96,63 @@ tool JSON Schema. For `tasks`/`chain`, workspace options must be placed on each
 entry; top-level options are rejected rather than ignored or broadcast. These
 checks do not add path confinement or change authored-agent discovery roots.
 
+### Additional workspace roots
+
+Native delegation inherits the additional directories admitted through
+`--add-dir`, `/add-dir`, or the owning SDK `WorkspaceHandle`. This applies to
+single calls, parallel and chained calls, workflows, background delegation,
+retained workers and pools, `/tan`, schema retries, and explicit hub revival.
+SDK tools built independently of a session can attach their live handle with
+`SubagentTool::with_workspace`.
+
+Each request captures its grants when admitted. Adding another directory later
+does not widen queued work or an existing worker. Removing an inherited root
+refuses subsequent launches and revival, stops affected running or idle
+children at the next native control checkpoint, and prevents pending isolated
+writeback. Removing and re-adding the same path creates a new grant; it cannot
+reactivate an old child. Effects already performed are retained.
+
+For an unisolated child, the added directories retain their original paths.
+For a worktree-isolated child, directories inside the source repository map
+into the captured checkout. Roots outside that repository, including ancestor
+directories, are excluded. A directory missing from the capture, such as an
+empty or ignored-only directory, is also excluded. A mapped symlink that
+escapes the captured checkout refuses the launch. No additional-root grant
+points an isolated child back at the live source checkout or a live sibling
+repository.
+
+The child receives a host-generated description of these path mappings and
+exclusions. Result entries expose the same information under `workspaceRoots`:
+
+```json
+{
+  "schema": "pi.subagent.workspace.v1",
+  "inherited": [],
+  "mapped": [{"source": "/work/project/library", "path": "/tmp/pi-iso-run/library"}],
+  "excluded": [{"source": "/work/other-project", "reason": "outside_isolated_repository"}]
+}
+```
+
+Retained worker snapshots also expose `workspaceRoots`; pool snapshots include
+it in each `workerWorkspaces` entry. `TanCompletion.workspace_roots` carries
+the same optional description. These fields describe access and do not grant
+authority to a later invocation.
+
+Filesystem access does not grant workspace trust or load instructions,
+settings, skills, extensions, or agent profiles from the added directories.
+The parent's privacy policy screens the complete mapping before it enters the
+child's instructions; a mapping that would be redacted is refused rather than
+converted into different executable paths. SDK callers using a borrowed
+`execute_with_auxiliary_privacy` callback must use `execute_with_invocation`
+with an owned policy, or ordinary `execute`, when delegating additional roots.
+
+Native children receive the roots through one private bounded manifest,
+retained until their process is retired. Root count does not expand the
+command line. A launch supports at most 128 additional roots and a 256 KiB
+encoded manifest; malformed, noncanonical, unavailable, or unrepresentable
+root paths fail before child startup. The child uses the same ordinary root
+validation and native tool confinement as explicit `--add-dir`.
+
 ## Background delegation
 
 Add `"async": true` to a single, `tasks`, `chain`, or `workflow` request to release the
