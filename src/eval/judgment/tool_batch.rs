@@ -85,6 +85,11 @@ struct Failed<'a> {
 }
 
 fn encode_failure(index: usize, call: &ToolCall, error: &str) -> Result<String, String> {
+    let error = if error.is_empty() {
+        "tool call failed"
+    } else {
+        error
+    };
     bridge_result::encode_limited(
         &Item {
             index,

@@ -20,7 +20,8 @@ use crate::hostcall_rewrite::{
     HostcallRewriteEngine, HostcallRewritePlan, HostcallRewritePlanKind,
 };
 use crate::hostcall_superinstructions::{
-    HostcallSuperinstructionCompiler, HostcallSuperinstructionPlan, execute_with_superinstruction,
+    HostcallSuperinstructionCompiler, HostcallSuperinstructionPlan, opcode_window_signature_str,
+    select_best_plan_for_str_slice,
 };
 use crate::hostcall_trace_jit::{GuardContext, TraceJitCompiler};
 use crate::permissions::{PermissionStore, PersistedDecision};

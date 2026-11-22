@@ -129,6 +129,22 @@ impl TraceGuard {
             Self::MinSupportCount(min) => ctx.current_support_count >= *min,
         }
     }
+
+    /// Zero-allocation `&[&str]` variant of [`Self::check`].
+    #[must_use]
+    pub fn check_str(&self, trace: &[&str], ctx: &GuardContext) -> bool {
+        match self {
+            Self::OpcodePrefix(window) => {
+                trace.len() >= window.len()
+                    && trace
+                        .iter()
+                        .zip(window.iter())
+                        .all(|(actual, expected)| *actual == expected.as_str())
+            }
+            Self::SafetyEnvelopeNotVetoing => !ctx.safety_envelope_vetoing,
+            Self::MinSupportCount(min) => ctx.current_support_count >= *min,
+        }
+    }
 }
 
 /// Context supplied to guard checks.
@@ -358,17 +374,24 @@ impl TraceJitCompiler {
         self.telemetry.plans_evaluated += 1;
         self.generation += 1;
 
-        let profile = self.profiles.entry(plan.plan_id.clone()).or_default();
+        let (execution_count, invalidated) =
+            if let Some(profile) = self.profiles.get_mut(&plan.plan_id) {
+                profile.execution_count += 1;
+                profile.last_access_generation = self.generation;
+                (profile.execution_count, profile.invalidated)
+            } else {
+                let profile = self.profiles.entry(plan.plan_id.clone()).or_default();
+                profile.execution_count += 1;
+                profile.last_access_generation = self.generation;
+                (profile.execution_count, profile.invalidated)
+            };
 
-        profile.execution_count += 1;
-        profile.last_access_generation = self.generation;
-
-        if profile.invalidated {
+        if invalidated {
             return false;
         }
 
         // Check if plan has reached the hotness threshold.
-        if profile.execution_count >= self.config.min_jit_executions
+        if execution_count >= self.config.min_jit_executions
             && !self.cache.contains_key(&plan.plan_id)
         {
             self.compile_trace(plan);
@@ -493,6 +516,50 @@ impl TraceJitCompiler {
             deopt_reason: None,
             cost_delta: tier_improvement_delta,
         }
+    }
+
+    /// Zero-allocation `&[&str]` hot-path variant of [`Self::try_jit_dispatch`]
+    /// returning `(jit_hit, cost_delta)` while maintaining identical telemetry,
+    /// LRU updates, guard checks, and trace invalidation semantics.
+    pub(crate) fn try_jit_dispatch_str(
+        &mut self,
+        plan_id: &str,
+        trace: &[&str],
+        ctx: &GuardContext,
+    ) -> (bool, i64) {
+        if !self.config.enabled {
+            return (false, 0);
+        }
+
+        self.generation += 1;
+
+        let (tier_improvement_delta, guard_failed) = {
+            let Some(compiled) = self.cache.get(plan_id) else {
+                return (false, 0);
+            };
+
+            let guard_failed = compiled
+                .guards
+                .iter()
+                .any(|guard| !guard.check_str(trace, ctx));
+            (compiled.tier_improvement_delta, guard_failed)
+        };
+
+        if let Some(profile) = self.profiles.get_mut(plan_id) {
+            profile.last_access_generation = self.generation;
+        }
+
+        if guard_failed {
+            let _ = self.record_guard_failure(plan_id);
+            return (false, 0);
+        }
+
+        self.telemetry.jit_hits += 1;
+        if let Some(profile) = self.profiles.get_mut(plan_id) {
+            profile.consecutive_guard_failures = 0;
+        }
+
+        (true, tier_improvement_delta)
     }
 
     /// Record a guard failure for a plan, possibly invalidating the trace.
@@ -1360,5 +1427,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn try_jit_dispatch_str_matches_owned_dispatch_and_handles_invalidation() {
+        let config = TraceJitConfig::new(true, 2, 8, 2);
+        let mut owned_jit = TraceJitCompiler::new(config.clone());
+        let mut str_jit = TraceJitCompiler::new(config);
+        let plan = make_plan("str_parity", &["tool.read", "tool.write"], 6);
+
+        // Before promotion threshold -> not compiled.
+        assert!(!owned_jit.record_plan_execution(&plan));
+        assert!(!str_jit.record_plan_execution(&plan));
+        let good_ctx = GuardContext {
+            safety_envelope_vetoing: false,
+            current_support_count: plan.support_count,
+        };
+        let owned_pre = owned_jit.try_jit_dispatch(&plan.plan_id, &plan.opcode_window, &good_ctx);
+        let str_pre =
+            str_jit.try_jit_dispatch_str(&plan.plan_id, &["tool.read", "tool.write"], &good_ctx);
+        assert_eq!((owned_pre.jit_hit, owned_pre.cost_delta), str_pre);
+        assert!(!str_pre.0);
+
+        // Second execution promotes to JIT -> dispatch succeeds with positive delta.
+        assert!(owned_jit.record_plan_execution(&plan));
+        assert!(str_jit.record_plan_execution(&plan));
+        let owned_hit = owned_jit.try_jit_dispatch(&plan.plan_id, &plan.opcode_window, &good_ctx);
+        let str_hit =
+            str_jit.try_jit_dispatch_str(&plan.plan_id, &["tool.read", "tool.write"], &good_ctx);
+        assert_eq!((owned_hit.jit_hit, owned_hit.cost_delta), str_hit);
+        assert!(str_hit.0);
+        assert!(str_hit.1 > 0);
+
+        // Guard failure via low support count (the default-ctx bug class) deoptimizes & invalidates identically.
+        let zero_ctx = GuardContext::default();
+        for _ in 0..2 {
+            let owned_miss =
+                owned_jit.try_jit_dispatch(&plan.plan_id, &plan.opcode_window, &zero_ctx);
+            let str_miss = str_jit.try_jit_dispatch_str(
+                &plan.plan_id,
+                &["tool.read", "tool.write"],
+                &zero_ctx,
+            );
+            assert_eq!((owned_miss.jit_hit, owned_miss.cost_delta), str_miss);
+            assert!(!str_miss.0);
+        }
+        assert!(str_jit.is_invalidated(&plan.plan_id));
+        assert_eq!(str_jit.telemetry(), owned_jit.telemetry());
     }
 }

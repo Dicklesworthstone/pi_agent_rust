@@ -369,7 +369,7 @@ fn egraph_fast_opcode_cost_for_engine(
 #[derive(Debug, Default)]
 struct HostcallSuperinstructionRuntimeState {
     compiler: HostcallSuperinstructionCompiler,
-    trace_history: VecDeque<String>,
+    trace_history: VecDeque<&'static str>,
     plans: Vec<HostcallSuperinstructionPlan>,
     observation_count: u64,
 }
@@ -403,12 +403,13 @@ fn hostcall_superinstruction_telemetry(
         };
     };
 
-    let Ok(mut state) = hostcall_superinstruction_state().lock() else {
+    let Ok(mut state_guard) = hostcall_superinstruction_state().lock() else {
         return HostcallSuperinstructionTelemetry {
             deopt_reason: Some("superinstruction_state_lock_poisoned".to_string()),
             ..HostcallSuperinstructionTelemetry::default()
         };
     };
+    let state = &mut *state_guard;
     if !state.compiler.enabled() {
         return HostcallSuperinstructionTelemetry {
             deopt_reason: Some("superinstructions_disabled".to_string()),
@@ -416,7 +417,7 @@ fn hostcall_superinstruction_telemetry(
         };
     }
 
-    state.trace_history.push_back(opcode.code().to_string());
+    state.trace_history.push_back(opcode.code());
     while state.trace_history.len() > HOSTCALL_SUPERINSTRUCTION_TRACE_HISTORY_LIMIT {
         let _ = state.trace_history.pop_front();
     }
@@ -426,81 +427,76 @@ fn hostcall_superinstruction_telemetry(
         && (state.plans.is_empty()
             || state.observation_count % HOSTCALL_SUPERINSTRUCTION_RECOMPILE_INTERVAL == 0)
     {
-        let trace = state.trace_history.iter().cloned().collect::<Vec<_>>();
-        state.plans = state.compiler.compile_plans(&[trace]);
+        let trace = state.trace_history.make_contiguous();
+        state.plans = state.compiler.compile_plans_str(&[trace]);
     }
 
     let max_window = state.compiler.max_window().min(state.trace_history.len());
-    let mut recent_window = state
-        .trace_history
-        .iter()
-        .rev()
-        .take(max_window)
-        .cloned()
-        .collect::<Vec<_>>();
-    recent_window.reverse();
-    if recent_window.len() < 2 {
+    if max_window < 2 {
         return HostcallSuperinstructionTelemetry {
             deopt_reason: Some("insufficient_trace_history".to_string()),
             ..HostcallSuperinstructionTelemetry::default()
         };
     }
 
-    let mut best_hit = None;
-    for start in 0..recent_window.len() - 1 {
-        let candidate = execute_with_superinstruction(&recent_window[start..], &state.plans);
-        if candidate.selection.hit() {
-            let replace =
-                best_hit
-                    .as_ref()
-                    .is_none_or(|current: &HostcallSuperinstructionTelemetry| {
-                        candidate.selection.expected_cost_delta > current.expected_cost_delta
-                    });
-            if replace {
-                // Attempt JIT promotion and dispatch for this plan.
-                let (jit_hit, jit_cost_delta) = if let Some(ref pid) =
-                    candidate.selection.selected_plan_id
-                {
-                    // Find the matching plan to record execution.
-                    let matched_plan = state.plans.iter().find(|p| p.plan_id == *pid);
-                    if let Some(plan) = matched_plan {
-                        TRACE_JIT.with(|cell| {
-                            let mut jit = cell.borrow_mut();
-                            jit.record_plan_execution(plan);
-                            let ctx = GuardContext::default();
-                            let result = jit.try_jit_dispatch(pid, &recent_window[start..], &ctx);
-                            (result.jit_hit, result.cost_delta)
-                        })
-                    } else {
-                        (false, 0)
-                    }
-                } else {
-                    (false, 0)
-                };
+    let mut stack_window = [""; 8];
+    let heap_window: Vec<&'static str>;
+    let skip = state.trace_history.len() - max_window;
+    let recent_window: &[&str] = if max_window <= stack_window.len() {
+        for (slot, &code) in stack_window
+            .iter_mut()
+            .zip(state.trace_history.iter().skip(skip))
+        {
+            *slot = code;
+        }
+        &stack_window[..max_window]
+    } else {
+        heap_window = state.trace_history.iter().skip(skip).copied().collect();
+        &heap_window
+    };
 
-                best_hit = Some(HostcallSuperinstructionTelemetry {
-                    trace_signature: Some(candidate.selection.trace_signature),
-                    plan_id: candidate.selection.selected_plan_id,
-                    expected_cost_delta: candidate.selection.expected_cost_delta,
-                    observed_cost_delta: candidate.selection.expected_cost_delta,
-                    deopt_reason: None,
-                    jit_hit,
-                    jit_cost_delta,
-                });
+    let mut best_match: Option<(&HostcallSuperinstructionPlan, usize)> = None;
+    for start in 0..recent_window.len() - 1 {
+        let sub_window = &recent_window[start..];
+        if let Ok(plan) = select_best_plan_for_str_slice(sub_window, &state.plans) {
+            let replace = best_match
+                .is_none_or(|(current, _)| plan.expected_cost_delta > current.expected_cost_delta);
+            if replace {
+                best_match = Some((plan, start));
             }
         }
     }
-    if let Some(hit) = best_hit {
-        return hit;
+    if let Some((plan, start)) = best_match {
+        // Supply the matched plan's real observed support count so
+        // TraceGuard::MinSupportCount evaluates live support rather
+        // than failing closed against GuardContext::default() (0).
+        let (jit_hit, jit_cost_delta) = TRACE_JIT.with(|cell| {
+            let mut jit = cell.borrow_mut();
+            jit.record_plan_execution(plan);
+            let ctx = GuardContext {
+                safety_envelope_vetoing: false,
+                current_support_count: plan.support_count,
+            };
+            jit.try_jit_dispatch_str(&plan.plan_id, &recent_window[start..], &ctx)
+        });
+        return HostcallSuperinstructionTelemetry {
+            trace_signature: Some(opcode_window_signature_str(&recent_window[start..])),
+            plan_id: Some(plan.plan_id.clone()),
+            expected_cost_delta: plan.expected_cost_delta,
+            observed_cost_delta: plan.expected_cost_delta,
+            deopt_reason: None,
+            jit_hit,
+            jit_cost_delta,
+        };
     }
 
-    let fallback = execute_with_superinstruction(&recent_window, &state.plans);
+    let deopt_reason = select_best_plan_for_str_slice(recent_window, &state.plans).err();
     HostcallSuperinstructionTelemetry {
-        trace_signature: Some(fallback.selection.trace_signature),
+        trace_signature: Some(opcode_window_signature_str(recent_window)),
         plan_id: None,
         expected_cost_delta: 0,
         observed_cost_delta: 0,
-        deopt_reason: fallback.selection.deopt_reason.map(str::to_string),
+        deopt_reason: deopt_reason.map(str::to_string),
         jit_hit: false,
         jit_cost_delta: 0,
     }
@@ -511,6 +507,9 @@ pub(super) fn reset_hostcall_superinstruction_state_for_tests() {
     if let Ok(mut state) = hostcall_superinstruction_state().lock() {
         *state = HostcallSuperinstructionRuntimeState::default();
     }
+    TRACE_JIT.with(|cell| {
+        *cell.borrow_mut() = TraceJitCompiler::default();
+    });
 }
 
 /// Guard that serializes tests which touch the global superinstruction state.
