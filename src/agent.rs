@@ -8710,12 +8710,13 @@ impl ExtensionModelCatalog {
     pub(crate) fn snapshot(&self) -> Result<ExtensionModelCatalogSnapshot> {
         // Release the publication lock before consulting the runtime catalog.
         // Runtime refresh and host-state writers only acquire the inner lock.
-        let state = Arc::clone(
-            &self
+        let state = {
+            let guard = self
                 .state
                 .lock()
-                .map_err(|_| Error::session("setModel: the live model catalog is unavailable"))?,
-        );
+                .map_err(|_| Error::session("setModel: the live model catalog is unavailable"))?;
+            Arc::clone(&guard)
+        };
         let mut state = state
             .lock()
             .map_err(|_| Error::session("setModel: the live model catalog is unavailable"))?;
@@ -10003,14 +10004,14 @@ fn pi_ai_completion_response(message: &AssistantMessage, simple: bool) -> Result
 mod message_queue_tests {
     use super::*;
 
-    fn user_message(text: &str) -> Message {
+    pub(super) fn user_message(text: &str) -> Message {
         Message::User(UserMessage {
             content: UserContent::Text(text.to_string()),
             timestamp: 0,
         })
     }
 
-    fn queued_user_message(text: &str) -> QueuedAgentMessage {
+    pub(super) fn queued_user_message(text: &str) -> QueuedAgentMessage {
         QueuedAgentMessage::from_authored_message(user_message(text))
     }
 
@@ -10723,6 +10724,7 @@ mod tool_effect_batch_planning_tests {
 
 #[cfg(test)]
 mod extensions_integration_tests {
+    use super::message_queue_tests::{queued_user_message, user_message};
     use super::*;
 
     use crate::session::Session;

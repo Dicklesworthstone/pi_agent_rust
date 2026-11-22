@@ -19607,6 +19607,7 @@ mod tests {
             model: "test-model".to_string(),
             usage: pi::model::Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };

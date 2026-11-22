@@ -12,12 +12,12 @@ use crate::error::{Error, Result};
 use serde_json::{Value, json};
 
 #[derive(Default)]
-pub(crate) struct RpcPlanControl {
+pub struct RpcPlanControl {
     presented: Option<(String, SessionPlanReview)>,
 }
 
 impl RpcPlanControl {
-    pub(crate) fn handles(command: &str) -> bool {
+    pub fn handles(command: &str) -> bool {
         matches!(
             command,
             "get_plan"
@@ -31,7 +31,7 @@ impl RpcPlanControl {
 
     /// Run before RPC recovery preflight so malformed requests cannot write
     /// session history as a side effect of being rejected.
-    pub(crate) fn validate(command: &str, payload: &Value) -> Result<()> {
+    pub fn validate(command: &str, payload: &Value) -> Result<()> {
         let fields = payload
             .as_object()
             .ok_or_else(|| Error::validation("Plan command must be an object"))?;
@@ -136,7 +136,7 @@ impl RpcPlanControl {
         result
     }
 
-    pub(crate) async fn command(
+    pub async fn command(
         &mut self,
         handle: &mut AgentSession,
         owner: &AgentCx,

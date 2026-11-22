@@ -275,7 +275,7 @@ pub(super) fn snapshot(handle: &AgentSession) -> Result<PlanSnapshot> {
 /// Prepare the source session's unpinned prompt before installing another
 /// session. Nothing changes on error, and no fallible cleanup follows the
 /// replacement. Callers retain their outer session authority until installation.
-pub(crate) fn replacement_system_prompt(
+pub fn replacement_system_prompt(
     agent: &crate::agent::Agent,
     store: &Arc<Store>,
     session: &Session,
@@ -585,7 +585,7 @@ fn decode_plan_checkpoint(data: &serde_json::Value, session_id: &str) -> Result<
 /// Call only on the freshly copied target before saving or installing it.
 /// Rebind every selected checkpoint so a later fork can select old inherited
 /// history before this fork's tip without encountering a foreign identity.
-pub(crate) fn inherit_fork_checkpoint(session: &mut Session, source_id: &str) -> Result<()> {
+pub fn inherit_fork_checkpoint(session: &mut Session, source_id: &str) -> Result<()> {
     if session.header.id == source_id {
         return Err(checkpoint_error(
             "fork target must have a fresh session identity",

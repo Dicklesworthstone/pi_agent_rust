@@ -9868,6 +9868,7 @@ fn rpc_parse_extension_ui_response(
 
 #[cfg(test)]
 mod ui_bridge_tests {
+    use super::tests::parse_response;
     use super::*;
 
     /// Await a bridge deadline-timer task and fail loudly if it never finishes.
@@ -10948,7 +10949,10 @@ fn retry_delay_ms(config: &Config, attempt: u32) -> u32 {
 
 #[cfg(test)]
 mod retry_tests {
-    use super::tests::{build_test_rpc_options, dummy_entry};
+    use super::tests::{
+        assert_err, assert_ok, build_test_rpc_options, dummy_entry, parse_response,
+        recv_ask_request, recv_line, recv_ui_request,
+    };
     use super::*;
     use crate::agent::{Agent, AgentConfig, AgentSession};
     use crate::model::{AssistantMessage, ThinkingLevel, Usage};
@@ -17011,7 +17015,7 @@ mod retry_tests {
     }
 
     async fn collect_transition_responses(
-        out_rx: &Arc<Mutex<Receiver<String>>>,
+        out_rx: &Arc<std::sync::Mutex<std::sync::mpsc::Receiver<String>>>,
         ids: &[&str],
     ) -> Vec<Value> {
         asupersync::time::timeout(wall_now(), Duration::from_secs(2), async {
@@ -17079,7 +17083,7 @@ mod retry_tests {
                 let (in_tx, _) = open_transition_test_input(&mut fixture).await;
                 let inner_session = Arc::clone(&fixture.inner_session);
                 let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
-                let out_rx = Arc::new(Mutex::new(out_rx));
+                let out_rx = Arc::new(std::sync::Mutex::new(out_rx));
                 let server = handle.spawn(async move {
                     Box::pin(run(
                         fixture.agent_session,
@@ -17240,7 +17244,7 @@ mod retry_tests {
                     .manager()
                     .clone();
                 let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
-                let out_rx = Arc::new(Mutex::new(out_rx));
+                let out_rx = Arc::new(std::sync::Mutex::new(out_rx));
                 let server = handle.spawn(async move {
                     Box::pin(run(
                         fixture.agent_session,
@@ -17337,7 +17341,7 @@ mod retry_tests {
                         .expect("send transition");
                     let inner_session = Arc::clone(&fixture.inner_session);
                     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
-                    let out_rx = Arc::new(Mutex::new(out_rx));
+                    let out_rx = Arc::new(std::sync::Mutex::new(out_rx));
                     let server = handle.spawn(async move {
                         Box::pin(run_with_input(
                             fixture.agent_session,
@@ -17411,7 +17415,7 @@ mod retry_tests {
                     let (in_tx, _) = open_transition_test_input(&mut fixture).await;
                     let inner_session = Arc::clone(&fixture.inner_session);
                     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
-                    let out_rx = Arc::new(Mutex::new(out_rx));
+                    let out_rx = Arc::new(std::sync::Mutex::new(out_rx));
                     let server = handle.spawn(async move {
                         Box::pin(run(
                             fixture.agent_session,
@@ -17498,7 +17502,7 @@ mod retry_tests {
                 fixture.options.ask_tool = Some(ask.clone());
                 let (in_tx, _) = open_transition_test_input(&mut fixture).await;
                 let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
-                let out_rx = Arc::new(Mutex::new(out_rx));
+                let out_rx = Arc::new(std::sync::Mutex::new(out_rx));
                 let server = handle.spawn(async move {
                     Box::pin(run(
                         fixture.agent_session,
@@ -23451,7 +23455,7 @@ mod tests {
         (agent_session, options)
     }
 
-    async fn recv_line(
+    pub(super) async fn recv_line(
         rx: &Arc<Mutex<Receiver<String>>>,
         label: &str,
     ) -> std::result::Result<String, String> {
@@ -23478,7 +23482,7 @@ mod tests {
         }
     }
 
-    fn parse_response(line: &str) -> Value {
+    pub(super) fn parse_response(line: &str) -> Value {
         serde_json::from_str(line.trim()).expect("parse JSON response")
     }
 
@@ -23526,13 +23530,13 @@ mod tests {
         recv_response(out_rx, label).await
     }
 
-    fn assert_ok(resp: &Value, command: &str) {
+    pub(super) fn assert_ok(resp: &Value, command: &str) {
         assert_eq!(resp["type"], "response", "response type for {command}");
         assert_eq!(resp["command"], command);
         assert_eq!(resp["success"], true, "success for {command}: {resp}");
     }
 
-    fn assert_err(resp: &Value, command: &str) {
+    pub(super) fn assert_err(resp: &Value, command: &str) {
         assert_eq!(resp["type"], "response", "response type for {command}");
         assert_eq!(resp["command"], command);
         assert_eq!(
@@ -23541,7 +23545,10 @@ mod tests {
         );
     }
 
-    async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
+    pub(super) async fn recv_ui_request(
+        out_rx: &Arc<Mutex<Receiver<String>>>,
+        label: &str,
+    ) -> Value {
         let start = Instant::now();
         loop {
             let recv_result = {
@@ -23573,7 +23580,10 @@ mod tests {
         }
     }
 
-    async fn recv_ask_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
+    pub(super) async fn recv_ask_request(
+        out_rx: &Arc<Mutex<Receiver<String>>>,
+        label: &str,
+    ) -> Value {
         let start = Instant::now();
         loop {
             let recv_result = {

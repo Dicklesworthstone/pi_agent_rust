@@ -1595,7 +1595,7 @@ struct ManifestRegistrations {
     event_handlers: Vec<String>,
 }
 
-/// Node.js stream, process, socket, and watcher EventEmitter callback names
+/// Node.js stream, process, socket, and watcher `EventEmitter` callback names
 /// that static `.on(...)` scanning must never mistake for Pi extension
 /// lifecycle hooks (`pi.on(...)` / `pi.events.on(...)`).
 const NON_PI_NODE_EVENTS: &[&str] = &[
