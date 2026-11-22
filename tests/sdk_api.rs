@@ -1142,6 +1142,179 @@ printf '%s\n' '{"type":"response","id":"rpc-9","command":"set_plan_mode","succes
     client.shutdown().expect("shutdown protocol fixture");
 }
 
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_session_transitions_deliver_ui_events_without_stealing_terminal_responses() {
+    let directory = tempfile::tempdir().expect("session protocol fixture directory");
+    let mut client = rpc_pipe_fixture(
+        r#"
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"extension_ui_request","id":"ui-new","requestGeneration":11,"method":"confirm","title":"Create session?"}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-2","command":"extension_ui_response","success":true,"data":{"resolved":true}}'
+printf '%s\n' '{"type":"response","id":"rpc-1","command":"new_session","success":true,"data":{"cancelled":false}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"ask_request","id":"ask-switch","questions":[{"id":"switch-choice","question":"Keep the current session?","options":[{"label":"Keep"},{"label":"Switch"}]}]}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-4","command":"ask_response","success":true,"data":{"resolved":true}}'
+printf '%s\n' '{"type":"response","id":"rpc-3","command":"switch_session","success":true,"data":{"cancelled":true}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"extension_ui_request","id":"ui-fork","requestGeneration":42,"method":"confirm","title":"Inspect fork?"}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-6","command":"extension_ui_response","success":true,"data":{"resolved":true}}'
+printf '%s\n' '{"type":"session_transition_hook_error","id":"rpc-5","command":"fork","phase":"after","committed":true,"error":"after-hook failed"}'
+printf '%s\n' '{"type":"response","id":"rpc-5","command":"fork","success":true,"data":{"text":"selected text","cancelled":false}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"ask_request","id":"ask-content","questions":[{"id":"review","question":"Review the selected input?","options":[{"label":"Now"},{"label":"Later"}]}]}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-8","command":"ask_response","success":true,"data":{"resolved":true}}'
+printf '%s\n' '{"type":"response","id":"rpc-7","command":"fork","success":true,"data":{"text":"native text","content":[{"type":"text","text":"native text"},{"type":"image","data":"AQ==","mimeType":"image/png"}],"cancelled":false}}'
+"#,
+        Some(directory.path().to_path_buf()),
+    );
+    let control = client.control_handle();
+    futures::executor::block_on(async {
+        let mut new_events = Vec::new();
+        let created = client
+            .new_session_with_events(Some(std::path::Path::new("parent.jsonl")), |event| {
+                assert_eq!(event["type"], "extension_ui_request");
+                control
+                    .extension_ui_response(
+                        event["id"].as_str().unwrap(),
+                        event["requestGeneration"].as_u64().unwrap(),
+                        sdk::RpcExtensionUiResponse::Confirmed { confirmed: true },
+                    )
+                    .expect("reply during new-session hook");
+                new_events.push(event);
+            })
+            .await
+            .expect("new-session terminal response");
+        assert!(!created.cancelled);
+        assert_eq!(new_events.len(), 1);
+
+        let mut switch_events = Vec::new();
+        let switched = client
+            .switch_session_with_events(std::path::Path::new("target.jsonl"), |event| {
+                assert_eq!(event["type"], "ask_request");
+                control
+                    .ask_response(
+                        event["id"].as_str().unwrap(),
+                        sdk::AskResponse {
+                            answers: vec![sdk::AskAnswer {
+                                question_id: "switch-choice".to_string(),
+                                selected: vec!["Keep".to_string()],
+                                other: None,
+                            }],
+                            dismissed: false,
+                        },
+                    )
+                    .expect("reply during switch hook");
+                switch_events.push(event);
+            })
+            .await
+            .expect("cancelled switch is a successful protocol response");
+        assert!(switched.cancelled);
+        assert_eq!(switch_events.len(), 1);
+
+        let mut fork_events = Vec::new();
+        let forked = client
+            .fork_with_events("entry-text", |event| {
+                if event["type"] == "extension_ui_request" {
+                    control
+                        .extension_ui_response(
+                            event["id"].as_str().unwrap(),
+                            event["requestGeneration"].as_u64().unwrap(),
+                            sdk::RpcExtensionUiResponse::Confirmed { confirmed: true },
+                        )
+                        .expect("reply during fork hook");
+                }
+                fork_events.push(event);
+            })
+            .await
+            .expect("after-hook diagnostic does not undo committed fork");
+        assert!(!forked.cancelled);
+        assert_eq!(forked.text, "selected text");
+        assert_eq!(fork_events.len(), 2);
+        assert_eq!(
+            fork_events[1],
+            json!({
+                "type": "session_transition_hook_error",
+                "id": "rpc-5",
+                "command": "fork",
+                "phase": "after",
+                "committed": true,
+                "error": "after-hook failed",
+            })
+        );
+
+        let mut content_events = Vec::new();
+        let native = client
+            .fork_with_content_and_events("entry-native", |event| {
+                assert_eq!(event["type"], "ask_request");
+                control
+                    .ask_response(
+                        event["id"].as_str().unwrap(),
+                        sdk::AskResponse {
+                            answers: Vec::new(),
+                            dismissed: true,
+                        },
+                    )
+                    .expect("dismiss live ask card");
+                content_events.push(event);
+            })
+            .await
+            .expect("native fork terminal response");
+        assert!(!native.cancelled);
+        assert_eq!(native.text, "native text");
+        assert_eq!(content_events.len(), 1);
+        assert_eq!(
+            serde_json::to_value(native.content.expect("selected attachments")).unwrap(),
+            json!([
+                {"type":"text","text":"native text"},
+                {"type":"image","data":"AQ==","mimeType":"image/png"},
+            ])
+        );
+    });
+    let recorded = std::fs::read_to_string(directory.path().join("frames.jsonl")).unwrap();
+    let frames: Vec<serde_json::Value> = recorded
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames,
+        vec![
+            json!({"type":"new_session","id":"rpc-1","parentSession":"parent.jsonl"}),
+            json!({
+                "type":"extension_ui_response","id":"rpc-2",
+                "requestId":"ui-new","requestGeneration":11,"confirmed":true,
+            }),
+            json!({"type":"switch_session","id":"rpc-3","sessionPath":"target.jsonl"}),
+            json!({
+                "type":"ask_response","id":"rpc-4","requestId":"ask-switch",
+                "answers":[{"questionId":"switch-choice","selected":["Keep"]}],
+            }),
+            json!({"type":"fork","id":"rpc-5","entryId":"entry-text"}),
+            json!({
+                "type":"extension_ui_response","id":"rpc-6",
+                "requestId":"ui-fork","requestGeneration":42,"confirmed":true,
+            }),
+            json!({"type":"fork","id":"rpc-7","entryId":"entry-native"}),
+            json!({
+                "type":"ask_response","id":"rpc-8","requestId":"ask-content","dismissed":true,
+            }),
+        ]
+    );
+    client.shutdown().expect("shutdown session protocol fixture");
+}
+
 #[test]
 fn sdk_is_only_public_root_module_and_basic_sdk_imports_exclusively_from_sdk() {
     fn unhidden_root_pub_mods(lib_source: &str) -> Vec<String> {

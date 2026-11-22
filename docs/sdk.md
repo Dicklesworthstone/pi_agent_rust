@@ -695,6 +695,36 @@ fn main() -> pi::sdk::Result<()> {
 }
 ```
 
+### Interactive RPC session transitions
+
+Session lifecycle hooks can ask the host to confirm a change or answer an
+Ask card. Use the event-forwarding methods when those hooks are installed:
+
+| Operation | Method | Result |
+|---|---|---|
+| Create a session | `new_session_with_events(parent, on_event)` | Cancellation state |
+| Switch sessions | `switch_session_with_events(path, on_event)` | Cancellation state |
+| Fork editable text | `fork_with_events(entry_id, on_event)` | Selected text and cancellation state |
+| Fork native input | `fork_with_content_and_events(entry_id, on_event)` | Selected text, ordered attachments, and cancellation state |
+
+Clone `rpc.control_handle()` before starting the operation. The callback or a
+separate UI thread can use that handle's `extension_ui_response()` and
+`ask_response()` while the operation owns the response reader. Echo the exact
+UI request ID, plus `requestGeneration` for extension UI replies; choose
+answers through the host's UI.
+`AskAnswer` and `AskResponse` are exported through `pi::sdk`. Control reply
+acknowledgements are kept separate from the operation's terminal response.
+
+A hook veto returns `cancelled: true`. A before-hook error fails the operation.
+If an after-hook fails after the session change commits, the callback receives
+`session_transition_hook_error` with `phase: "after"` and `committed: true`,
+followed by the successful operation result. That event does not mean the
+session change rolled back. Forked input remains unsent, including when a
+post-transition diagnostic is delivered.
+
+Existing convenience methods keep their signatures and discard intermediate
+events; use the methods above when the host needs to answer hook dialogs.
+
 ### Durable plan review over RPC
 
 `RpcTransportClient` uses the same guarded plan lifecycle as in-process sessions.

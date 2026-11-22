@@ -127,12 +127,12 @@ struct ExtensionUiCloseGuard {
 }
 
 impl ExtensionUiCloseGuard {
-    fn close(&self) {
+    fn close(&self) -> usize {
         self.ui_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .close_and_cancel_timers();
-        self.manager.close_ui_sender_and_cancel_pending();
+        self.manager.close_ui_sender_and_cancel_pending()
     }
 }
 
@@ -1235,9 +1235,9 @@ async fn rpc_dispatch_session_before_switch(
     manager: Option<ExtensionManager>,
     reason: &str,
     target_session_file: Option<&str>,
-) -> bool {
+) -> Result<bool> {
     let Some(manager) = manager else {
-        return false;
+        return Ok(false);
     };
 
     let payload = target_session_file.map_or_else(
@@ -1252,17 +1252,19 @@ async fn rpc_dispatch_session_before_switch(
             EXTENSION_EVENT_TIMEOUT_MS,
         )
         .await
-        .unwrap_or(false)
 }
 
-async fn rpc_dispatch_session_switch_event(manager: Option<ExtensionManager>, payload: Value) {
+async fn rpc_dispatch_session_switch_event(
+    manager: Option<ExtensionManager>,
+    payload: Value,
+) -> Result<()> {
     let Some(manager) = manager else {
-        return;
+        return Ok(());
     };
 
-    let _ = manager
+    manager
         .dispatch_event(ExtensionEventName::SessionSwitch, Some(payload))
-        .await;
+        .await
 }
 
 async fn rpc_dispatch_session_before_fork(
@@ -1270,33 +1272,67 @@ async fn rpc_dispatch_session_before_fork(
     entry_id: &str,
     summary: &str,
     session_id: &str,
-) -> bool {
-    let Some(manager) = manager else {
-        return false;
+    abort: &RpcForkHookCancellation,
+) -> Result<bool> {
+    let before = async {
+        let Some(manager) = manager else {
+            return Ok(false);
+        };
+        manager
+            .dispatch_cancellable_event(
+                ExtensionEventName::SessionBeforeFork,
+                Some(json!({
+                    "entryId": entry_id,
+                    "summary": summary,
+                    "sessionId": session_id,
+                })),
+                EXTENSION_EVENT_TIMEOUT_MS,
+            )
+            .await
     };
-
-    manager
-        .dispatch_cancellable_event(
-            ExtensionEventName::SessionBeforeFork,
-            Some(json!({
-                "entryId": entry_id,
-                "summary": summary,
-                "sessionId": session_id,
-            })),
-            EXTENSION_EVENT_TIMEOUT_MS,
-        )
-        .await
-        .unwrap_or(false)
+    rpc_wait_for_fork_hook(before, abort).await
 }
 
-async fn rpc_dispatch_session_fork_event(manager: Option<ExtensionManager>, payload: Value) {
-    let Some(manager) = manager else {
-        return;
+async fn rpc_wait_for_fork_hook<T>(
+    hook: impl Future<Output = Result<T>>,
+    abort: &RpcForkHookCancellation,
+) -> Result<T> {
+    let cx = AgentCx::for_current_or_request();
+    let cancelled = async {
+        loop {
+            if abort.is_cancelled() || cx.checkpoint().is_err() {
+                return;
+            }
+            cx.time().sleep(Duration::from_millis(10)).await;
+        }
     };
+    futures::pin_mut!(hook, cancelled);
+    match futures::future::select(cancelled, hook).await {
+        futures::future::Either::Left(((), _)) => Err(Error::Aborted),
+        futures::future::Either::Right((result, _)) => {
+            if abort.is_cancelled() || cx.checkpoint().is_err() {
+                Err(Error::Aborted)
+            } else {
+                result
+            }
+        }
+    }
+}
 
-    let _ = manager
-        .dispatch_event(ExtensionEventName::SessionFork, Some(payload))
-        .await;
+async fn rpc_dispatch_session_fork_event(
+    manager: Option<ExtensionManager>,
+    payload: Value,
+    abort: &RpcForkHookCancellation,
+) -> Result<()> {
+    let after = async {
+        let Some(manager) = manager else {
+            return Ok(());
+        };
+        manager
+            .dispatch_event(ExtensionEventName::SessionFork, Some(payload))
+            .await
+    };
+    rpc_wait_for_fork_hook(after, abort).await
 }
 
 fn try_send_line_with_backpressure<T>(tx: &mpsc::Sender<T>, mut line: T) -> bool {
@@ -1381,6 +1417,7 @@ const RPC_INPUT_QUEUE_CAPACITY: usize = 2;
 enum RpcInput {
     Lines(mpsc::Receiver<String>),
     Stdio(mpsc::Receiver<io::Result<String>>),
+    Closed,
 }
 
 impl RpcInput {
@@ -1388,8 +1425,364 @@ impl RpcInput {
         match self {
             Self::Lines(receiver) => receiver.recv(cx).await.ok().map(Ok),
             Self::Stdio(receiver) => receiver.recv(cx).await.ok(),
+            Self::Closed => None,
         }
     }
+}
+
+
+/// The command reader remains the sole consumer of input. While an extension
+/// lifecycle hook is awaiting a dialog, service its control replies in place;
+/// competing commands get a bounded busy response instead of a hidden queue.
+#[derive(Clone)]
+struct RpcTransitionControls {
+    ask: Option<crate::ask::AskTool>,
+    ask_state: Arc<std::sync::Mutex<RpcAskBridgeState>>,
+    manager: Option<ExtensionManager>,
+    ui_state: Option<Arc<std::sync::Mutex<RpcUiBridgeState>>>,
+    retry_abort: Arc<AtomicBool>,
+    fork_abort: Arc<RpcForkHookCancellation>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+}
+
+impl RpcTransitionControls {
+    fn route_response(&self, parsed: &Value) -> bool {
+        let id = parsed.get("id").and_then(Value::as_str).map(str::to_string);
+        match parsed.get("type").and_then(Value::as_str) {
+            Some("ask_response") => {
+                let Some(ask) = self.ask.as_ref() else {
+                    let _ = self.out_tx.send(response_error(
+                        id,
+                        "ask_response",
+                        "The ask tool is not enabled in this session",
+                    ));
+                    return true;
+                };
+                match rpc_parse_ask_response(parsed) {
+                    Ok((request_id, response)) => {
+                        let resolved = {
+                            let mut state = self
+                                .ask_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state.forwarded.remove(&request_id);
+                            ask.respond_ui(&request_id, response)
+                        };
+                        let _ = self.out_tx.send(response_ok(
+                            id,
+                            "ask_response",
+                            Some(json!({ "resolved": resolved })),
+                        ));
+                    }
+                    Err(message) => {
+                        let _ = self.out_tx.send(response_error(id, "ask_response", message));
+                    }
+                }
+                true
+            }
+            Some("extension_ui_response") => {
+                self.extension_response(parsed, id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn extension_response(&self, parsed: &Value, id: Option<String>) {
+        let (Some(manager), Some(ui_state)) = (self.manager.as_ref(), self.ui_state.as_ref())
+        else {
+            let _ = self.out_tx.send(response_ok(id, "extension_ui_response", None));
+            return;
+        };
+        let Some(request_id) = rpc_parse_extension_ui_response_id(parsed) else {
+            let _ = self.out_tx.send(response_error(
+                id,
+                "extension_ui_response",
+                "Missing requestId (or id) field",
+            ));
+            return;
+        };
+        let Some(request_generation) = rpc_parse_extension_ui_response_generation(parsed) else {
+            let _ = self.out_tx.send(response_error(
+                id,
+                "extension_ui_response",
+                "Missing requestGeneration field",
+            ));
+            return;
+        };
+        let (response, next_request) = {
+            let mut guard = ui_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(active) = guard.active.clone() else {
+                let _ = self.out_tx.send(response_error(
+                    id,
+                    "extension_ui_response",
+                    "No active extension UI request",
+                ));
+                return;
+            };
+            if active.request.id != request_id {
+                let _ = self.out_tx.send(response_error(
+                    id,
+                    "extension_ui_response",
+                    format!(
+                        "Unexpected requestId: {request_id} (active: {})",
+                        active.request.id
+                    ),
+                ));
+                return;
+            }
+            if active.generation != request_generation {
+                let _ = self.out_tx.send(response_error(
+                    id,
+                    "extension_ui_response",
+                    format!(
+                        "Unexpected requestGeneration: {request_generation} (active: {})",
+                        active.generation
+                    ),
+                ));
+                return;
+            }
+            let response = match rpc_parse_extension_ui_response(parsed, &active.request) {
+                Ok(response) => response,
+                Err(message) => {
+                    let _ = self.out_tx.send(response_error(
+                        id,
+                        "extension_ui_response",
+                        message,
+                    ));
+                    return;
+                }
+            };
+            let next = guard.finish_active();
+            (response, next)
+        };
+        let resolved = manager.respond_ui(response);
+        let _ = self.out_tx.send(response_ok(
+            id,
+            "extension_ui_response",
+            Some(json!({ "resolved": resolved })),
+        ));
+        if let Some(next) = next_request {
+            rpc_publish_extension_ui_request(
+                Arc::clone(ui_state),
+                manager.clone(),
+                self.out_tx.clone(),
+                next,
+            );
+        }
+    }
+
+    /// An aborted hook must not leave a dead active card in front of the next
+    /// hook's dialog. Keep the bridge open and its generation counter intact.
+    fn dismiss_pending(&self) {
+        if let Some(ask) = self.ask.as_ref() {
+            let state = self
+                .ask_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for id in &state.forwarded {
+                ask.respond_ui(
+                    id,
+                    crate::ask::AskResponse {
+                        answers: Vec::new(),
+                        dismissed: true,
+                    },
+                );
+            }
+        }
+        if let (Some(manager), Some(ui_state)) = (self.manager.as_ref(), self.ui_state.as_ref()) {
+            let requests = {
+                let mut guard = ui_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut requests = Vec::new();
+                if let Some(active) = guard.active.take() {
+                    requests.push(active);
+                }
+                requests.extend(guard.queue.drain(..));
+                for request in &requests {
+                    request.cancel_timer();
+                }
+                requests
+            };
+            for request in requests {
+                manager.respond_ui(ExtensionUiResponse {
+                    id: request.request.id,
+                    value: None,
+                    cancelled: true,
+                });
+            }
+        }
+    }
+
+    /// EOF is terminal for the reply surface, including requests admitted by a
+    /// hook just after this call. Count outstanding dialogs before dismissing.
+    fn close_surfaces(&self) -> usize {
+        // The hook completion check takes this same lock. A cancelled UI
+        // response cannot win the race before we publish its interruption.
+        let mut fork_aborted = self
+            .fork_abort
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut dismissed = self
+            .ask
+            .as_ref()
+            .map_or(0, crate::ask::AskTool::close_channel_ui);
+        if let (Some(manager), Some(ui_state)) = (self.manager.as_ref(), self.ui_state.as_ref()) {
+            ui_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .close_and_cancel_timers();
+            dismissed += manager.close_ui_sender_and_cancel_pending();
+        }
+        if dismissed > 0 {
+            *fork_aborted = true;
+        }
+        dismissed
+    }
+
+    /// A borrowed fork join handle remains owned by the outer loop on error.
+    /// Abort requests interrupt a pending hook without rolling back a Session
+    /// that already committed. Other callers own an individual hook wait.
+    async fn wait<T>(
+        &self,
+        future: impl Future<Output = Result<T>>,
+        input: &mut RpcInput,
+        input_error: &mut Option<io::Error>,
+        cx: &AgentCx,
+        fork_abort: Option<&RpcForkHookCancellation>,
+    ) -> Result<T> {
+        let mut pending = Box::pin(future);
+        loop {
+            if cx.checkpoint().is_err() {
+                if let Some(abort) = fork_abort {
+                    abort.set_cancelled(true);
+                }
+                *input = RpcInput::Closed;
+                drop(pending);
+                self.close_surfaces();
+                return Err(Error::Aborted);
+            }
+            let frame = {
+                let received = Box::pin(input.recv(cx));
+                match futures::future::select(pending, received).await {
+                    futures::future::Either::Left((result, _)) => {
+                        if result.is_err() {
+                            self.dismiss_pending();
+                        }
+                        return result;
+                    }
+                    futures::future::Either::Right((frame, remaining)) => {
+                        pending = remaining;
+                        frame
+                    }
+                }
+            };
+            let Some(frame) = frame else {
+                *input = RpcInput::Closed;
+                let dismissed = self.close_surfaces();
+                if cx.checkpoint().is_err() || dismissed > 0 {
+                    if let Some(abort) = fork_abort {
+                        abort.set_cancelled(true);
+                    }
+                    drop(pending);
+                    return Err(Error::Aborted);
+                }
+                // A piped noninteractive command may close stdin immediately.
+                // Let its accepted hook finish under its original deadline.
+                // Any subsequent UI request fails against the closed surface.
+                return pending.await;
+            };
+            let line = match frame.and_then(|line| {
+                validate_rpc_input_frame(&line, MAX_RPC_INPUT_FRAME_BYTES)?;
+                Ok(line)
+            }) {
+                Ok(line) => line,
+                Err(error) => {
+                    let _ = self.out_tx.send(response_error(
+                        None,
+                        "parse",
+                        format!("Failed to read command: {error}"),
+                    ));
+                    *input_error = Some(error);
+                    *input = RpcInput::Closed;
+                    if let Some(abort) = fork_abort {
+                        abort.set_cancelled(true);
+                    }
+                    drop(pending);
+                    self.close_surfaces();
+                    return Err(Error::Aborted);
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parsed: Value = match serde_json::from_str(&line) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let _ = self.out_tx.send(response_error(
+                        None,
+                        "parse",
+                        format!("Failed to parse command: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            let Some(command) = parsed.get("type").and_then(Value::as_str) else {
+                let _ = self.out_tx.send(response_error(
+                    None,
+                    "parse",
+                    "Missing command type",
+                ));
+                continue;
+            };
+            if self.route_response(&parsed) {
+                continue;
+            }
+            let command = normalize_command_type(command);
+            let id = parsed.get("id").and_then(Value::as_str).map(str::to_string);
+            if matches!(command, "abort" | "abort_retry") {
+                self.retry_abort.store(true, Ordering::SeqCst);
+                let _ = self.out_tx.send(response_ok(id, command, None));
+                if command == "abort" {
+                    if let Some(abort) = fork_abort {
+                        abort.set_cancelled(true);
+                    }
+                    // The outer loop still owns a borrowed fork handle. Drop
+                    // only this wait and reject its held command; never run a
+                    // queued mutation after the client cancelled the wait.
+                    drop(pending);
+                    self.dismiss_pending();
+                    return Err(Error::Aborted);
+                }
+                continue;
+            }
+            let _ = self.out_tx.send(response_error(
+                id,
+                command,
+                format!("A session transition hook is pending; wait before running {command}"),
+            ));
+        }
+    }
+}
+
+fn rpc_report_after_transition_hook_error(
+    out_tx: &std::sync::mpsc::SyncSender<String>,
+    id: Option<&str>,
+    command: &str,
+    error: &Error,
+) {
+    let _ = out_tx.send(event(&json!({
+        "type": "session_transition_hook_error",
+        "id": id,
+        "command": command,
+        "phase": "after",
+        "committed": true,
+        "error": error.to_string(),
+    })));
 }
 
 fn rpc_input_limit_error(max_bytes: usize) -> io::Error {
@@ -1477,6 +1870,31 @@ const RPC_WRITER_SHUTDOWN_SENTINEL: &str = "\u{0}__pi_rpc_writer_shutdown__";
 /// drain loop forever (gh #137). Normal completion paths still clear the
 /// flags explicitly at their intended points; this is a safety net.
 struct ClearFlagOnDrop(Arc<AtomicBool>);
+
+/// Synchronize cancellation with dialog dismissal: a fork must observe a
+/// disconnected approval before the cancelled reply can authorize replacement.
+#[derive(Default)]
+struct RpcForkHookCancellation(std::sync::Mutex<bool>);
+
+impl RpcForkHookCancellation {
+    fn is_cancelled(&self) -> bool {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_cancelled(&self, cancelled: bool) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cancelled;
+    }
+}
+
+/// A detached fork may still be awaiting a hook when its RPC owner is dropped.
+/// Cancel the hook without rolling back a transition that already committed.
+struct RpcForkHookAbortOnDrop(Arc<RpcForkHookCancellation>);
+
+impl Drop for RpcForkHookAbortOnDrop {
+    fn drop(&mut self) {
+        self.0.set_cancelled(true);
+    }
+}
 
 impl Drop for ClearFlagOnDrop {
     fn drop(&mut self) {
@@ -3155,6 +3573,28 @@ impl RpcUiBridgeState {
         next
     }
 
+    fn prune_stale(
+        &mut self,
+        mut pending: impl FnMut(&str) -> bool,
+    ) -> Option<RpcUiBridgeRequest> {
+        self.queue.retain(|queued| {
+            let live = pending(&queued.request.id);
+            if !live {
+                queued.cancel_timer();
+            }
+            live
+        });
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| !pending(&active.request.id))
+        {
+            self.finish_active()
+        } else {
+            None
+        }
+    }
+
     fn close_and_cancel_timers(&mut self) {
         self.closed = true;
         if let Some(active) = self.active.take() {
@@ -3426,7 +3866,7 @@ async fn run_with_input(
     let rpc_ui_state: Option<Arc<std::sync::Mutex<RpcUiBridgeState>>> = rpc_extension_manager
         .as_ref()
         .map(|_| Arc::new(std::sync::Mutex::new(RpcUiBridgeState::default())));
-    let extension_ui_close_guard = rpc_extension_manager
+    let _extension_ui_close_guard = rpc_extension_manager
         .as_ref()
         .zip(rpc_ui_state.as_ref())
         .map(|(manager, ui_state)| ExtensionUiCloseGuard {
@@ -3528,11 +3968,20 @@ async fn run_with_input(
             let cx = AgentCx::for_request();
             while let Ok(request) = extension_ui_rx.recv(&cx).await {
                 if request.expects_response() {
-                    let admitted = {
+                    let (admitted, promoted) = {
                         let mut guard = ui_state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if !manager_ui.ui_request_is_pending(&request.id) {
+                        // An invocation can be cancelled before its buffered UI
+                        // delivery reaches this task. Retire the dead card once
+                        // its manager lease is gone, including queued peers.
+                        // A new delivery of an existing public ID also retires
+                        // its older generation: duplicate pending admissions
+                        // are rejected by the manager.
+                        let promoted = guard.prune_stale(|id| {
+                            id != request.id && manager_ui.ui_request_is_pending(id)
+                        });
+                        let admitted = if !manager_ui.ui_request_is_pending(&request.id) {
                             None
                         } else if guard.active.is_none()
                             || guard.queue.len() < MAX_UI_PENDING_REQUESTS
@@ -3546,8 +3995,17 @@ async fn run_with_input(
                                 cancelled: true,
                             });
                             None
-                        }
+                        };
+                        (admitted, promoted)
                     };
+                    if let Some(promoted) = promoted {
+                        rpc_publish_extension_ui_request(
+                            Arc::clone(&ui_state),
+                            manager_ui.clone(),
+                            out_tx_ui.clone(),
+                            promoted,
+                        );
+                    }
 
                     if let Some((admitted, emit_now, cancel_rx)) = admitted {
                         if let Some(cancel_rx) = cancel_rx {
@@ -3587,8 +4045,19 @@ async fn run_with_input(
         None
     };
 
+    let fork_hook_abort = Arc::new(RpcForkHookCancellation::default());
+    let transition_controls = RpcTransitionControls {
+        ask: options.ask_tool.clone(),
+        ask_state: Arc::clone(&ask_bridge_state),
+        manager: rpc_extension_manager.clone(),
+        ui_state: rpc_ui_state.clone(),
+        retry_abort: Arc::clone(&retry_abort),
+        fork_abort: Arc::clone(&fork_hook_abort),
+        out_tx: out_tx.clone(),
+    };
+    let _fork_hook_abort_on_drop = RpcForkHookAbortOnDrop(Arc::clone(&fork_hook_abort));
     let mut pending_bg_commands = Vec::new();
-    let mut in_flight_fork = None;
+    let mut in_flight_fork: Option<JoinHandle<()>> = None;
     let mut input_error = None;
     let mut plan_control = crate::plan::rpc::RpcPlanControl::default();
 
@@ -3641,9 +4110,30 @@ async fn run_with_input(
                 | "get_available_models"
                 | "get_last_assistant_text"
                 | "extension_ui_response"
-        ) && let Some(prev_fork) = in_flight_fork.take()
+                | "ask_response"
+                | "abort"
+                | "abort_retry"
+        ) && let Some(prev_fork) = in_flight_fork.as_mut()
         {
-            prev_fork.await;
+            // Retain ownership until the task has drained. Dropping a hook wait
+            // must never abandon a fork that has already committed its Session.
+            let result = transition_controls
+                .wait(
+                    async {
+                        prev_fork.await;
+                        Ok(())
+                    },
+                    &mut input,
+                    &mut input_error,
+                    &cx,
+                    Some(fork_hook_abort.as_ref()),
+                )
+                .await;
+            if let Err(err) = result {
+                let _ = out_tx.send(response_error_with_hints(id, command_type, &err));
+                continue;
+            }
+            drop(in_flight_fork.take());
         }
 
         // Validate once before recovery, model restoration, or queue mutation.
@@ -4318,6 +4808,10 @@ async fn run_with_input(
 
             "abort" => {
                 retry_abort.store(true, Ordering::SeqCst);
+                if in_flight_fork.is_some() {
+                    fork_hook_abort.set_cancelled(true);
+                    transition_controls.dismiss_pending();
+                }
                 let handle = abort_handle
                     .lock(&cx)
                     .await
@@ -5902,15 +6396,33 @@ async fn run_with_input(
                         continue;
                     }
                 };
-                if rpc_dispatch_session_before_switch(rpc_extension_manager.clone(), "new", None)
+                match transition_controls
+                    .wait(
+                        rpc_dispatch_session_before_switch(
+                            rpc_extension_manager.clone(),
+                            "new",
+                            None,
+                        ),
+                        &mut input,
+                        &mut input_error,
+                        &cx,
+                        None,
+                    )
                     .await
                 {
-                    let _ = out_tx.send(response_ok(
-                        id,
-                        "new_session",
-                        Some(json!({ "cancelled": true })),
-                    ));
-                    continue;
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "new_session",
+                            Some(json!({ "cancelled": true })),
+                        ));
+                        continue;
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "new_session", &err));
+                        continue;
+                    }
                 }
                 let session_transition = match acquire_rpc_session_transition(
                     &transition_baseline,
@@ -6054,15 +6566,30 @@ async fn run_with_input(
                             json!({ "cancelled": false }),
                         )
                         .await;
-                        rpc_dispatch_session_switch_event(
-                            rpc_extension_manager.clone(),
-                            json!({
-                                "reason": "new",
-                                "previousSessionFile": previous_session_file,
-                                "sessionId": session_id,
-                            }),
-                        )
-                        .await;
+                        if let Err(err) = transition_controls
+                            .wait(
+                                rpc_dispatch_session_switch_event(
+                                    rpc_extension_manager.clone(),
+                                    json!({
+                                        "reason": "new",
+                                        "previousSessionFile": previous_session_file,
+                                        "sessionId": session_id,
+                                    }),
+                                ),
+                                &mut input,
+                                &mut input_error,
+                                &cx,
+                                None,
+                            )
+                            .await
+                        {
+                            rpc_report_after_transition_hook_error(
+                                &out_tx,
+                                id.as_deref(),
+                                "new_session",
+                                &err,
+                            );
+                        }
                         let _ = out_tx.send(response_ok(id, "new_session", Some(response_data)));
                     }
                     Err(err) => {
@@ -6111,19 +6638,33 @@ async fn run_with_input(
                     }
                 };
 
-                if rpc_dispatch_session_before_switch(
-                    rpc_extension_manager.clone(),
-                    "resume",
-                    Some(session_path),
-                )
-                .await
+                match transition_controls
+                    .wait(
+                        rpc_dispatch_session_before_switch(
+                            rpc_extension_manager.clone(),
+                            "resume",
+                            Some(session_path),
+                        ),
+                        &mut input,
+                        &mut input_error,
+                        &cx,
+                        None,
+                    )
+                    .await
                 {
-                    let _ = out_tx.send(response_ok(
-                        id,
-                        "switch_session",
-                        Some(json!({ "cancelled": true })),
-                    ));
-                    continue;
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "switch_session",
+                            Some(json!({ "cancelled": true })),
+                        ));
+                        continue;
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
+                        continue;
+                    }
                 }
                 // Validate relative paths against the sessions directory to prevent traversal.
                 let session_path_buf = std::path::PathBuf::from(session_path);
@@ -6375,16 +6916,31 @@ async fn run_with_input(
                                     json!({ "cancelled": false }),
                                 )
                                 .await;
-                                rpc_dispatch_session_switch_event(
-                                    rpc_extension_manager.clone(),
-                                    json!({
-                                        "reason": "resume",
-                                        "previousSessionFile": previous_session_file,
-                                        "targetSessionFile": target_session_file,
-                                        "sessionId": session_id,
-                                    }),
-                                )
-                                .await;
+                                if let Err(err) = transition_controls
+                                    .wait(
+                                        rpc_dispatch_session_switch_event(
+                                            rpc_extension_manager.clone(),
+                                            json!({
+                                                "reason": "resume",
+                                                "previousSessionFile": previous_session_file,
+                                                "targetSessionFile": target_session_file,
+                                                "sessionId": session_id,
+                                            }),
+                                        ),
+                                        &mut input,
+                                        &mut input_error,
+                                        &cx,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    rpc_report_after_transition_hook_error(
+                                        &out_tx,
+                                        id.as_deref(),
+                                        "switch_session",
+                                        &err,
+                                    );
+                                }
 
                                 let _ = out_tx.send(response_ok(
                                     id,
@@ -6454,6 +7010,9 @@ async fn run_with_input(
                 let options_for_fork = options.clone();
                 let out_tx_for_fork = out_tx.clone();
                 let cx_for_fork = cx.clone();
+                let controls_for_fork = transition_controls.clone();
+                fork_hook_abort.set_cancelled(false);
+                let before_fork_abort = Arc::clone(&fork_hook_abort);
 
                 in_flight_fork = Some(options.runtime_handle.spawn(async move {
                     let mut service_shutdown = None;
@@ -6477,14 +7036,18 @@ async fn run_with_input(
                             // Both locks released here.
                         };
 
-                        if rpc_dispatch_session_before_fork(
+                        let before = rpc_dispatch_session_before_fork(
                             rpc_extension_manager_for_fork.clone(),
                             &entry_id_owned,
                             &fork_plan.selected_text,
                             &header_snapshot.id,
+                            &before_fork_abort,
                         )
-                        .await
-                        {
+                        .await;
+                        if before.is_err() {
+                            controls_for_fork.dismiss_pending();
+                        }
+                        if before? {
                             return Ok(None);
                         }
 
@@ -6747,7 +7310,7 @@ async fn run_with_input(
                                 payload,
                             )
                             .await;
-                            rpc_dispatch_session_fork_event(
+                            if let Err(err) = rpc_dispatch_session_fork_event(
                                 rpc_extension_manager_for_fork,
                                 json!({
                                     "entryId": entry_id_owned,
@@ -6756,8 +7319,18 @@ async fn run_with_input(
                                     "newSessionId": new_session_id,
                                     "previousSessionFile": previous_session_file,
                                 }),
+                                &before_fork_abort,
                             )
-                            .await;
+                            .await
+                            {
+                                controls_for_fork.dismiss_pending();
+                                rpc_report_after_transition_hook_error(
+                                    &out_tx_for_fork,
+                                    id.as_deref(),
+                                    "fork",
+                                    &err,
+                                );
+                            }
                             let _ = out_tx_for_fork.send(response_ok(
                                 id,
                                 "fork",
@@ -6800,130 +7373,8 @@ async fn run_with_input(
                 ));
             }
 
-            "ask_response" => {
-                let Some(ask) = options.ask_tool.as_ref() else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "ask_response",
-                        "The ask tool is not enabled in this session",
-                    ));
-                    continue;
-                };
-                match rpc_parse_ask_response(&parsed) {
-                    Ok((request_id, response)) => {
-                        let resolved = {
-                            let mut state = ask_bridge_state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            state.forwarded.remove(&request_id);
-                            ask.respond_ui(&request_id, response)
-                        };
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "ask_response",
-                            Some(json!({ "resolved": resolved })),
-                        ));
-                    }
-                    Err(message) => {
-                        let _ = out_tx.send(response_error(id, "ask_response", message));
-                    }
-                }
-            }
-            "extension_ui_response" => {
-                if let (Some(manager), Some(ui_state)) =
-                    (rpc_extension_manager.as_ref(), rpc_ui_state.as_ref())
-                {
-                    let Some(request_id) = rpc_parse_extension_ui_response_id(&parsed) else {
-                        let _ = out_tx.send(response_error(
-                            id,
-                            "extension_ui_response",
-                            "Missing requestId (or id) field",
-                        ));
-                        continue;
-                    };
-                    let Some(request_generation) =
-                        rpc_parse_extension_ui_response_generation(&parsed)
-                    else {
-                        let _ = out_tx.send(response_error(
-                            id,
-                            "extension_ui_response",
-                            "Missing requestGeneration field",
-                        ));
-                        continue;
-                    };
-
-                    let (response, next_request) = {
-                        let mut guard = ui_state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-                        let Some(active) = guard.active.clone() else {
-                            let _ = out_tx.send(response_error(
-                                id,
-                                "extension_ui_response",
-                                "No active extension UI request",
-                            ));
-                            continue;
-                        };
-
-                        if active.request.id != request_id {
-                            let _ = out_tx.send(response_error(
-                                id,
-                                "extension_ui_response",
-                                format!(
-                                    "Unexpected requestId: {request_id} (active: {})",
-                                    active.request.id
-                                ),
-                            ));
-                            continue;
-                        }
-                        if active.generation != request_generation {
-                            let _ = out_tx.send(response_error(
-                                id,
-                                "extension_ui_response",
-                                format!(
-                                    "Unexpected requestGeneration: {request_generation} (active: {})",
-                                    active.generation
-                                ),
-                            ));
-                            continue;
-                        }
-
-                        let response =
-                            match rpc_parse_extension_ui_response(&parsed, &active.request) {
-                                Ok(response) => response,
-                                Err(message) => {
-                                    let _ = out_tx.send(response_error(
-                                        id,
-                                        "extension_ui_response",
-                                        message,
-                                    ));
-                                    continue;
-                                }
-                            };
-
-                        let next = guard.finish_active();
-                        (response, next)
-                    };
-
-                    let resolved = manager.respond_ui(response);
-                    let _ = out_tx.send(response_ok(
-                        id,
-                        "extension_ui_response",
-                        Some(json!({ "resolved": resolved })),
-                    ));
-
-                    if let Some(next) = next_request {
-                        rpc_publish_extension_ui_request(
-                            Arc::clone(ui_state),
-                            (*manager).clone(),
-                            out_tx.clone(),
-                            next,
-                        );
-                    }
-                } else {
-                    let _ = out_tx.send(response_ok(id, "extension_ui_response", None));
-                }
+            "ask_response" | "extension_ui_response" => {
+                transition_controls.route_response(&parsed);
             }
 
             _ => {
@@ -6939,6 +7390,9 @@ async fn run_with_input(
     // Release queued frames and wake a backpressured reader before draining
     // accepted work. A framing failure must not leave its input queue alive.
     drop(input);
+    if input_error.is_some() || cx.checkpoint().is_err() {
+        fork_hook_abort.set_cancelled(true);
+    }
 
     // EOF and client cancellation both drain accepted work. Cleanup must not
     // inherit the cancelled receive context or its exhausted deadline.
@@ -6948,22 +7402,11 @@ async fn run_with_input(
             .request_cx_with_budget(asupersync::Budget::INFINITE),
     );
 
-    // stdin has closed. No future ask_response frame can arrive, so dismiss
-    // every pending picker before waiting for the in-flight turn to drain.
-    // Otherwise a turn blocked in `ask` and this drain loop wait on each
-    // other until the five-minute picker timeout expires.
-    if let Some(ask) = options.ask_tool.as_ref() {
-        ask.close_channel_ui();
-    }
-
-    // No future extension_ui_response frame can arrive either. Atomically
-    // close the bridge before cancelling manager requests, then wait until the
-    // forwarding task has observed the disconnected channel. This ordering
-    // suppresses post-close publication, cancels every bridge timer, and also
-    // covers an idle RPC session before the work-drain loop's early-exit check.
-    if let Some(guard) = extension_ui_close_guard.as_ref() {
-        guard.close();
-    }
+    // stdin has closed. Dismiss picker and extension dialogs before draining
+    // accepted work, publishing fork-hook cancellation before a dismissed
+    // approval can resume that task. Closing admission also rejects any later
+    // dialog requested by a noninteractive hook still finishing after EOF.
+    transition_controls.close_surfaces();
     if let Some(forwarder) = extension_ui_forwarder {
         forwarder.await;
     }
@@ -9083,6 +9526,15 @@ fn rpc_publish_extension_ui_request_at_seam(
             if !guard.active_matches(&request_id, generation) {
                 return;
             }
+            if !manager.ui_request_is_pending(&request_id) {
+                let next = guard.prune_stale(|id| manager.ui_request_is_pending(id));
+                drop(guard);
+                let Some(next) = next else {
+                    return;
+                };
+                active = next;
+                continue;
+            }
 
             let remaining = active.request.remaining_timeout(std::time::Instant::now());
             if remaining.is_some_and(|remaining| remaining.is_zero()) {
@@ -9894,27 +10346,190 @@ mod ui_bridge_tests {
         );
     }
 
+    async fn pending_rpc_ui_test_request(
+        manager: &ExtensionManager,
+        receiver: &mut mpsc::Receiver<ExtensionUiRequest>,
+        request: ExtensionUiRequest,
+    ) -> (
+        ExtensionUiRequest,
+        futures::future::BoxFuture<'static, Result<Option<ExtensionUiResponse>>>,
+    ) {
+        let manager = manager.clone();
+        let mut pending: futures::future::BoxFuture<'static, Result<Option<ExtensionUiResponse>>> =
+            Box::pin(async move { manager.request_ui(request).await });
+        assert!(
+            futures::poll!(pending.as_mut()).is_pending(),
+            "the manager must retain the response-bearing request"
+        );
+        let request = receiver
+            .recv(&AgentCx::for_request())
+            .await
+            .expect("manager delivery");
+        (request, pending)
+    }
+
+    #[test]
+    fn cancelled_late_ui_delivery_cannot_block_live_fifo_or_reused_generation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let manager = ExtensionManager::new();
+            let (ui_tx, mut ui_rx) = mpsc::channel(4);
+            manager.set_ui_sender(ui_tx);
+            let state = Arc::new(std::sync::Mutex::new(RpcUiBridgeState::default()));
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+            let controls = RpcTransitionControls {
+                ask: None,
+                ask_state: Arc::new(std::sync::Mutex::new(RpcAskBridgeState::default())),
+                manager: Some(manager.clone()),
+                ui_state: Some(Arc::clone(&state)),
+                retry_abort: Arc::new(AtomicBool::new(false)),
+                fork_abort: Arc::new(RpcForkHookCancellation::default()),
+                out_tx: out_tx.clone(),
+            };
+            let (late_request, late_pending) = pending_rpc_ui_test_request(
+                &manager,
+                &mut ui_rx,
+                ExtensionUiRequest::new("reused", "confirm", json!({}))
+                    .with_timeout_ms(30_000),
+            )
+            .await;
+            // Abort sees no published card. Its delivery then arrives before
+            // the JS actor has dropped the manager's pending request lease.
+            controls.dismiss_pending();
+            let (late, _, late_cancel) = state
+                .lock()
+                .expect("bridge lock")
+                .admit(late_request)
+                .expect("late delivery");
+            let mut late_cancel = late_cancel.expect("late timer");
+
+            let (stale_request, stale_pending) = pending_rpc_ui_test_request(
+                &manager,
+                &mut ui_rx,
+                ExtensionUiRequest::new("stale-queued", "confirm", json!({}))
+                    .with_timeout_ms(30_000),
+            )
+            .await;
+            let (_, _, stale_cancel) = state
+                .lock()
+                .expect("bridge lock")
+                .admit(stale_request)
+                .expect("queued stale delivery");
+            let mut stale_cancel = stale_cancel.expect("queued stale timer");
+            let (live_request, live_pending) = pending_rpc_ui_test_request(
+                &manager,
+                &mut ui_rx,
+                ExtensionUiRequest::new("live-queued", "confirm", json!({}))
+                    .with_timeout_ms(30_000),
+            )
+            .await;
+            let (live, _, live_cancel) = state
+                .lock()
+                .expect("bridge lock")
+                .admit(live_request)
+                .expect("queued live delivery");
+            let mut live_cancel = live_cancel.expect("live timer");
+
+            drop(late_pending);
+            drop(stale_pending);
+            assert!(!manager.ui_request_is_pending("reused"));
+            assert!(!manager.ui_request_is_pending("stale-queued"));
+            let (replacement_request, replacement_pending) = pending_rpc_ui_test_request(
+                &manager,
+                &mut ui_rx,
+                ExtensionUiRequest::new("reused", "confirm", json!({}))
+                    .with_timeout_ms(30_000),
+            )
+            .await;
+            let (promoted, replacement) = {
+                let mut guard = state.lock().expect("bridge lock");
+                let promoted = guard
+                    .prune_stale(|id| {
+                        id != replacement_request.id && manager.ui_request_is_pending(id)
+                    })
+                    .expect("promote first live queued card");
+                let (replacement, emits, _) = guard
+                    .admit(replacement_request)
+                    .expect("replacement delivery");
+                assert!(!emits, "retained FIFO entry remains first");
+                assert_eq!(guard.queue.len(), 1);
+                (promoted, replacement)
+            };
+            assert_eq!(promoted.generation, live.generation);
+            assert_eq!(late_cancel.try_recv(), Ok(()));
+            assert_eq!(stale_cancel.try_recv(), Ok(()));
+            rpc_publish_extension_ui_request(
+                Arc::clone(&state),
+                manager.clone(),
+                out_tx.clone(),
+                promoted,
+            );
+            let first = parse_response(&out_rx.try_recv().expect("live FIFO publication"));
+            assert_eq!(first["id"], "live-queued");
+            assert_eq!(first["requestGeneration"], live.generation);
+
+            // Cancellation between promotion and publication must also retire
+            // the stale active card and publish its still-live successor.
+            drop(live_pending);
+            rpc_publish_extension_ui_request(
+                Arc::clone(&state),
+                manager.clone(),
+                out_tx,
+                live.clone(),
+            );
+            let second = parse_response(&out_rx.try_recv().expect("replacement publication"));
+            assert_eq!(second["id"], "reused");
+            assert_eq!(second["requestGeneration"], replacement.generation);
+            assert_eq!(live_cancel.try_recv(), Ok(()));
+            {
+                let mut guard = state.lock().expect("bridge lock");
+                assert!(guard.expire("reused", late.generation).is_none());
+                assert!(guard.expire("live-queued", live.generation).is_none());
+                assert!(guard.active_matches("reused", replacement.generation));
+            }
+            assert!(controls.route_response(&json!({
+                "id": "answer",
+                "type": "extension_ui_response",
+                "requestId": "reused",
+                "requestGeneration": replacement.generation,
+                "confirmed": true,
+            })));
+            let response = replacement_pending
+                .await
+                .expect("replacement waiter")
+                .expect("response-bearing request");
+            assert_eq!(response.value, Some(json!(true)));
+            assert!(!response.cancelled);
+            assert!(state.lock().expect("bridge lock").active.is_none());
+        });
+    }
+
     #[test]
     fn full_channel_publication_fails_closed_and_advances_entire_fifo() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
         runtime.block_on(async move {
+            let manager = ExtensionManager::new();
+            let (ui_tx, mut ui_rx) = mpsc::channel(2);
+            manager.set_ui_sender(ui_tx);
+            let (first_request, first_pending) = pending_rpc_ui_test_request(
+                &manager,
+                &mut ui_rx,
+                ExtensionUiRequest::new("first", "confirm", json!({"title": "first"})),
+            )
+            .await;
+            let (second_request, second_pending) = pending_rpc_ui_test_request(
+                &manager,
+                &mut ui_rx,
+                ExtensionUiRequest::new("second", "confirm", json!({"title": "second"})),
+            )
+            .await;
             let mut bridge = RpcUiBridgeState::default();
-            let (first, first_emits, _) = bridge
-                .admit(ExtensionUiRequest::new(
-                    "first",
-                    "confirm",
-                    json!({"title": "first"}),
-                ))
-                .expect("bridge is open");
-            let (_, second_emits, _) = bridge
-                .admit(ExtensionUiRequest::new(
-                    "second",
-                    "confirm",
-                    json!({"title": "second"}),
-                ))
-                .expect("bridge is open");
+            let (first, first_emits, _) = bridge.admit(first_request).expect("bridge is open");
+            let (_, second_emits, _) = bridge.admit(second_request).expect("bridge is open");
             assert!(first_emits);
             assert!(!second_emits);
 
@@ -9926,14 +10541,22 @@ mod ui_bridge_tests {
 
             rpc_publish_extension_ui_request(
                 Arc::clone(&state),
-                ExtensionManager::new(),
+                manager,
                 out_tx,
                 first,
             );
 
-            let guard = state.lock().expect("bridge lock");
-            assert!(guard.active.is_none());
-            assert!(guard.queue.is_empty());
+            {
+                let guard = state.lock().expect("bridge lock");
+                assert!(guard.active.is_none());
+                assert!(guard.queue.is_empty());
+            }
+            for pending in [first_pending, second_pending] {
+                assert!(
+                    pending.await.expect("closed delivery").expect("response").cancelled,
+                    "backpressure dismisses the real manager waiter"
+                );
+            }
         });
     }
 
@@ -9943,9 +10566,21 @@ mod ui_bridge_tests {
             .build()
             .expect("runtime build");
         runtime.block_on(async move {
-            let mut request =
-                ExtensionUiRequest::new("already-expired", "confirm", json!({"title": "too late"}))
-                    .with_timeout_ms(0);
+            let manager = ExtensionManager::new();
+            let (ui_tx, mut ui_rx) = mpsc::channel(1);
+            manager.set_ui_sender(ui_tx);
+            let (request, pending) = pending_rpc_ui_test_request(
+                &manager,
+                &mut ui_rx,
+                ExtensionUiRequest::new(
+                    "already-expired",
+                    "confirm",
+                    json!({"title": "too late"}),
+                ),
+            )
+            .await;
+            // Place a real manager delivery precisely at its bridge deadline.
+            let mut request = request.with_timeout_ms(0);
             request.bind_deadline(std::time::Instant::now());
 
             let mut bridge = RpcUiBridgeState::default();
@@ -9956,7 +10591,7 @@ mod ui_bridge_tests {
 
             rpc_publish_extension_ui_request(
                 Arc::clone(&state),
-                ExtensionManager::new(),
+                manager,
                 out_tx,
                 active,
             );
@@ -9965,8 +10600,11 @@ mod ui_bridge_tests {
                 out_rx.try_recv().is_err(),
                 "an expired frame must not cross the publication boundary"
             );
-            let guard = state.lock().expect("bridge lock");
-            assert!(guard.active.is_none());
+            assert!(state.lock().expect("bridge lock").active.is_none());
+            assert!(
+                pending.await.expect("expired delivery").expect("response").cancelled,
+                "bridge expiry resolves the real pending waiter"
+            );
         });
     }
 
@@ -10105,6 +10743,13 @@ mod ui_bridge_tests {
             )
             .with_timeout_ms(30_000);
             queued_request.bind_deadline(std::time::Instant::now());
+            let manager = ExtensionManager::new();
+            let (ui_tx, mut ui_rx) = mpsc::channel(2);
+            manager.set_ui_sender(ui_tx);
+            let (active_request, active_pending) =
+                pending_rpc_ui_test_request(&manager, &mut ui_rx, active_request).await;
+            let (queued_request, queued_pending) =
+                pending_rpc_ui_test_request(&manager, &mut ui_rx, queued_request).await;
 
             let mut bridge = RpcUiBridgeState::default();
             let (active, active_emits, active_cancel_rx) =
@@ -10116,7 +10761,6 @@ mod ui_bridge_tests {
             let active_cancel_rx = active_cancel_rx.expect("active request owns a waiter");
             let queued_cancel_rx = queued_cancel_rx.expect("queued request owns a waiter");
             let state = Arc::new(std::sync::Mutex::new(bridge));
-            let manager = ExtensionManager::new();
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel(4);
             let active_timer = rpc_schedule_extension_ui_timeout(
                 &runtime_handle,
@@ -10210,6 +10854,12 @@ mod ui_bridge_tests {
             // releasing the bridge Arc it captured.
             join_bridge_timer(active_timer, "terminal-close active request").await;
             join_bridge_timer(queued_timer, "terminal-close queued request").await;
+            for pending in [active_pending, queued_pending] {
+                assert!(
+                    pending.await.expect("terminal close").expect("response").cancelled,
+                    "close dismisses every real manager waiter"
+                );
+            }
             assert_eq!(
                 Arc::strong_count(&state),
                 1,
@@ -16248,12 +16898,22 @@ mod retry_tests {
         hook_body: &str,
         command: &str,
     ) -> RealJsSwitchFixture {
-        let is_fork = command == "fork";
-        let hook_event = if is_fork {
+        let hook_event = if command == "fork" {
             "session_before_fork"
         } else {
             "session_before_switch"
         };
+        real_js_transition_fixture(runtime_handle, temp, hook_body, command, hook_event).await
+    }
+
+    async fn real_js_transition_fixture(
+        runtime_handle: &asupersync::runtime::RuntimeHandle,
+        temp: &tempfile::TempDir,
+        hook_body: &str,
+        command: &str,
+        hook_event: &str,
+    ) -> RealJsSwitchFixture {
+        let is_fork = command == "fork";
         let extension_path = temp.path().join("switch-hook.mjs");
         std::fs::write(
             &extension_path,
@@ -16327,6 +16987,587 @@ mod retry_tests {
             source_id,
             target_id,
         }
+    }
+
+    const TRANSITION_CONFIRM_HOOK: &str = r#"
+        const confirmed = await pi.ui("confirm", {
+            title: "Transition",
+            message: "Approve this session transition?"
+        });
+        return { cancel: !confirmed };
+    "#;
+
+    async fn open_transition_test_input(
+        fixture: &mut RealJsSwitchFixture,
+    ) -> (asupersync::channel::mpsc::Sender<String>, Value) {
+        let cx = asupersync::Cx::for_testing();
+        let request = fixture.in_rx.recv(&cx).await.expect("queued transition");
+        let request: Value = serde_json::from_str(&request).expect("transition JSON");
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        in_tx
+            .send(&cx, request.to_string())
+            .await
+            .expect("send initial transition");
+        fixture.in_rx = in_rx;
+        (in_tx, request)
+    }
+
+    async fn collect_transition_responses(
+        out_rx: &Arc<Mutex<Receiver<String>>>,
+        ids: &[&str],
+    ) -> Vec<Value> {
+        asupersync::time::timeout(wall_now(), Duration::from_secs(2), async {
+            let mut frames = Vec::new();
+            loop {
+                let line = recv_line(out_rx, "transition response")
+                    .await
+                    .expect("receive transition frame");
+                frames.push(parse_response(&line));
+                if ids.iter().all(|id| {
+                    frames.iter().any(|value| {
+                        value["type"] == "response" && value["id"].as_str() == Some(*id)
+                    })
+                }) {
+                    return frames;
+                }
+            }
+        })
+        .await
+        .expect("control replies must not wait for the extension hook timeout")
+    }
+
+    fn transition_response<'a>(frames: &'a [Value], id: &str) -> &'a Value {
+        let mut matching = frames
+            .iter()
+            .filter(|value| value["type"] == "response" && value["id"].as_str() == Some(id));
+        let response = matching.next().expect("terminal response");
+        assert!(matching.next().is_none(), "duplicate response for {id}");
+        response
+    }
+
+    async fn send_transition_confirmation(
+        in_tx: &asupersync::channel::mpsc::Sender<String>,
+        request: &Value,
+        id: &str,
+        confirmed: bool,
+    ) {
+        in_tx
+            .send(
+                &asupersync::Cx::for_testing(),
+                json!({
+                    "id": id,
+                    "type": "extension_ui_response",
+                    "requestId": request["id"],
+                    "requestGeneration": request["requestGeneration"],
+                    "confirmed": confirmed,
+                })
+                .to_string(),
+            )
+            .await
+            .expect("send transition approval");
+    }
+
+    #[test]
+    fn rpc_transition_hooks_route_approval_behind_competing_commands() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            for command in ["new_session", "switch_session", "fork"] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut fixture =
+                    real_js_switch_fixture(&handle, &temp, TRANSITION_CONFIRM_HOOK, command).await;
+                let (in_tx, _) = open_transition_test_input(&mut fixture).await;
+                let inner_session = Arc::clone(&fixture.inner_session);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = handle.spawn(async move {
+                    Box::pin(run(
+                        fixture.agent_session,
+                        fixture.options,
+                        fixture.in_rx,
+                        out_tx,
+                    ))
+                    .await
+                });
+                let request = recv_ui_request(&out_rx, "before transition approval").await;
+                // A fork already has a spawned task: this first mutation waits
+                // behind its join handle. The second must be rejected promptly
+                // while the single reader still accepts the approval.
+                for (id, kind) in [
+                    ("held", "set_steering_mode"),
+                    ("busy", "set_follow_up_mode"),
+                ] {
+                    in_tx
+                        .send(
+                            &asupersync::Cx::for_testing(),
+                            json!({"id": id, "type": kind, "mode": "all"}).to_string(),
+                        )
+                        .await
+                        .expect("send competing command");
+                }
+                let busy = collect_transition_responses(&out_rx, &["busy"]).await;
+                assert_err(transition_response(&busy, "busy"), "set_follow_up_mode");
+                if command != "fork" {
+                    assert_err(transition_response(&busy, "held"), "set_steering_mode");
+                }
+                let invalid = json!({
+                    "id": "stale",
+                    "type": "extension_ui_response",
+                    "requestId": request["id"],
+                    "requestGeneration": request["requestGeneration"].as_u64().unwrap() + 1,
+                    "confirmed": true,
+                });
+                in_tx
+                    .send(&asupersync::Cx::for_testing(), invalid.to_string())
+                    .await
+                    .expect("send stale approval");
+                let stale = collect_transition_responses(&out_rx, &["stale"]).await;
+                assert_err(transition_response(&stale, "stale"), "extension_ui_response");
+                assert_eq!(
+                    inner_session
+                        .lock(&AgentCx::for_request())
+                        .await
+                        .expect("source lock")
+                        .header
+                        .id,
+                    fixture.source_id,
+                    "stale approval cannot replace the source"
+                );
+                send_transition_confirmation(&in_tx, &request, "approve", true).await;
+                let ids: &[&str] = if command == "fork" {
+                    &["approve", "1", "held"]
+                } else {
+                    &["approve", "1"]
+                };
+                let frames = collect_transition_responses(&out_rx, ids).await;
+                let approval = transition_response(&frames, "approve");
+                assert_ok(approval, "extension_ui_response");
+                assert_eq!(approval["data"]["resolved"], true);
+                let response = transition_response(&frames, "1");
+                assert_ok(response, command);
+                assert_eq!(response["data"]["cancelled"], false);
+                if command == "fork" {
+                    assert_ok(transition_response(&frames, "held"), "set_steering_mode");
+                }
+                let inner = inner_session
+                    .lock(&AgentCx::for_request())
+                    .await
+                    .expect("target lock");
+                assert_ne!(inner.header.id, fixture.source_id);
+                if command == "switch_session" {
+                    assert_eq!(inner.header.id, fixture.target_id);
+                }
+                drop(inner);
+                drop(in_tx);
+                server.await.expect("RPC shutdown");
+            }
+        });
+    }
+
+    #[test]
+    fn rpc_transition_before_hook_errors_preserve_the_source() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            for command in ["new_session", "switch_session", "fork"] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let fixture = real_js_switch_fixture(
+                    &handle,
+                    &temp,
+                    "throw new Error('transition hook failed');",
+                    command,
+                )
+                .await;
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
+                Box::pin(run(
+                    fixture.agent_session,
+                    fixture.options,
+                    fixture.in_rx,
+                    out_tx,
+                ))
+                .await
+                .expect("RPC shutdown");
+                let frames: Vec<Value> = out_rx.try_iter().map(|line| parse_response(&line)).collect();
+                let response = transition_response(&frames, "1");
+                assert_err(response, command);
+                assert!(
+                    response["error"].as_str().unwrap().contains("transition hook failed"),
+                    "{response}"
+                );
+                assert_eq!(
+                    fixture
+                        .inner_session
+                        .lock(&AgentCx::for_request())
+                        .await
+                        .expect("source lock")
+                        .header
+                        .id,
+                    fixture.source_id
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn rpc_transition_abort_preserves_source_and_releases_the_next_dialog() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            for command in ["new_session", "switch_session", "fork"] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut fixture =
+                    real_js_switch_fixture(&handle, &temp, TRANSITION_CONFIRM_HOOK, command).await;
+                let (in_tx, _) = open_transition_test_input(&mut fixture).await;
+                let inner_session = Arc::clone(&fixture.inner_session);
+                let manager = fixture
+                    .agent_session
+                    .extensions
+                    .as_ref()
+                    .expect("extension region")
+                    .manager()
+                    .clone();
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = handle.spawn(async move {
+                    Box::pin(run(
+                        fixture.agent_session,
+                        fixture.options,
+                        fixture.in_rx,
+                        out_tx,
+                    ))
+                    .await
+                });
+                let first = recv_ui_request(&out_rx, "approval before abort").await;
+                in_tx
+                    .send(
+                        &asupersync::Cx::for_testing(),
+                        json!({"id": "abort", "type": "abort"}).to_string(),
+                    )
+                    .await
+                    .expect("abort pending transition");
+                let frames = collect_transition_responses(&out_rx, &["abort", "1"]).await;
+                assert_ok(transition_response(&frames, "abort"), "abort");
+                assert_err(transition_response(&frames, "1"), command);
+                assert_eq!(
+                    inner_session
+                        .lock(&AgentCx::for_request())
+                        .await
+                        .expect("source lock")
+                        .header
+                        .id,
+                    fixture.source_id
+                );
+                // Cancelling a JS lifecycle invocation quarantines its realm.
+                // A separate native producer can still use the RPC UI bridge;
+                // cancellation must not leave the old card blocking its dialog.
+                let next_dialog = handle.spawn(async move {
+                    manager
+                        .request_ui(ExtensionUiRequest::new(
+                            "after-hook-abort",
+                            "confirm",
+                            json!({"title": "Independent dialog"}),
+                        ))
+                        .await
+                });
+                let second = recv_ui_request(&out_rx, "independent dialog after abort").await;
+                assert!(
+                    second["requestGeneration"].as_u64().unwrap()
+                        > first["requestGeneration"].as_u64().unwrap()
+                );
+                send_transition_confirmation(&in_tx, &second, "reply", true).await;
+                let frames = collect_transition_responses(&out_rx, &["reply"]).await;
+                assert_ok(transition_response(&frames, "reply"), "extension_ui_response");
+                let response = next_dialog
+                    .await
+                    .expect("independent dialog")
+                    .expect("response-bearing dialog");
+                assert_eq!(response.value, Some(json!(true)));
+                assert!(!response.cancelled);
+                drop(in_tx);
+                server.await.expect("RPC shutdown");
+            }
+        });
+    }
+
+    #[test]
+    fn rpc_transition_disconnect_and_framing_failure_cannot_approve_pending_hooks() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            for command in ["new_session", "switch_session", "fork"] {
+                for framing_failure in [false, true] {
+                    let temp = tempfile::tempdir().expect("tempdir");
+                    // Deliberately ignore the UI result: EOF is a failed hook
+                    // wait even if extension code treats dismissal as approval.
+                    let mut fixture = real_js_switch_fixture(
+                        &handle,
+                        &temp,
+                        r#"await pi.ui("confirm", { title: "Disconnect" });"#,
+                        command,
+                    )
+                    .await;
+                    let request = fixture
+                        .in_rx
+                        .recv(&asupersync::Cx::for_testing())
+                        .await
+                        .expect("queued transition");
+                    let (in_tx, in_rx) =
+                        asupersync::channel::mpsc::channel::<io::Result<String>>(4);
+                    in_tx
+                        .send(&asupersync::Cx::for_testing(), Ok(request))
+                        .await
+                        .expect("send transition");
+                    let inner_session = Arc::clone(&fixture.inner_session);
+                    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
+                    let out_rx = Arc::new(Mutex::new(out_rx));
+                    let server = handle.spawn(async move {
+                        Box::pin(run_with_input(
+                            fixture.agent_session,
+                            fixture.options,
+                            RpcInput::Stdio(in_rx),
+                            out_tx,
+                        ))
+                        .await
+                    });
+                    recv_ui_request(&out_rx, "approval before disconnect").await;
+                    if framing_failure {
+                        in_tx
+                            .send(
+                                &asupersync::Cx::for_testing(),
+                                Err(io::Error::new(io::ErrorKind::InvalidData, "broken frame")),
+                            )
+                            .await
+                            .expect("send framing failure");
+                    }
+                    drop(in_tx);
+                    let result = asupersync::time::timeout(
+                        wall_now(),
+                        Duration::from_secs(2),
+                        server,
+                    )
+                    .await
+                    .expect("disconnected approval must not wait for its timeout");
+                    assert_eq!(result.is_err(), framing_failure, "{result:?}");
+                    let frames: Vec<Value> = out_rx
+                        .lock()
+                        .expect("output lock")
+                        .try_iter()
+                        .map(|line| parse_response(&line))
+                        .collect();
+                    assert_err(transition_response(&frames, "1"), command);
+                    assert_eq!(
+                        inner_session
+                            .lock(&AgentCx::for_request())
+                            .await
+                            .expect("source lock")
+                            .header
+                            .id,
+                        fixture.source_id,
+                        "a disconnected approval must leave the source installed"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn rpc_transition_after_hooks_serve_replies_and_report_abort_after_commit() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            for command in ["new_session", "switch_session", "fork"] {
+                for abort in [false, true] {
+                    let temp = tempfile::tempdir().expect("tempdir");
+                    let hook_event = if command == "fork" {
+                        "session_fork"
+                    } else {
+                        "session_switch"
+                    };
+                    let mut fixture = real_js_transition_fixture(
+                        &handle,
+                        &temp,
+                        TRANSITION_CONFIRM_HOOK,
+                        command,
+                        hook_event,
+                    )
+                    .await;
+                    let (in_tx, _) = open_transition_test_input(&mut fixture).await;
+                    let inner_session = Arc::clone(&fixture.inner_session);
+                    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
+                    let out_rx = Arc::new(Mutex::new(out_rx));
+                    let server = handle.spawn(async move {
+                        Box::pin(run(
+                            fixture.agent_session,
+                            fixture.options,
+                            fixture.in_rx,
+                            out_tx,
+                        ))
+                        .await
+                    });
+                    let request = recv_ui_request(&out_rx, "after transition approval").await;
+                    let committed_id = inner_session
+                        .lock(&AgentCx::for_request())
+                        .await
+                        .expect("committed session lock")
+                        .header
+                        .id
+                        .clone();
+                    assert_ne!(committed_id, fixture.source_id);
+                    if abort {
+                        in_tx
+                            .send(
+                                &asupersync::Cx::for_testing(),
+                                json!({"id": "control", "type": "abort"}).to_string(),
+                            )
+                            .await
+                            .expect("abort after hook");
+                    } else {
+                        send_transition_confirmation(&in_tx, &request, "control", true).await;
+                    }
+                    let frames = collect_transition_responses(&out_rx, &["control", "1"]).await;
+                    assert_ok(
+                        transition_response(&frames, "control"),
+                        if abort { "abort" } else { "extension_ui_response" },
+                    );
+                    let response = transition_response(&frames, "1");
+                    assert_ok(response, command);
+                    assert_eq!(response["data"]["cancelled"], false);
+                    let diagnostic = frames
+                        .iter()
+                        .find(|value| value["type"] == "session_transition_hook_error");
+                    if abort {
+                        let diagnostic = diagnostic.expect("after-hook interruption diagnostic");
+                        assert_eq!(diagnostic["id"], "1");
+                        assert_eq!(diagnostic["command"], command);
+                        assert_eq!(diagnostic["phase"], "after");
+                        assert_eq!(diagnostic["committed"], true);
+                        assert!(diagnostic["error"].as_str().is_some_and(|s| !s.is_empty()));
+                    } else {
+                        assert!(diagnostic.is_none(), "a successful hook has no error");
+                    }
+                    assert_eq!(
+                        inner_session
+                            .lock(&AgentCx::for_request())
+                            .await
+                            .expect("final session lock")
+                            .header
+                            .id,
+                        committed_id,
+                        "after-hook failure cannot imply rollback"
+                    );
+                    drop(in_tx);
+                    server.await.expect("RPC shutdown");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn rpc_transition_hook_waits_continue_routing_ask_responses() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            for command in ["new_session", "switch_session", "fork"] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut fixture =
+                    real_js_switch_fixture(&handle, &temp, TRANSITION_CONFIRM_HOOK, command).await;
+                let ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+                fixture.options.ask_tool = Some(ask.clone());
+                let (in_tx, _) = open_transition_test_input(&mut fixture).await;
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(128);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = handle.spawn(async move {
+                    Box::pin(run(
+                        fixture.agent_session,
+                        fixture.options,
+                        fixture.in_rx,
+                        out_tx,
+                    ))
+                    .await
+                });
+                recv_ui_request(&out_rx, "transition approval before ask").await;
+                if command == "fork" {
+                    // Force the dispatcher to wait on its existing fork task.
+                    in_tx
+                        .send(
+                            &asupersync::Cx::for_testing(),
+                            json!({
+                                "id": "held",
+                                "type": "set_steering_mode",
+                                "mode": "all",
+                            })
+                            .to_string(),
+                        )
+                        .await
+                        .expect("queue command behind fork");
+                }
+                let ask_task = handle.spawn(async move {
+                    crate::tools::Tool::execute(
+                        &ask,
+                        "transition-ask",
+                        json!({
+                            "questions": [{
+                                "question": "Pick?",
+                                "options": [{"label": "A"}, {"label": "B"}]
+                            }]
+                        }),
+                        None,
+                    )
+                    .await
+                });
+                let ask_request = recv_ask_request(&out_rx, "ask during transition").await;
+                in_tx
+                    .send(
+                        &asupersync::Cx::for_testing(),
+                        json!({
+                            "id": "ask-reply",
+                            "type": "ask_response",
+                            "requestId": ask_request["id"],
+                            "dismissed": true,
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .expect("answer ask during hook");
+                let frames = collect_transition_responses(&out_rx, &["ask-reply"]).await;
+                let response = transition_response(&frames, "ask-reply");
+                assert_ok(response, "ask_response");
+                assert_eq!(response["data"]["resolved"], true);
+                let error = ask_task.await.expect_err("picker was dismissed");
+                assert!(error.to_string().contains("dismissed"), "{error}");
+                in_tx
+                    .send(
+                        &asupersync::Cx::for_testing(),
+                        json!({"id": "abort", "type": "abort"}).to_string(),
+                    )
+                    .await
+                    .expect("abort remaining transition");
+                let ids: &[&str] = if command == "fork" {
+                    &["abort", "1", "held"]
+                } else {
+                    &["abort", "1"]
+                };
+                let frames = collect_transition_responses(&out_rx, ids).await;
+                assert_err(transition_response(&frames, "1"), command);
+                if command == "fork" {
+                    assert_err(transition_response(&frames, "held"), "set_steering_mode");
+                }
+                drop(in_tx);
+                server.await.expect("RPC shutdown");
+            }
+        });
     }
 
     /// Hook statement that writes an entry into the session it runs against.

@@ -46,6 +46,7 @@ pub use crate::agent::{
 };
 pub use crate::agent_cx::AgentCx;
 pub use crate::approval::{ApprovalMode, ApprovalState};
+pub use crate::ask::{AskAnswer, AskResponse};
 pub use crate::compaction::{AutoCompactionMethod, CompactionReader, ResolvedCompactionSettings};
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
@@ -1960,6 +1961,16 @@ impl RpcTransportClient {
         &mut self,
         parent_session: Option<&Path>,
     ) -> Result<RpcCancelledResult> {
+        self.new_session_with_events(parent_session, |_| {}).await
+    }
+
+    /// Create a session while forwarding extension hook events to the host.
+    /// Clone a control handle first to answer UI requests from the callback.
+    pub async fn new_session_with_events(
+        &mut self,
+        parent_session: Option<&Path>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcCancelledResult> {
         let mut payload = Map::new();
         if let Some(parent_session) = parent_session {
             payload.insert(
@@ -1967,7 +1978,10 @@ impl RpcTransportClient {
                 Value::String(parent_session.display().to_string()),
             );
         }
-        self.request_typed("new_session", payload).await
+        let data = self
+            .request_with_events("new_session", payload, on_event)
+            .await?;
+        Self::parse_response_data(data, "new_session")
     }
 
     pub async fn get_state(&mut self) -> Result<RpcSessionState> {
@@ -2268,20 +2282,44 @@ impl RpcTransportClient {
     }
 
     pub async fn switch_session(&mut self, session_path: &Path) -> Result<RpcCancelledResult> {
+        self.switch_session_with_events(session_path, |_| {}).await
+    }
+
+    /// Switch sessions while forwarding hook dialogs and diagnostics.
+    /// A failed after-hook is reported as an event after the switch commits.
+    pub async fn switch_session_with_events(
+        &mut self,
+        session_path: &Path,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcCancelledResult> {
         let mut payload = Map::new();
         payload.insert(
             "sessionPath".to_string(),
             Value::String(session_path.display().to_string()),
         );
-        self.request_typed("switch_session", payload).await
+        let data = self
+            .request_with_events("switch_session", payload, on_event)
+            .await?;
+        Self::parse_response_data(data, "switch_session")
     }
 
     /// Fork and return the selected prompt's editable text without submitting it.
     /// Use [`Self::fork_with_content`] to retain native attachments as well.
     pub async fn fork(&mut self, entry_id: impl Into<String>) -> Result<RpcForkResult> {
+        self.fork_with_events(entry_id, |_| {}).await
+    }
+
+    /// Fork editable text while forwarding interactive lifecycle events.
+    /// The selected prompt is returned without being submitted.
+    pub async fn fork_with_events(
+        &mut self,
+        entry_id: impl Into<String>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcForkResult> {
         let mut payload = Map::new();
         payload.insert("entryId".to_string(), Value::String(entry_id.into()));
-        self.request_typed("fork", payload).await
+        let data = self.request_with_events("fork", payload, on_event).await?;
+        Self::parse_response_data(data, "fork")
     }
 
     /// Fork and retain the selected prompt's ordered native attachments.
@@ -2292,9 +2330,20 @@ impl RpcTransportClient {
         &mut self,
         entry_id: impl Into<String>,
     ) -> Result<RpcForkContentResult> {
+        self.fork_with_content_and_events(entry_id, |_| {}).await
+    }
+
+    /// Fork native selected input while forwarding interactive lifecycle events.
+    /// Attachments retain their original order and the prompt remains unsent.
+    pub async fn fork_with_content_and_events(
+        &mut self,
+        entry_id: impl Into<String>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcForkContentResult> {
         let mut payload = Map::new();
         payload.insert("entryId".to_string(), Value::String(entry_id.into()));
-        self.request_typed("fork", payload).await
+        let data = self.request_with_events("fork", payload, on_event).await?;
+        Self::parse_response_data(data, "fork")
     }
 
     pub async fn get_fork_messages(&mut self) -> Result<Vec<RpcForkMessage>> {

@@ -404,6 +404,29 @@ in-memory content; session resume still hydrates saved sidecar payloads.
   - Params: `name` (optional; defaults to the latest checkpoint).
 - **fresh**: Mint a fresh provider-cache session ID and reset stream bookkeeping without discarding transcript history.
 
+### Interactive session hooks
+
+`new_session`, `switch_session`, and `fork` keep control replies flowing while
+extensions await interactive lifecycle hooks. Reply with
+`extension_ui_response` or `ask_response`, preserving the original request
+correlation; `abort` can interrupt a pending hook. Other commands consumed by a
+hook wait receive a busy error, so they cannot block a later UI reply.
+A competing mutation already waiting behind a fork is rejected if that wait
+is aborted; the accepted fork still receives its own terminal response.
+
+A before-hook veto returns a successful response with `cancelled: true`.
+A before-hook error or timeout fails the command before session replacement.
+An error or interruption in an after-hook emits this diagnostic and preserves
+the already-committed transition's successful response:
+
+```json
+{"type":"session_transition_hook_error","id":"switch-1","command":"switch_session","phase":"after","committed":true,"error":"..."}
+```
+
+Treat the terminal response as the transition outcome. An abort after the
+session change commits cannot roll it back. End-of-input dismisses unanswered
+dialogs while allowing already-accepted noninteractive work to drain.
+
 ### Plan Mode & Goals
 
 - **goal**: Inspect or mutate the active session objective (`op: "get"` works while busy or idle; lifecycle mutations require an idle session).
