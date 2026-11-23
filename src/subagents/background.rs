@@ -649,7 +649,11 @@ mod tests {
             let error = result.expect_err("replacement owner cannot acknowledge native admission");
             assert!(error.to_string().contains("PI_SUBAGENT_SESSION_CHANGED"));
             assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
-            assert!(crate::jobs::list(&owner).expect("original owner jobs").is_empty());
+            assert!(
+                crate::jobs::list(&owner)
+                    .expect("original owner jobs")
+                    .is_empty()
+            );
             assert!(crate::jobs::take_completion_notices(&owner).is_empty());
             assert!(!root.path().join("launched").exists());
         }

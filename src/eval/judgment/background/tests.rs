@@ -767,10 +767,21 @@ mod legacy {
                 .await
                 .expect("retire test session");
             assert!(retired, "abandoned model admission left a ghost job");
-            assert!(fixture.provider.prompts.lock().expect("provider calls").is_empty());
+            assert!(
+                fixture
+                    .provider
+                    .prompts
+                    .lock()
+                    .expect("provider calls")
+                    .is_empty()
+            );
             assert_eq!(fixture.provider.active.load(Ordering::SeqCst), 0);
             assert_eq!(fixture.provider.dropped.load(Ordering::SeqCst), 0);
-            assert!(crate::jobs::list(&fixture.host.session).expect("owned jobs").is_empty());
+            assert!(
+                crate::jobs::list(&fixture.host.session)
+                    .expect("owned jobs")
+                    .is_empty()
+            );
             assert!(crate::jobs::take_completion_notices(&fixture.host.session).is_empty());
         });
     }

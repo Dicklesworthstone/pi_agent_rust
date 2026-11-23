@@ -4,12 +4,12 @@
 
 use super::{
     ArtifactCleanupOutcome, ArtifactRetentionPolicy, ArtifactSink, CancelDeadline, ForegroundJob,
-    JobDelivery, JobEntry, JobSnapshot, JobStatus, JobWaitHandle, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES,
-    MAX_TOTAL_ARTIFACT_BYTES, MIN_RETAINED_ARTIFACT_FILES, OUTPUT_TAIL_BYTES, TailBuffer,
-    acquire_artifact_budget_lock, capture_session_spawn_generation, create_job_artifact,
-    enforce_artifact_retention, ensure_process_accepting_jobs, ensure_session_spawn_generation,
-    lifecycle_lock, now_ms, registry, reserve_job_slot, session_closing_error,
-    settle_job_and_enqueue_notice, settle_job_without_notice,
+    JobDelivery, JobEntry, JobSnapshot, JobStatus, JobWaitHandle, MAX_ARTIFACT_BYTES,
+    MAX_ARTIFACT_FILES, MAX_TOTAL_ARTIFACT_BYTES, MIN_RETAINED_ARTIFACT_FILES, OUTPUT_TAIL_BYTES,
+    TailBuffer, acquire_artifact_budget_lock, capture_session_spawn_generation,
+    create_job_artifact, enforce_artifact_retention, ensure_process_accepting_jobs,
+    ensure_session_spawn_generation, lifecycle_lock, now_ms, registry, reserve_job_slot,
+    session_closing_error, settle_job_and_enqueue_notice, settle_job_without_notice,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -384,10 +384,7 @@ pub struct NativeTaskLaunch {
 impl NativeTaskLaunch {
     fn check(&self) -> Result<()> {
         check_owner(&self.owner)?;
-        ensure_session_spawn_generation(
-            &self.attempt.owner_session_id,
-            self.attempt.generation(),
-        )?;
+        ensure_session_spawn_generation(&self.attempt.owner_session_id, self.attempt.generation())?;
         check_task_deadline(self.started, self.timeout)
     }
 
@@ -552,9 +549,7 @@ where
             .get(owner_session_id)
             .copied()
             .unwrap_or_default();
-        if reg.closing_owners.contains_key(owner_session_id)
-            || generation != attempt.generation()
-        {
+        if reg.closing_owners.contains_key(owner_session_id) || generation != attempt.generation() {
             return Err(session_closing_error(owner_session_id));
         }
         let entry = JobEntry {
@@ -1307,7 +1302,10 @@ mod tests {
             assert_eq!(probe.drops.load(Ordering::Acquire), 1);
             assert!(probe.original_owner_drop.load(Ordering::Acquire));
             assert!(super::super::take_completion_notices(&session).is_empty());
-            assert_eq!(registry().lock().expect("released capacity").starting_jobs, 0);
+            assert_eq!(
+                registry().lock().expect("released capacity").starting_jobs,
+                0
+            );
         }
     }
 
@@ -1353,7 +1351,10 @@ mod tests {
         drop(lifecycle);
         wait_for_native_admission_cleanup(&session);
         assert_eq!(reserved, super::super::MAX_CONCURRENT_JOBS);
-        assert!(rejected, "the ninth task must not create a waiting launch worker");
+        assert!(
+            rejected,
+            "the ninth task must not create a waiting launch worker"
+        );
         probes.push(excess_probe);
         for probe in probes {
             assert_rejected_admission(&session, root.path(), &probe, 0);
@@ -1429,7 +1430,11 @@ mod tests {
             let snapshot = launch.snapshot().expect("unpublished snapshot");
             std::thread::sleep(Duration::from_millis(50));
             assert!(!probe.polled.load(Ordering::Acquire));
-            assert!(super::super::list(&session).expect("visible jobs").is_empty());
+            assert!(
+                super::super::list(&session)
+                    .expect("visible jobs")
+                    .is_empty()
+            );
             assert!(super::super::take_completion_notices(&session).is_empty());
             if action == "publish" {
                 let published = launch.publish().expect("final native acknowledgment");
@@ -1472,7 +1477,10 @@ mod tests {
                 assert!(sender.send_blocking(launch).is_ok());
                 drop(receiver);
             } else {
-                let error = launch.publish().err().expect("stale handoff must be refused");
+                let error = launch
+                    .publish()
+                    .err()
+                    .expect("stale handoff must be refused");
                 let expected = match action {
                     "owner" => "PI_JOBS_TASK_CANCELLED",
                     "deadline" => "PI_JOBS_TASK_TIMEOUT",

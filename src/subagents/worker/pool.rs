@@ -2522,9 +2522,11 @@ done
                     json!({"operation":"worker_start", "agent":"worker",
                         "task":"must not execute"})
                 };
-                let launch = Box::pin(owner.with_current(
-                    fixture.tool.execute("abandoned-start", request, None),
-                ));
+                let launch = Box::pin(owner.with_current(fixture.tool.execute(
+                    "abandoned-start",
+                    request,
+                    None,
+                )));
                 let time = owner.time();
                 let gate = Box::pin(futures::future::select(
                     Box::pin(ready),
@@ -2577,9 +2579,7 @@ done
                         .lock()
                         .expect("worker registry")
                         .iter()
-                        .any(|worker| {
-                            worker.lock().expect("worker state").owner == fixture.owner
-                        })
+                        .any(|worker| worker.lock().expect("worker state").owner == fixture.owner)
                 };
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let retired = loop {
@@ -2603,7 +2603,11 @@ done
                 assert!(!retained, "abandoned admission consumed a retained handle");
                 assert!(retired, "abandoned carrier did not retire its owned work");
                 assert!(!fixture.root.path().join("launches").exists());
-                assert!(crate::jobs::list(&fixture.owner).expect("owned jobs").is_empty());
+                assert!(
+                    crate::jobs::list(&fixture.owner)
+                        .expect("owned jobs")
+                        .is_empty()
+                );
                 assert!(crate::jobs::take_completion_notices(&fixture.owner).is_empty());
             });
         }
