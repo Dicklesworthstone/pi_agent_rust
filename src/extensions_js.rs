@@ -15374,11 +15374,9 @@ export function createReadStream(path, opts) {
       while (offset < source.byteLength) {
         const nextOffset = Math.min(source.byteLength, offset + highWaterMark);
         const slice = source.subarray(offset, nextOffset);
-        if (encoding && typeof Buffer !== "undefined" && Buffer.from) {
-          stream.push(Buffer.from(slice).toString(encoding));
-        } else {
-          stream.push(slice);
-        }
+        // Readable owns decoding so a multibyte character split by the
+        // high-water mark is retained until the next chunk arrives.
+        stream.push(slice);
         offset = nextOffset;
       }
       stream.push(null);
@@ -17116,6 +17114,7 @@ export default { test, describe, it, before, after, beforeEach, afterEach, run, 
         "node:stream".to_string(),
         compressed_js_literal!(r#"
 import EventEmitter from "node:events";
+import { StringDecoder } from "node:string_decoder";
 
 function __streamToError(err) {
   return err instanceof Error ? err : new Error(String(err ?? "stream error"));
@@ -17192,7 +17191,8 @@ class Stream extends EventEmitter {
 class Readable extends Stream {
   constructor(opts = {}) {
     super(opts);
-    this._readableState = { flowing: null, ended: false, endEmitted: false, encoding: opts.encoding || null };
+    this._readableState = { flowing: null, ended: false, endEmitted: false, encoding: null };
+    this._decoder = null;
     this.readable = true;
     this._queue = [];
     this._flowing = false;
@@ -17202,11 +17202,37 @@ class Readable extends Stream {
     this._readWaiter = null;
     this._pipeCleanup = new Map();
     this._autoDestroy = opts.autoDestroy !== false;
+    if (opts.encoding) this.setEncoding(opts.encoding);
   }
 
   get readableEnded() { return this._readableState.endEmitted; }
   get readableFlowing() { return this._readableState.flowing; }
+  get readableEncoding() { return this._readableState.encoding; }
   isPaused() { return this._readableState.flowing === false; }
+
+  setEncoding(encoding) {
+    // Construct first so an invalid encoding cannot discard queued bytes or
+    // the partial character retained by the current decoder.
+    const decoder = new StringDecoder(encoding);
+    if (this._decoder && this._readableState.encoding === decoder.encoding) return this;
+    const decoded = [];
+    for (const chunk of this._queue) {
+      const text = typeof chunk === "string" ? chunk : decoder.write(chunk);
+      if (text.length) decoded.push(text);
+    }
+    if (this._readableState.ended) {
+      const tail = decoder.end();
+      if (tail.length) decoded.push(tail);
+    }
+    this._queue = decoded;
+    this._decoder = decoder;
+    this._readableState.encoding = decoder.encoding;
+    if (this._queue.length === 0 && !this._readableState.ended &&
+        this.listenerCount("readable") > 0) this._readRequested = true;
+    this._wakeRead();
+    this._maybeEnd();
+    return this;
+  }
 
   on(event, listener) {
     super.on(event, listener);
@@ -17289,12 +17315,27 @@ class Readable extends Stream {
   push(chunk) {
     if (this.destroyed || this._readableState.ended) return false;
     if (chunk === null) {
+      const tail = this._decoder ? this._decoder.end() : "";
+      if (tail.length) this._queue.push(tail);
       this._readableState.ended = true;
+      if (tail.length) {
+        if (this._readableState.flowing === true) this._flow();
+        else this.emit("readable");
+      }
       this._maybeEnd();
       this._wakeRead();
       return false;
     }
-    const normalized = __normalizeChunk(chunk, this._readableState.encoding);
+    const bytes = __normalizeChunk(chunk, null);
+    const normalized = this._decoder && typeof bytes !== "string"
+      ? this._decoder.write(bytes) : bytes;
+    if (this._decoder && normalized.length === 0) {
+      // A readable-mode consumer cannot ask for its next chunk until a whole
+      // character is available. Preserve its demand across partial bytes.
+      this._readRequested = true;
+      this._wakeRead();
+      return this._queue.length === 0;
+    }
     this._queue.push(normalized);
     if (this._readableState.flowing === true) this._flow();
     else this.emit("readable");
@@ -17314,6 +17355,7 @@ class Readable extends Stream {
   destroy(error) {
     if (this.destroyed) return this;
     this._queue.length = 0;
+    this._decoder = null;
     this._readRequested = false;
     this.readable = false;
     this._wakeRead();
@@ -17581,7 +17623,9 @@ class Readable extends Stream {
             readable.push(null);
             break;
           }
-          const normalized = __normalizeChunk(value, readable._readableState.encoding);
+          // Decoding belongs to push(), whose decoder retains partial
+          // characters across reads and flushes them only at EOF.
+          const normalized = __normalizeChunk(value, null);
           const chunk = !opts.objectMode && typeof normalized !== 'string' &&
               typeof Buffer !== 'undefined' && !Buffer.isBuffer(normalized)
             ? Buffer.from(normalized)
@@ -31209,6 +31253,10 @@ mod tests {
     /// forms stop later handlers before they can erase an earlier veto.
     /// Atomic virtual directory rename and parent-link resolution add 4_342
     /// filesystem bytes, covered by identity, admission, and watcher tests.
+    /// Stateful readable decoding adds 1_875 stream bytes and removes 22
+    /// filesystem bytes by eliminating adapter-side chunk decoding. The
+    /// filesystem literal already had 311 bytes of receipt drift at 7ddfa2ac;
+    /// only the two deliberately changed modules are re-pinned here.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
@@ -31217,8 +31265,8 @@ mod tests {
         ),
         (
             "node:fs",
-            87_318,
-            "cb0143953b7cee99b4bd41f3cfe60bd7047716c28d5f0d3dcb1784745c8b4004",
+            87_607,
+            "7299410bd52caed7a72dc60e09dbcde4c5938a55f2f181badc1ef0629faed4bb",
         ),
         (
             "@mariozechner/pi-ai",
@@ -31234,8 +31282,8 @@ mod tests {
         // Only this deliberately changed module is re-pinned.
         (
             "node:stream",
-            41_648,
-            "414b4dd3b5e7e0f10aa2a09881b0e6ebe882074ce56cc52eb8c23566e6b88589",
+            43_523,
+            "f41171290d44be8bfbff1116ee5e0c249e6b6a146effb692b885cc3b6363bb54",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -44855,6 +44903,189 @@ globalThis.__spawn_abort_result = result;
                 assert_eq!(result["received"][name]["order"], json!(["end", "close"]));
                 assert_eq!(result["received"][name]["buffered"], json!(0));
             }
+        });
+    }
+
+    #[test]
+    fn pijs_readable_decoding_preserves_split_bytes_across_all_sources() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.readableDecoding = { done: false };
+                    (async () => {
+                        const { Readable, PassThrough } = await import("node:stream");
+                        const fs = await import("node:fs");
+                        const collect = async stream => {
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(chunk);
+                            return chunks;
+                        };
+                        const results = [];
+                        for (const [encoding, bytes] of [
+                            ['utf8', Buffer.from('Aé中😀Z')],
+                            ['utf16le', Buffer.from('Aé中😀Z', 'utf16le')],
+                            ['base64', Buffer.from([0, 1, 2, 3, 254, 255, 7])],
+                            ['base64url', Buffer.from([251, 255, 239, 3, 4])],
+                        ]) {
+                            const chunks = Array.from(bytes, byte => Buffer.from([byte]));
+                            const direct = new Readable({ encoding });
+                            for (const chunk of chunks) direct.push(chunk);
+                            direct.push(null);
+                            const transformed = new PassThrough({ encoding });
+                            for (const chunk of chunks) transformed.write(chunk);
+                            transformed.end();
+                            const web = Readable.fromWeb(new ReadableStream({
+                                start(controller) {
+                                    for (const chunk of chunks) controller.enqueue(chunk);
+                                    controller.close();
+                                },
+                            }), { encoding });
+                            fs.writeFileSync('/tmp/encoded-' + encoding, bytes);
+                            const sources = {
+                                direct, transformed, web,
+                                iterable: Readable.from(chunks, { encoding }),
+                                file: fs.createReadStream('/tmp/encoded-' + encoding, {
+                                    encoding, highWaterMark: 1,
+                                }),
+                            };
+                            const outputs = {};
+                            for (const [name, stream] of Object.entries(sources)) {
+                                const seen = await collect(stream);
+                                outputs[name] = {
+                                    text: seen.join(''), strings: seen.every(chunk => typeof chunk === 'string'),
+                                    noEmpty: seen.every(chunk => chunk.length > 0),
+                                };
+                            }
+                            results.push({ encoding, outputs });
+                        }
+                        const binary = await collect(Readable.fromWeb(new ReadableStream({
+                            start(controller) {
+                                controller.enqueue(new Uint8Array([0, 255, 128, 1]));
+                                controller.close();
+                            },
+                        })));
+                        globalThis.readableDecoding = {
+                            done: true, results,
+                            binary: Array.from(Buffer.concat(binary)),
+                            binaryBuffers: binary.every(chunk => Buffer.isBuffer(chunk)),
+                        };
+                    })().catch(error => { globalThis.readableDecoding.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate split stream decoding");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "readableDecoding").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            for (index, expected) in ["Aé中😀Z", "Aé中😀Z", "AAECA/7/Bw==", "-__vAwQ"]
+                .into_iter()
+                .enumerate()
+            {
+                for source in ["direct", "transformed", "web", "iterable", "file"] {
+                    assert_eq!(
+                        result["results"][index]["outputs"][source],
+                        json!({"text": expected, "strings": true, "noEmpty": true}),
+                        "source={source}, encoding index={index}: {result}"
+                    );
+                }
+            }
+            assert_eq!(result["binary"], json!([0, 255, 128, 1]));
+            assert_eq!(result["binaryBuffers"], json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_readable_decoding_handles_late_encoding_eof_and_readable_demand() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.readableDecodingLifecycle = { done: false };
+                    (async () => {
+                        const { Readable } = await import("node:stream");
+                        const collect = async stream => {
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(chunk);
+                            return chunks.join('');
+                        };
+                        const late = new Readable();
+                        late.push(Buffer.from([0xf0, 0x9f]));
+                        const chained = late.setEncoding('UTF-8') === late;
+                        let invalid = false;
+                        try { late.setEncoding('not-an-encoding'); }
+                        catch (_) { invalid = true; }
+                        late.setEncoding('utf8');
+                        late.push(Buffer.from([0x98, 0x80]));
+                        late.push(null);
+                        const lateText = await collect(late);
+
+                        const ended = new Readable();
+                        ended.push(Buffer.from([0xc3]));
+                        ended.push(Buffer.from([0xa9, 0xe2, 0x82]));
+                        ended.push(null);
+                        ended.setEncoding('utf8');
+                        const endedText = await collect(ended);
+
+                        const truncated = new Readable({ encoding: 'utf8' });
+                        const events = [];
+                        truncated.on('data', chunk => events.push(chunk));
+                        truncated.on('end', () => events.push('end'));
+                        truncated.on('close', () => events.push('close'));
+                        truncated.push(Buffer.from([0xe2, 0x82]));
+                        const beforeEof = [...events];
+                        truncated.push(null);
+                        truncated.push(null);
+                        for (let i = 0; i < 20; i++) await Promise.resolve();
+
+                        const bytes = [0xe4, 0xb8, 0xad, 0xf0, 0x9f, 0x98, 0x80];
+                        let reads = 0;
+                        const demanded = Readable.fromWeb({ getReader() { return {
+                            read() {
+                                const index = reads++;
+                                return Promise.resolve(index < bytes.length
+                                    ? { done: false, value: new Uint8Array([bytes[index]]) }
+                                    : { done: true });
+                            },
+                            releaseLock() {}, cancel() {},
+                        }; } }, { encoding: 'utf8' });
+                        for (let i = 0; i < 20; i++) await Promise.resolve();
+                        const readsWithoutConsumer = reads;
+                        let demandText = '';
+                        demanded.on('readable', () => {
+                            let chunk;
+                            while ((chunk = demanded.read()) !== null) demandText += chunk;
+                        });
+                        await new Promise((resolve, reject) => demanded.on('end', resolve).on('error', reject));
+                        globalThis.readableDecodingLifecycle = {
+                            done: true, chained, invalid, lateText, endedText,
+                            beforeEof, events, readsWithoutConsumer, reads, demandText,
+                        };
+                    })().catch(error => { globalThis.readableDecodingLifecycle.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate decoder lifecycle and demand");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "readableDecodingLifecycle").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["chained"], json!(true));
+            assert_eq!(result["invalid"], json!(true));
+            assert_eq!(result["lateText"], json!("😀"));
+            assert_eq!(result["endedText"], json!("é�"));
+            assert_eq!(result["beforeEof"], json!([]));
+            assert_eq!(result["events"], json!(["�", "end", "close"]));
+            assert_eq!(result["readsWithoutConsumer"], json!(0));
+            assert_eq!(result["reads"], json!(8));
+            assert_eq!(result["demandText"], json!("中😀"));
         });
     }
 
