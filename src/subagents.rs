@@ -1169,9 +1169,7 @@ fn render_chain_template(
         if let Some(tail) = rest.strip_prefix(RAW) {
             push_chain_part(&mut rendered, raw, limit)?;
             rest = tail;
-        } else if typed_tokens_can_close
-            && let Some(after_open) = rest.strip_prefix(OPEN)
-        {
+        } else if typed_tokens_can_close && let Some(after_open) = rest.strip_prefix(OPEN) {
             let Some(end) = after_open.find(CLOSE) else {
                 // No later typed token can close either. Stop searching for
                 // delimiters, but still expand later authored raw tokens.
@@ -2607,7 +2605,8 @@ mod tests {
             "open": "{{"
         });
         let raw = "source: {previous} {{previous.data.number}} {{previous.data.";
-        let template = "raw=[{previous}] value=[{{previous.data.value}}] nested=[{{previous.data.nested}}]";
+        let template =
+            "raw=[{previous}] value=[{{previous.data.value}}] nested=[{{previous.data.nested}}]";
         assert_eq!(
             render_chain_template(template, raw, Some(&data), 4096).unwrap(),
             format!(

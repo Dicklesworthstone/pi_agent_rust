@@ -820,7 +820,10 @@ fn fs_directory_rename_resolves_parent_links_but_preserves_final_link_entries() 
             .await
             .unwrap();
         runtime.drain_microtasks().await.unwrap();
-        let checks = runtime.read_global_json("directoryAliasChecks").await.unwrap();
+        let checks = runtime
+            .read_global_json("directoryAliasChecks")
+            .await
+            .unwrap();
         for (name, passed) in checks.as_object().unwrap() {
             assert_eq!(passed, &serde_json::Value::Bool(true), "{name}: {checks}");
         }
@@ -889,7 +892,10 @@ fn fs_directory_rename_rejects_invalid_destinations_without_partial_mutation() {
             assert_eq!(result["unchanged"], true, "{result}");
         }
         assert_eq!(
-            runtime.read_global_json("renameRetainedData").await.unwrap(),
+            runtime
+                .read_global_json("renameRetainedData")
+                .await
+                .unwrap(),
             serde_json::json!(["source", "target"])
         );
         assert_eq!(
@@ -920,10 +926,8 @@ fn fs_directory_rename_preflights_nested_source_and_destination_admission() {
             )
             .await
             .unwrap();
-            runtime.add_extension_root_with_id(
-                workspace.path().to_path_buf(),
-                Some("rename.owner"),
-            );
+            runtime
+                .add_extension_root_with_id(workspace.path().to_path_buf(), Some("rename.owner"));
             let source_json = serde_json::to_string(&source.display().to_string()).unwrap();
             let destination_json =
                 serde_json::to_string(&destination.display().to_string()).unwrap();
@@ -1012,7 +1016,10 @@ fn fs_directory_rename_merges_into_an_uncached_native_parent() {
             .unwrap();
         runtime.drain_microtasks().await.unwrap();
         assert_eq!(
-            runtime.read_global_json("nativeParentRename").await.unwrap(),
+            runtime
+                .read_global_json("nativeParentRename")
+                .await
+                .unwrap(),
             serde_json::json!({
                 "names":["moved-tree", "native-sibling"], "identity":true,
                 "metadataChanged":true, "data":"overlay", "sourceGone":true,
@@ -1071,7 +1078,10 @@ fn fs_directory_rename_rejects_partial_native_overlays_without_touching_host_fil
             .unwrap();
         runtime.drain_microtasks().await.unwrap();
         assert_eq!(
-            runtime.read_global_json("nativeDirectoryRename").await.unwrap(),
+            runtime
+                .read_global_json("nativeDirectoryRename")
+                .await
+                .unwrap(),
             serde_json::json!({
                 "codes":["ERR_PI_SHIM_UNSUPPORTED_OPERATION", "ERR_PI_SHIM_UNSUPPORTED_OPERATION"],
                 "overlay":"virtual", "virtual":"virtual", "movedAbsent":true,
@@ -1718,7 +1728,11 @@ fn fs_watch_file_observes_directory_rename_and_retained_descriptor_writes() {
         poll_files(&runtime, &clock, 10).await.unwrap();
         let events = runtime.read_global_json("renameWatchEvents").await.unwrap();
         let events = events.as_array().unwrap();
-        assert_eq!(events.len(), 4, "one transition per watched name: {events:?}");
+        assert_eq!(
+            events.len(),
+            4,
+            "one transition per watched name: {events:?}"
+        );
         for kind in ["Root", "File"] {
             let old = events
                 .iter()
@@ -1746,7 +1760,11 @@ fn fs_watch_file_observes_directory_rename_and_retained_descriptor_writes() {
         poll_files(&runtime, &clock, 20).await.unwrap();
         let events = runtime.read_global_json("renameWatchEvents").await.unwrap();
         let events = events.as_array().unwrap();
-        assert_eq!(events.len(), 1, "detached names must stay quiet: {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "detached names must stay quiet: {events:?}"
+        );
         assert_eq!(events[0]["name"], "newFile");
         assert_eq!(events[0]["current"], events[0]["previous"]);
         assert_eq!(events[0]["changed"], true);
