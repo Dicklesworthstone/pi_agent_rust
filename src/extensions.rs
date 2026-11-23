@@ -10926,8 +10926,7 @@ fn is_node_modules_directory(path: &Path) -> bool {
     path.file_name()
         .and_then(|value| value.to_str())
         .is_some_and(|value| {
-            value == "node_modules"
-                || (cfg!(windows) && value.eq_ignore_ascii_case("node_modules"))
+            value == "node_modules" || (cfg!(windows) && value.eq_ignore_ascii_case("node_modules"))
         })
 }
 
@@ -11045,9 +11044,7 @@ impl JsExtensionLoadSpec {
         if let Ok(JsExtensionProvenance::DeclaredPackage(root)) =
             js_extension_provenance(&entry_path, &mut JsPackageEntryCache::new())
             && let Ok(Some(json)) = read_js_package_manifest(&root.join("package.json"))
-            && let Some(package_name) = json
-                .get("name")
-                .and_then(Value::as_str)
+            && let Some(package_name) = json.get("name").and_then(Value::as_str)
             && let Some(prefix) = extension_package_identity_prefix(&root, package_name)
         {
             extension_id = format!("{prefix}:{package_name}:{extension_id}");
@@ -15418,7 +15415,11 @@ mod application_storage_tests {
             ),
             ("node_modules/auth", "auth", "npm:auth:src"),
             ("node_modules/installed", "different-name", "src"),
-            ("loose-package", "loose-package", "package:loose-package:src"),
+            (
+                "loose-package",
+                "loose-package",
+                "package:loose-package:src",
+            ),
             ("invalid-package", "invalid:name", "src"),
             ("empty-package", "", "src"),
         ] {
