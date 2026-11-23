@@ -1891,6 +1891,44 @@ impl AbortSignal {
     }
 }
 
+/// Keep both cancellation sources live while a provider is silent. Receiving
+/// on an unsent channel subscribes to owner cancellation without spawning a
+/// task; the timer also observes budgets that expire without a notification.
+/// An optional UI abort signal never replaces the invoking owner's lifetime.
+async fn wait_for_provider_cancellation(owner: &crate::agent_cx::AgentCx, abort: Option<&AbortSignal>) {
+    let owner_cancelled = async {
+        let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+        let _ = receiver.recv(owner.cx()).await;
+        drop(sender);
+    }
+    .fuse();
+    let explicit_abort = async {
+        if let Some(signal) = abort {
+            signal.wait().await;
+        } else {
+            futures::future::pending::<()>().await;
+        }
+    }
+    .fuse();
+    futures::pin_mut!(owner_cancelled, explicit_abort);
+    let cancelled = futures::future::select(owner_cancelled, explicit_abort).fuse();
+    futures::pin_mut!(cancelled);
+    let time = owner.time();
+    loop {
+        if owner.checkpoint().is_err() || abort.is_some_and(AbortSignal::is_aborted) {
+            return;
+        }
+        let tick = time.sleep(Duration::from_millis(25)).fuse();
+        futures::pin_mut!(tick);
+        if matches!(
+            futures::future::select(cancelled.as_mut(), tick).await,
+            futures::future::Either::Left(_)
+        ) {
+            return;
+        }
+    }
+}
+
 /// Compaction window for a model entry, with a reported zero treated as
 /// "unknown" rather than "no room".
 ///
@@ -5530,36 +5568,39 @@ impl Agent {
         }
 
         let request_started_at = Instant::now();
-        let stream_fut = provider.stream(&context, &stream_options);
-        let mut stream = if let Some(signal) = abort.as_ref() {
-            let abort_fut = signal.wait().fuse();
-            let stream_fut = stream_fut.fuse();
-            futures::pin_mut!(abort_fut, stream_fut);
-            match futures::future::select(abort_fut, stream_fut).await {
-                futures::future::Either::Left(((), _)) => {
-                    let abort_arc = Arc::new(self.build_abort_message(None));
-                    on_event(AgentEvent::MessageStart {
-                        message: Message::Assistant(Arc::clone(&abort_arc)),
-                    });
-                    self.messages
-                        .push(Message::Assistant(Arc::clone(&abort_arc)));
-                    on_event(AgentEvent::MessageUpdate {
-                        message: Message::Assistant(Arc::clone(&abort_arc)),
-                        assistant_message_event: AssistantMessageEvent::Error {
-                            reason: StopReason::Aborted,
-                            error: Arc::clone(&abort_arc),
-                        },
-                    });
-                    return Ok(self.finalize_assistant_message(
-                        Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
-                        &on_event,
-                        true,
-                    ));
-                }
-                futures::future::Either::Right((res, _)) => res?,
+        let cancelled = wait_for_provider_cancellation(checkpoint_cx, abort.as_ref()).fuse();
+        let stream_fut = provider.stream(&context, &stream_options).fuse();
+        futures::pin_mut!(cancelled, stream_fut);
+        let mut stream = match futures::future::select(cancelled.as_mut(), stream_fut).await {
+            // The provider poll may itself request cancellation before
+            // returning, including while producing an opening error. Recheck
+            // after that poll before interpreting its result as a failure.
+            futures::future::Either::Right((res, _))
+                if checkpoint_cx.checkpoint().is_ok()
+                    && !abort.as_ref().is_some_and(AbortSignal::is_aborted) =>
+            {
+                res?
             }
-        } else {
-            stream_fut.await?
+            _ => {
+                let abort_arc = Arc::new(self.build_abort_message(None));
+                on_event(AgentEvent::MessageStart {
+                    message: Message::Assistant(Arc::clone(&abort_arc)),
+                });
+                self.messages
+                    .push(Message::Assistant(Arc::clone(&abort_arc)));
+                on_event(AgentEvent::MessageUpdate {
+                    message: Message::Assistant(Arc::clone(&abort_arc)),
+                    assistant_message_event: AssistantMessageEvent::Error {
+                        reason: StopReason::Aborted,
+                        error: Arc::clone(&abort_arc),
+                    },
+                });
+                return Ok(self.finalize_assistant_message(
+                    Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
+                    &on_event,
+                    true,
+                ));
+            }
         };
 
         let mut added_partial = false;
@@ -5618,12 +5659,11 @@ impl Agent {
                 ));
             }
 
-            let event_result = if let Some(signal) = abort.as_ref() {
-                let abort_fut = signal.wait().fuse();
+            let event_result = {
                 let event_fut = stream.next().fuse();
-                futures::pin_mut!(abort_fut, event_fut);
+                futures::pin_mut!(event_fut);
 
-                match futures::future::select(abort_fut, event_fut).await {
+                match futures::future::select(cancelled.as_mut(), event_fut).await {
                     futures::future::Either::Left(((), _event_fut)) => {
                         let last_partial = if added_partial {
                             match self
@@ -5665,28 +5705,16 @@ impl Agent {
                     }
                     futures::future::Either::Right((event, _abort_fut)) => event,
                 }
-            } else {
-                let event_fut = stream.next().fuse();
-                futures::pin_mut!(event_fut);
-                loop {
-                    let now = checkpoint_cx
-                        .cx()
-                        .timer_driver()
-                        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-                    let tick_fut =
-                        asupersync::time::sleep(now, std::time::Duration::from_millis(25)).fuse();
-                    futures::pin_mut!(tick_fut);
-
-                    match futures::future::select(tick_fut, &mut event_fut).await {
-                        futures::future::Either::Left(((), _event_fut)) => {
-                            if checkpoint_cx.checkpoint().is_err() {
-                                continue 'stream;
-                            }
-                        }
-                        futures::future::Either::Right((result, _tick_fut)) => break result,
-                    }
-                }
             };
+
+            // Cancellation can occur inside the provider poll that returns
+            // EOF or an error. It takes precedence before either outcome is
+            // consumed, just as it does for a successfully decoded event.
+            if checkpoint_cx.checkpoint().is_err()
+                || abort.as_ref().is_some_and(AbortSignal::is_aborted)
+            {
+                continue 'stream;
+            }
 
             let Some(event_result) = event_result else {
                 break;
@@ -5716,11 +5744,6 @@ impl Agent {
                 }
             };
 
-            if checkpoint_cx.checkpoint().is_err()
-                || abort.as_ref().is_some_and(AbortSignal::is_aborted)
-            {
-                continue 'stream;
-            }
             if let Some((rule, retry)) = self.stream_rule_interruption(&event) {
                 let partial = match &event {
                     StreamEvent::Start { partial } => Some(partial),
@@ -18023,6 +18046,214 @@ mod abort_tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum PendingProviderPhase {
+        Opening,
+        Reading,
+    }
+
+    struct ProviderDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for ProviderDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct EventsThenPending {
+        events: std::vec::IntoIter<StreamEvent>,
+        pending: Arc<AtomicBool>,
+        _drop_probe: ProviderDropProbe,
+    }
+
+    impl Stream for EventsThenPending {
+        type Item = crate::error::Result<StreamEvent>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if let Some(event) = self.events.next() {
+                return Poll::Ready(Some(Ok(event)));
+            }
+            self.pending.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingProvider {
+        phase: PendingProviderPhase,
+        pending: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for PendingProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let drop_probe = ProviderDropProbe(Arc::clone(&self.drops));
+            if matches!(self.phase, PendingProviderPhase::Opening) {
+                self.pending.store(true, Ordering::SeqCst);
+                futures::future::pending::<()>().await;
+                unreachable!("opening is interrupted only by dropping its future");
+            }
+            Ok(Box::pin(EventsThenPending {
+                events: vec![
+                    StreamEvent::Start {
+                        partial: PhasedProvider::base_message(),
+                    },
+                    StreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "already shown".to_string(),
+                    },
+                    // A complete tool block is still provisional until the
+                    // provider supplies a successful terminal response.
+                    StreamEvent::ToolCallEnd {
+                        content_index: 1,
+                        tool_call: ToolCall {
+                            id: "pending-write".to_string(),
+                            name: "write".to_string(),
+                            arguments: json!({
+                                "path": "must-not-exist.txt",
+                                "content": "cancelled provider must not authorize this write",
+                            }),
+                            thought_signature: None,
+                        },
+                    },
+                ]
+                .into_iter(),
+                pending: Arc::clone(&self.pending),
+                _drop_probe: drop_probe,
+            }))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadyProviderResult {
+        OpeningError,
+        StreamError,
+        StreamEof,
+    }
+
+    #[derive(Clone, Debug)]
+    enum ProviderPollCancellation {
+        Owner(crate::agent_cx::AgentCx),
+        Explicit(AbortHandle),
+    }
+
+    impl ProviderPollCancellation {
+        fn request(&self) {
+            match self {
+                Self::Owner(owner) => owner.set_cancel_requested(true),
+                Self::Explicit(handle) => handle.abort(),
+            }
+        }
+    }
+
+    struct CancelOnReadyStream {
+        partial: Option<AssistantMessage>,
+        result: ReadyProviderResult,
+        cancellation: ProviderPollCancellation,
+        _drop_probe: ProviderDropProbe,
+    }
+
+    impl Stream for CancelOnReadyStream {
+        type Item = crate::error::Result<StreamEvent>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if let Some(partial) = self.partial.take() {
+                return Poll::Ready(Some(Ok(StreamEvent::Start { partial })));
+            }
+            self.cancellation.request();
+            match self.result {
+                ReadyProviderResult::StreamError => {
+                    Poll::Ready(Some(Err(Error::api("ready stream failure"))))
+                }
+                ReadyProviderResult::StreamEof => Poll::Ready(None),
+                ReadyProviderResult::OpeningError => unreachable!("opening failed before streaming"),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CancelOnReadyProvider {
+        result: ReadyProviderResult,
+        cancellation: ProviderPollCancellation,
+        drops: Arc<AtomicUsize>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for CancelOnReadyProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let drop_probe = ProviderDropProbe(Arc::clone(&self.drops));
+            if matches!(self.result, ReadyProviderResult::OpeningError) {
+                self.cancellation.request();
+                return Err(Error::api("ready opening failure"));
+            }
+            let mut partial = PhasedProvider::base_message();
+            partial.content = vec![
+                ContentBlock::Text(TextContent::new("already shown")),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "ready-write".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({"path": "must-not-exist.txt", "content": "withheld"}),
+                    thought_signature: None,
+                }),
+            ];
+            Ok(Box::pin(CancelOnReadyStream {
+                partial: Some(partial),
+                result: self.result,
+                cancellation: self.cancellation.clone(),
+                _drop_probe: drop_probe,
+            }))
+        }
+    }
+
     #[derive(Debug)]
     struct CountingProvider {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -18658,6 +18889,266 @@ mod abort_tests {
             assert_eq!(message.stop_reason, StopReason::Aborted);
             assert_eq!(message.error_message.as_deref(), Some("Aborted"));
         });
+    }
+
+    fn assert_aborted_provider_lifecycle(
+        agent: &Agent,
+        message: &AssistantMessage,
+        events: &[AgentEvent],
+    ) {
+        assert_eq!(message.stop_reason, StopReason::Aborted);
+        assert_eq!(message.error_message.as_deref(), Some("Aborted"));
+        let expected = serde_json::to_value(message).unwrap();
+        let [Message::User(_), Message::Assistant(retained)] = agent.messages() else {
+            panic!("cancellation must retain exactly the user and one assistant message");
+        };
+        assert_eq!(serde_json::to_value(retained).unwrap(), expected);
+
+        let mut lifecycle = Vec::new();
+        for event in events {
+            match event {
+                AgentEvent::MessageStart {
+                    message: Message::Assistant(_),
+                } => lifecycle.push("start"),
+                AgentEvent::MessageUpdate {
+                    assistant_message_event: AssistantMessageEvent::Error { reason, error },
+                    ..
+                } => {
+                    assert_eq!(*reason, StopReason::Aborted);
+                    assert_eq!(serde_json::to_value(error).unwrap(), expected);
+                    lifecycle.push("aborted");
+                }
+                AgentEvent::MessageEnd {
+                    message: Message::Assistant(ended),
+                } => {
+                    assert_eq!(serde_json::to_value(ended).unwrap(), expected);
+                    lifecycle.push("message_end");
+                }
+                AgentEvent::TurnEnd {
+                    message: Message::Assistant(ended),
+                    tool_results,
+                    ..
+                } => {
+                    assert_eq!(serde_json::to_value(ended).unwrap(), expected);
+                    assert!(tool_results.is_empty());
+                    lifecycle.push("turn_end");
+                }
+                AgentEvent::AgentEnd { error, .. } => {
+                    assert_eq!(error.as_deref(), Some("Aborted"));
+                    lifecycle.push("agent_end");
+                }
+                AgentEvent::MessageUpdate {
+                    assistant_message_event: AssistantMessageEvent::Done { .. },
+                    ..
+                }
+                | AgentEvent::ToolExecutionStart { .. }
+                | AgentEvent::ToolExecutionEnd { .. }
+                | AgentEvent::ProviderError { .. }
+                | AgentEvent::AutoRetryStart { .. }
+                | AgentEvent::FailoverStart { .. } => {
+                    panic!("cancelled provider must not succeed, execute, or recover: {event:?}");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            lifecycle,
+            ["start", "aborted", "message_end", "turn_end", "agent_end"]
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn assert_pending_provider_cancellation(
+        phase: PendingProviderPhase,
+        with_abort_signal: bool,
+        cancel_owner: bool,
+    ) {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tool fixture directory");
+            let pending = Arc::new(AtomicBool::new(false));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(PendingProvider {
+                phase,
+                pending: Arc::clone(&pending),
+                drops: Arc::clone(&drops),
+                calls: AtomicUsize::new(0),
+            });
+            let tools = ToolRegistry::from_tools(vec![Box::new(crate::tools::WriteTool::new(
+                temp.path(),
+            ))]);
+            let mut agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+            let owner = crate::agent_cx::AgentCx::for_testing();
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let event_sink = Arc::clone(&events);
+            let message = {
+                let mut turn = Box::pin(owner.with_current(agent.run_with_abort(
+                    "keep the partial response",
+                    with_abort_signal.then(|| abort_signal.clone()),
+                    move |event| event_sink.lock().unwrap().push(event),
+                )));
+                // The fixture does not observe cancellation or arrange any
+                // provider wakeup. Wait until the exact open/read is pending
+                // before cancelling; a startup-only check cannot pass this.
+                let reached_pending = futures::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
+                    if pending.load(Ordering::SeqCst) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                });
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    reached_pending,
+                )
+                .await
+                .expect("provider must reach its pending operation");
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                assert!(!abort_signal.is_aborted());
+                assert!(!owner.is_cancel_requested());
+
+                if cancel_owner {
+                    owner.set_cancel_requested(true);
+                } else {
+                    abort_handle.abort();
+                }
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    turn.as_mut(),
+                )
+                .await
+                .expect("cancellation must interrupt a silent provider")
+                .expect("cancelled agent turn")
+            };
+
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(abort_signal.is_aborted(), !cancel_owner);
+            assert_eq!(owner.is_cancel_requested(), cancel_owner);
+            assert!(!temp.path().join("must-not-exist.txt").exists());
+            match phase {
+                PendingProviderPhase::Opening => assert!(message.content.is_empty()),
+                PendingProviderPhase::Reading => {
+                    assert!(matches!(
+                        message.content.as_slice(),
+                        [ContentBlock::Text(text), ContentBlock::ToolCall(call)]
+                            if text.text == "already shown" && call.id == "pending-write"
+                    ));
+                }
+            }
+            let events = events.lock().unwrap().clone();
+            assert_aborted_provider_lifecycle(&agent, &message, &events);
+        });
+    }
+
+    #[test]
+    fn owner_cancellation_interrupts_pending_provider_open_with_optional_abort() {
+        for with_abort_signal in [false, true] {
+            assert_pending_provider_cancellation(
+                PendingProviderPhase::Opening,
+                with_abort_signal,
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn owner_cancellation_interrupts_silent_stream_with_optional_abort() {
+        for with_abort_signal in [false, true] {
+            assert_pending_provider_cancellation(
+                PendingProviderPhase::Reading,
+                with_abort_signal,
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_abort_interrupts_pending_provider_open_and_stream() {
+        for phase in [PendingProviderPhase::Opening, PendingProviderPhase::Reading] {
+            assert_pending_provider_cancellation(phase, true, false);
+        }
+    }
+
+    fn assert_provider_poll_cancellation(result: ReadyProviderResult, cancel_owner: bool) {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tool fixture directory");
+            let owner = crate::agent_cx::AgentCx::for_testing();
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(CancelOnReadyProvider {
+                result,
+                cancellation: if cancel_owner {
+                    ProviderPollCancellation::Owner(owner.clone())
+                } else {
+                    ProviderPollCancellation::Explicit(abort_handle)
+                },
+                drops: Arc::clone(&drops),
+                calls: AtomicUsize::new(0),
+            });
+            let tools = ToolRegistry::from_tools(vec![Box::new(crate::tools::WriteTool::new(
+                temp.path(),
+            ))]);
+            let mut agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let event_sink = Arc::clone(&events);
+            // Cancellation occurs inside the poll that returns a ready error
+            // or EOF, after select has polled its cancellation arm as healthy.
+            // Every fixture result is immediately ready: no timer can conceal
+            // a missing recheck at the provider-result boundary.
+            let message = owner
+                .with_current(agent.run_with_abort(
+                    "preserve cancellation over provider failure",
+                    Some(abort_signal.clone()),
+                    move |event| event_sink.lock().unwrap().push(event),
+                ))
+                .await
+                .expect("cancellation wins over a simultaneous provider failure");
+
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(owner.is_cancel_requested(), cancel_owner);
+            assert_eq!(abort_signal.is_aborted(), !cancel_owner);
+            assert!(!temp.path().join("must-not-exist.txt").exists());
+            match result {
+                ReadyProviderResult::OpeningError => assert!(message.content.is_empty()),
+                ReadyProviderResult::StreamError | ReadyProviderResult::StreamEof => {
+                    assert!(matches!(
+                        message.content.as_slice(),
+                        [ContentBlock::Text(text), ContentBlock::ToolCall(call)]
+                            if text.text == "already shown" && call.id == "ready-write"
+                    ));
+                }
+            }
+            let events = events.lock().unwrap().clone();
+            assert_aborted_provider_lifecycle(&agent, &message, &events);
+        });
+    }
+
+    #[test]
+    fn cancellation_during_provider_opening_error_wins_over_failure() {
+        for cancel_owner in [false, true] {
+            assert_provider_poll_cancellation(ReadyProviderResult::OpeningError, cancel_owner);
+        }
+    }
+
+    #[test]
+    fn cancellation_during_stream_error_or_eof_preserves_aborted_partial() {
+        for result in [ReadyProviderResult::StreamError, ReadyProviderResult::StreamEof] {
+            for cancel_owner in [false, true] {
+                assert_provider_poll_cancellation(result, cancel_owner);
+            }
+        }
     }
 
     #[test]
