@@ -2559,6 +2559,237 @@ fn fs_host_descriptor_metadata_stays_with_captured_contents_after_path_replaceme
     });
 }
 
+async fn regular_host_file_runtime(workspace: &std::path::Path) -> PiJsRuntime<DeterministicClock> {
+    let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+        DeterministicClock::new(0),
+        PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            disk_cache_dir: None,
+            repair_mode: pi::extensions_js::RepairMode::AutoStrict,
+            ..Default::default()
+        },
+        Some(pi::extensions::ExtensionPolicy::default()),
+        "host-reader".to_string(),
+    )
+    .await
+    .expect("host file runtime");
+    runtime.add_extension_root_with_id(workspace.to_path_buf(), Some("host-reader"));
+    runtime
+}
+
+#[test]
+fn fs_host_reads_preserve_regular_bytes_and_directory_errors() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = pi::extensions::safe_canonicalize(temp.path());
+        std::fs::write(root.join("regular.bin"), [0_u8, 255, 1, 65, 10]).unwrap();
+        std::fs::write(root.join("empty.bin"), []).unwrap();
+        // A repairable asset suffix must not make an existing directory look
+        // like an absent text asset, even with automatic repairs enabled.
+        std::fs::create_dir(root.join("directory.txt")).unwrap();
+        let runtime = regular_host_file_runtime(&root).await;
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(async fs => {
+                    const path = process.cwd() + '/regular.bin';
+                    const fd = fs.openSync(path, 'r');
+                    const bytes = Buffer.alloc(5);
+                    fs.readSync(fd, bytes, 0, bytes.length, 0);
+                    fs.closeSync(fd);
+                    const callback = await new Promise((resolve, reject) => {
+                        fs.readFile(path, (error, data) => error ? reject(error) : resolve(data));
+                    });
+                    globalThis.hostBytes = {
+                        sync: Array.from(fs.readFileSync(path)),
+                        descriptor: Array.from(bytes),
+                        promise: Array.from(await fs.promises.readFile(path)),
+                        callback: Array.from(callback),
+                        empty: fs.readFileSync(process.cwd() + '/empty.bin').length,
+                    };
+                    const directory = process.cwd() + '/directory.txt';
+                    const operations = [
+                        () => fs.readFileSync(directory),
+                        () => fs.promises.readFile(directory),
+                        () => new Promise((resolve, reject) => {
+                            fs.readFile(directory, (error, data) => error ? reject(error) : resolve(data));
+                        }),
+                    ];
+                    globalThis.hostDirectoryErrors = [];
+                    for (const operation of operations) {
+                        try { await operation(); hostDirectoryErrors.push(null); }
+                        catch (error) {
+                            hostDirectoryErrors.push({
+                                code: error.code, syscall: error.syscall,
+                                pathMatches: String(error.path).replace(/\\/g, '/') === directory.replace(/\\/g, '/'),
+                            });
+                        }
+                    }
+                    try { fs.readFileSync(process.cwd() + '/absent.bin'); }
+                    catch (error) { globalThis.hostMissingCode = error.code; }
+                });
+                "#,
+            )
+            .await
+            .expect("exercise regular host reads");
+        runtime.drain_microtasks().await.expect("drain");
+        assert_eq!(
+            runtime.read_global_json("hostBytes").await.unwrap(),
+            serde_json::json!({
+                "sync": [0, 255, 1, 65, 10], "descriptor": [0, 255, 1, 65, 10],
+                "promise": [0, 255, 1, 65, 10], "callback": [0, 255, 1, 65, 10], "empty": 0,
+            })
+        );
+        assert_eq!(
+            runtime.read_global_json("hostDirectoryErrors").await.unwrap(),
+            serde_json::json!([
+                { "code": "EISDIR", "syscall": "open", "pathMatches": true },
+                { "code": "EISDIR", "syscall": "open", "pathMatches": true },
+                { "code": "EISDIR", "syscall": "open", "pathMatches": true },
+            ])
+        );
+        assert_eq!(
+            runtime.read_global_json("hostMissingCode").await.unwrap(),
+            "ENOENT"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_host_regular_reads_keep_symlink_admission_boundaries() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let root = base.join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("regular.txt"), "authorized bytes").unwrap();
+        std::fs::write(base.join("outside.txt"), "private bytes").unwrap();
+        std::os::unix::fs::symlink("regular.txt", root.join("alias.txt")).unwrap();
+        std::os::unix::fs::symlink(base.join("outside.txt"), root.join("outside.txt")).unwrap();
+        let runtime = regular_host_file_runtime(&root).await;
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(async fs => {
+                    const alias = process.cwd() + '/alias.txt';
+                    const fd = fs.openSync(alias, 'r');
+                    const bytes = Buffer.alloc(64);
+                    const count = fs.readSync(fd, bytes, 0, bytes.length, 0);
+                    fs.closeSync(fd);
+                    let blocked = false;
+                    try { await fs.promises.readFile(process.cwd() + '/outside.txt'); }
+                    catch (error) { blocked = error.code !== 'ENOENT' && String(error).includes('denied'); }
+                    globalThis.hostAliasReads = {
+                        sync: fs.readFileSync(alias, 'utf8'),
+                        promise: await fs.promises.readFile(alias, 'utf8'),
+                        descriptor: bytes.subarray(0, count).toString('utf8'),
+                        blocked,
+                    };
+                });
+                "#,
+            )
+            .await
+            .expect("exercise admitted host symlinks");
+        runtime.drain_microtasks().await.expect("drain");
+        assert_eq!(
+            runtime.read_global_json("hostAliasReads").await.unwrap(),
+            serde_json::json!({
+                "sync": "authorized bytes", "promise": "authorized bytes",
+                "descriptor": "authorized bytes", "blocked": true,
+            })
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_host_reads_reject_fifo_without_blocking_runtime() {
+    const CHILD_MODE: &str = "PIJS_FS_FIFO_READ_MODE";
+    if let Ok(operation) = std::env::var(CHILD_MODE) {
+        futures::executor::block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = pi::extensions::safe_canonicalize(temp.path());
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                root.join("events.txt"),
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .expect("create FIFO without any peer");
+            std::fs::write(root.join("regular.txt"), "runtime remains usable").unwrap();
+            let runtime = regular_host_file_runtime(&root).await;
+            let operation = serde_json::to_string(&operation).unwrap();
+            runtime
+                .eval(&format!(
+                    r#"
+                    import('node:fs').then(async fs => {{
+                        const path = process.cwd() + '/events.txt';
+                        const operation = {operation};
+                        let failure = null;
+                        try {{
+                            if (operation === 'sync') fs.readFileSync(path);
+                            else if (operation === 'descriptor') fs.openSync(path, 'r');
+                            else if (operation === 'promise') await fs.promises.readFile(path);
+                            else await new Promise((resolve, reject) => {{
+                                fs.readFile(path, (error, data) => error ? reject(error) : resolve(data));
+                            }});
+                        }} catch (error) {{
+                            failure = {{ code: error.code, syscall: error.syscall, pathMatches: error.path === path }};
+                        }}
+                        globalThis.fifoRead = {{
+                            failure, stillFifo: fs.statSync(path).isFIFO(),
+                            usable: fs.readFileSync(process.cwd() + '/regular.txt', 'utf8'),
+                        }};
+                    }});
+                    "#
+                ))
+                .await
+                .expect("reject blocking FIFO read");
+            runtime.drain_microtasks().await.expect("drain");
+            assert_eq!(
+                runtime.read_global_json("fifoRead").await.unwrap(),
+                serde_json::json!({
+                    "failure": { "code": "EINVAL", "syscall": "open", "pathMatches": true },
+                    "stillFifo": true, "usable": "runtime remains usable",
+                })
+            );
+        });
+        return;
+    }
+
+    // The broken implementation blocks inside a Rust hostcall, where neither
+    // JS interrupts nor async timeouts can run. Isolate each public surface in
+    // a child so a regression cannot strand this test binary or its peers.
+    for operation in ["sync", "descriptor", "promise", "callback"] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fs_host_reads_reject_fifo_without_blocking_runtime",
+                "--nocapture",
+            ])
+            .env(CHILD_MODE, operation)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn bounded FIFO regression child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll FIFO regression child") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{operation} must reject a FIFO without waiting for a peer");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "{operation} FIFO regression child failed: {status}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // host FS fallback in statSync (the fix we applied)
 // ---------------------------------------------------------------------------

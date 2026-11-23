@@ -13910,6 +13910,10 @@ const __pi_vfs = (() => {
       if (isPersistentPath(resolved) && (!error || error.code !== "ENOENT")) {
         throw error;
       }
+      // A present host file that cannot be read is not a missing overlay.
+      // In particular, do not hide rejected special files, directory reads,
+      // permission failures or failed descriptor captures behind ENOENT.
+      if (error && error.code !== undefined && error.code !== "ENOENT") throw error;
       // A standalone realm may use an unrestricted virtual overlay, but host
       // reads remain confined. Treat a denied host probe as an absent overlay
       // entry so create/write operations can proceed entirely in the VFS.
@@ -24017,9 +24021,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
-                                // Authorize before probing, then verify the opened handle's
-                                // path to close the check/open TOCTOU window.
-                                let file = match std::fs::File::open(&requested_abs) {
+                                // Authorize before probing, then open without waiting on a
+                                // FIFO/device and verify the opened handle's authorized path.
+                                // The shared opener checks regular-file identity across open
+                                // so a type or symlink swap cannot pin this runtime thread.
+                                let file = match crate::tools::open_regular_file_for_capped_read(&requested_abs) {
                                     Ok(file) => file,
                                     Err(err)
                                         if err.kind() == std::io::ErrorKind::NotFound
@@ -24046,10 +24052,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         return apply_missing_asset_fallback(&checked_path, &err.to_string());
                                     }
                                     Err(err) => {
-                                        return Err(rquickjs::Error::new_loading_message(
-                                            &path,
-                                            format!("host read open: {err}"),
-                                        ));
+                                        return Err(storage::filesystem_error(&ctx, &path, "open", &err));
                                     }
                                 };
 
@@ -24057,12 +24060,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     "/proc/self/fd/{}",
                                     file.as_raw_fd()
                                 ))
-                                .map_err(|err| {
-                                    rquickjs::Error::new_loading_message(
-                                        &path,
-                                        format!("host read verify: {err}"),
-                                    )
-                                })?;
+                                .map_err(|err| storage::filesystem_error(&ctx, &path, "open", &err))?;
                                 let secure_path =
                                     crate::extensions::strip_unc_prefix(secure_path_buf);
 
@@ -24100,20 +24098,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                                 let mut reader = file.take(MAX_SYNC_READ_SIZE + 1);
                                 let mut buffer = Vec::new();
-                                reader.read_to_end(&mut buffer).map_err(|err| {
-                                    rquickjs::Error::new_loading_message(
-                                        &path,
-                                        format!("host read content: {err}"),
-                                    )
-                                })?;
+                                reader.read_to_end(&mut buffer)
+                                    .map_err(|err| storage::filesystem_error(&ctx, &path, "read", &err))?;
 
                                 if buffer.len() as u64 > MAX_SYNC_READ_SIZE {
-                                    return Err(rquickjs::Error::new_loading_message(
-                                        &path,
+                                    let error = std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
                                         format!(
                                             "host read failed: file exceeds {MAX_SYNC_READ_SIZE} bytes"
                                         ),
-                                    ));
+                                    );
+                                    return Err(storage::filesystem_error(&ctx, &path, "read", &error));
                                 }
 
                                 Ok(BASE64_STANDARD.encode(buffer))
@@ -24159,16 +24154,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
-                                let file = match std::fs::File::open(&checked_path) {
+                                let file = match crate::tools::open_regular_file_for_capped_read(&checked_path) {
                                     Ok(file) => file,
                                     Err(err) => {
                                         if err.kind() == std::io::ErrorKind::NotFound && in_ext_root && configured_repair_mode.should_apply() {
                                             return apply_missing_asset_fallback(&checked_path, &err.to_string());
                                         }
-                                        return Err(rquickjs::Error::new_loading_message(
-                                            &path,
-                                            format!("host read: {err}"),
-                                        ));
+                                        return Err(storage::filesystem_error(&ctx, &path, "open", &err));
                                     }
                                 };
 
@@ -24180,18 +24172,15 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                                 let mut reader = file.take(MAX_SYNC_READ_SIZE + 1);
                                 let mut buffer = Vec::new();
-                                reader.read_to_end(&mut buffer).map_err(|err| {
-                                    rquickjs::Error::new_loading_message(
-                                        &path,
-                                        format!("host read content: {err}"),
-                                    )
-                                })?;
+                                reader.read_to_end(&mut buffer)
+                                    .map_err(|err| storage::filesystem_error(&ctx, &path, "read", &err))?;
 
                                 if buffer.len() as u64 > MAX_SYNC_READ_SIZE {
-                                    return Err(rquickjs::Error::new_loading_message(
-                                        &path,
+                                    let error = std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
                                         format!("host read failed: file exceeds {MAX_SYNC_READ_SIZE} bytes"),
-                                    ));
+                                    );
+                                    return Err(storage::filesystem_error(&ctx, &path, "read", &error));
                                 }
 
                                 Ok(BASE64_STANDARD.encode(buffer))

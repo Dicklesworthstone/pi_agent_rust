@@ -2144,7 +2144,7 @@ fn opened_file_matches_metadata_snapshot(
     true
 }
 
-fn open_regular_file_for_capped_read(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_regular_file_for_capped_read(path: &Path) -> std::io::Result<std::fs::File> {
     // Resolve an intentional terminal symlink once, then refuse a second
     // terminal link swap while opening the resolved target. NONBLOCK keeps a
     // concurrent regular-file-to-FIFO swap from hanging the agent.
@@ -2152,7 +2152,11 @@ fn open_regular_file_for_capped_read(path: &Path) -> std::io::Result<std::fs::Fi
     let expected_metadata = std::fs::metadata(&resolved_path)?;
     if !expected_metadata.is_file() {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+            if expected_metadata.is_dir() {
+                std::io::ErrorKind::IsADirectory
+            } else {
+                std::io::ErrorKind::InvalidInput
+            },
             format!("{} is not a regular file", path.display()),
         ));
     }
@@ -2167,6 +2171,7 @@ fn open_regular_file_for_capped_read(path: &Path) -> std::io::Result<std::fs::Fi
             rustix::fs::OFlags::RDONLY
                 | rustix::fs::OFlags::CLOEXEC
                 | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NOCTTY
                 | rustix::fs::OFlags::NONBLOCK,
             rustix::fs::Mode::empty(),
         )
@@ -2191,7 +2196,11 @@ fn open_regular_file_for_capped_read(path: &Path) -> std::io::Result<std::fs::Fi
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+            if metadata.is_dir() {
+                std::io::ErrorKind::IsADirectory
+            } else {
+                std::io::ErrorKind::InvalidInput
+            },
             format!("{} is not a regular file", path.display()),
         ));
     }
