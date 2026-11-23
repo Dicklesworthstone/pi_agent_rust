@@ -2431,7 +2431,7 @@ mod tests {
                     agent.name
                 );
                 let selected = cli.enabled_tools(&config);
-                let registry = if cli.builtin_tools_disabled() {
+                let registry = if cli.builtin_tools_disabled(&config) {
                     crate::tools::ToolRegistry::without_builtins(Some(&config))
                 } else {
                     crate::tools::ToolRegistry::with_builtin_tool_policy(
@@ -2442,7 +2442,7 @@ mod tests {
                         None,
                         false,
                         None,
-                        !cli.no_implicit_tools,
+                        cli.implicit_tools_allowed(&config),
                     )
                 };
                 let mut expected = agent

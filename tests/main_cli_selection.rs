@@ -1562,7 +1562,8 @@ fn prepare_initial_message_multiple_files_with_message() {
 #[test]
 fn cli_enabled_tools_default() {
     let cli = cli::Cli::parse_from(["pi"]);
-    let tools = cli.enabled_tools(&Config::default());
+    let config = Config::default();
+    let tools = cli.enabled_tools(&config);
     assert!(tools.contains(&"read"));
     assert!(tools.contains(&"bash"));
     assert!(tools.contains(&"edit"));

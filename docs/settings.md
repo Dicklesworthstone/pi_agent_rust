@@ -58,7 +58,9 @@ Resulting behavior:
 The `tools` object merges each activation flag independently, and `loadMode`
 merges entries by tool name. An omitted activation flag inherits the global
 value; an explicit `false` disables a globally enabled optional tool for that
-trusted project. See [Optional tools](#optional-tools).
+trusted project. The `defaultTools` list replaces the global list as a whole;
+an empty project list remains empty. See [Default tool list](#default-tool-list)
+and [Optional tools](#optional-tools).
 
 ## ACP workspace settings
 
@@ -152,6 +154,47 @@ to override a default or add another server.
 See [language-server setup and configuration](lsp-configuration.md) for the
 installation table, automatic detection behavior, and `lsp.servers` examples.
 
+### Default tool list
+
+Set `defaultTools` (or `default_tools`) to select the built-in tools for sessions
+that do not supply an explicit `--tools` list:
+
+```json
+{
+  "defaultTools": ["read", "grep", "find", "ls", "eval"]
+}
+```
+
+Each array entry is one tool name. Pi trims whitespace, ignores blank entries,
+and removes duplicates while preserving the list's order. The setting must be
+an array of strings; use one spelling per file.
+
+A configured list replaces the built-in defaults and the four optional-tool
+activation flags below. It also prevents automatic additions from browser,
+computer, media, memory, and skill-management settings. Tools still need their
+normal backend configuration and admission. A derived `xdev` dispatcher can
+expose discoverable tools admitted by the list.
+
+The precedence is:
+
+1. `--no-tools` disables all built-in tools.
+2. An explicit `--tools` list, including an empty one, overrides `defaultTools`.
+   The SDK's explicit `enabled_tools` list has the same precedence.
+3. A configured `defaultTools` list determines the selection.
+4. Without either list, Pi uses its usual defaults and configured opt-ins.
+
+Use `"defaultTools": []` to disable all built-ins, including implicit additions.
+A list containing only blank or whitespace-only names has the same effect.
+A trusted project's list replaces its global counterpart, including an empty
+list; an omitted or `null` project value inherits the global list. Untrusted
+project settings cannot change this selection. `PI_CONFIG_PATH` still selects
+one settings file instead of merging global and project files.
+
+Configured selection preserves tool load modes: `tools.loadMode.<name>: "off"`
+removes a tool from `defaultTools`, and discoverable tools stay discoverable.
+An explicit CLI `--tools` selection retains its existing override behavior.
+Extensions and MCP servers keep their separate loading and trust controls.
+
 ### Optional tools
 
 Persistently enable `eval`, `github`, `security_scan`, or `subagent` in the
@@ -180,17 +223,18 @@ For example, add this to `~/.pi/agent/settings.json`:
 }
 ```
 
-When `--tools` is omitted, Pi adds the enabled optional tools to its existing
-default tool list. An explicit `--tools` list selects the tools for that run
+When both `--tools` and `defaultTools` are omitted, Pi adds the enabled optional
+tools to its existing default tool list. An explicit `--tools` list selects the tools for that run
 and overrides these four flags, including when the list is empty or exactly
 matches the default list. For example, `pi --tools read,grep,find,ls` does not
 enable any of these four tools, even if all four settings are `true`.
 Conversely, `pi --tools read,eval` selects `eval` even when `enableEval` is
 `false`.
 
-`--no-tools` and an explicit `--tools ""` disable all built-in tools, including
-settings-gated browser, computer, media, and memory tools. A value containing
-only whitespace or commas also selects no built-ins. The SDK's explicit empty
+`--no-tools`, an explicit `--tools ""`, and an empty `defaultTools` list disable
+all built-in tools, including settings-gated browser, computer, media, and
+memory tools. A CLI value containing only whitespace or commas also selects
+no built-ins. The SDK's explicit empty
 `enabled_tools` list and ACP sessions follow the same rule. Extensions and MCP
 servers retain their existing loading and trust controls. Plan mode cannot
 reintroduce a built-in tool excluded by this selection.
@@ -204,8 +248,8 @@ settings invalidates a stored trust decision. `PI_CONFIG_PATH` retains its
 existing explicit single-file behavior and skips the global/project merge.
 
 In the default terminal UI, omitting `--tools` keeps the selection driven by
-settings across session replacements. Global optional-tool settings are read
-again when `/new`, `/resume`, `/fork`, or `/reload` builds a session. An explicit
+settings across session replacements. Global tool lists and optional-tool
+settings are read again when `/new`, `/resume`, `/fork`, or `/reload` builds a session. An explicit
 CLI selection remains authoritative across those operations.
 
 A launch grant from `--trust`, a prompt, or the stored workspace decision

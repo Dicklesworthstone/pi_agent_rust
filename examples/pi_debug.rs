@@ -230,7 +230,7 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
         tool_approval: None,
         ..AgentConfig::default()
     };
-    let tools = if cli.builtin_tools_disabled() {
+    let tools = if cli.builtin_tools_disabled(&config) {
         ToolRegistry::without_builtins(Some(&config))
     } else {
         ToolRegistry::with_builtin_tool_policy(
@@ -241,7 +241,7 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
             None,
             false,
             None,
-            !cli.no_implicit_tools,
+            cli.implicit_tools_allowed(&config),
         )
     };
     let session_arc = Arc::new(Mutex::new(session));

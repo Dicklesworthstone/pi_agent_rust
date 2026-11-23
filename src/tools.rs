@@ -29943,7 +29943,8 @@ mod known_tool_name_tests {
         // `--tools`' own default must not contain a name pi drops.
         use clap::Parser as _;
         let cli = crate::cli::Cli::parse_from(["pi"]);
-        let requested = cli.enabled_tools(&Config::default());
+        let config = Config::default();
+        let requested = cli.enabled_tools(&config);
         assert!(!requested.is_empty(), "the default set should not be empty");
         assert!(
             unknown_tool_names(&requested).is_empty(),

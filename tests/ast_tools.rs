@@ -1082,7 +1082,8 @@ fn ast_tools_are_gated_behind_tools_flag() {
     let defaults = pi::cli::parse_with_extension_flags(vec!["pi".to_string()])
         .expect("default CLI parse")
         .cli;
-    let names = defaults.enabled_tools(&pi::config::Config::default());
+    let config = pi::config::Config::default();
+    let names = defaults.enabled_tools(&config);
     assert!(names.contains(&"ast_grep"));
     assert!(names.contains(&"ast_edit"));
 

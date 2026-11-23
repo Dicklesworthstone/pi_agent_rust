@@ -344,9 +344,10 @@ pub fn prompt_index_for(enabled: &[&str], config: Option<&Config>) -> Vec<(Strin
         .collect()
 }
 
-/// System-prompt discoverable index accounting for CLI selection policy:
+/// System-prompt discoverable index accounting for CLI and settings selection:
 /// explicit `--tools` entries are promoted to the `Essential` schema tier and
-/// omitted from the discoverable index, while implicit settings-enabled
+/// omitted from the discoverable index. A configured `defaultTools` list or
+/// native child ceiling excludes implicit additions; otherwise settings-enabled
 /// built-in tools (`manage_skill`, memory bank, media tools, `browser`,
 /// `computer`) remain advertised as discoverable.
 #[must_use]
@@ -355,11 +356,10 @@ pub fn prompt_index_for_cli(
     enabled: &[&str],
     config: Option<&Config>,
 ) -> Vec<(String, String)> {
-    if cli.builtin_tools_disabled() {
+    let default_config = Config::default();
+    let policy_config = config.unwrap_or(&default_config);
+    if cli.builtin_tools_disabled(policy_config) {
         return Vec::new();
-    }
-    if cli.no_implicit_tools {
-        return prompt_index_for(enabled, config);
     }
     let explicit = cli.explicit_tools();
     let mut combined: Vec<&str> = enabled
@@ -367,9 +367,11 @@ pub fn prompt_index_for_cli(
         .copied()
         .filter(|name| !explicit.contains(name))
         .collect();
-    for implicit in implicit_enabled_tools(config) {
-        if !explicit.contains(&implicit) && !combined.contains(&implicit) {
-            combined.push(implicit);
+    if cli.implicit_tools_allowed(policy_config) {
+        for implicit in implicit_enabled_tools(config) {
+            if !explicit.contains(&implicit) && !combined.contains(&implicit) {
+                combined.push(implicit);
+            }
         }
     }
     prompt_index_for(&combined, config)
@@ -753,7 +755,7 @@ mod tests {
         cwd: &Path,
     ) -> (crate::tools::ToolRegistry, String) {
         let enabled = cli.enabled_tools(config);
-        let registry = if cli.builtin_tools_disabled() {
+        let registry = if cli.builtin_tools_disabled(config) {
             crate::tools::ToolRegistry::without_builtins(Some(config))
         } else {
             let mut registry = crate::tools::ToolRegistry::with_builtin_tool_policy(
@@ -764,7 +766,7 @@ mod tests {
                 None,
                 true,
                 None,
-                !cli.no_implicit_tools,
+                cli.implicit_tools_allowed(config),
             );
             registry.promote_tools(&cli.explicit_tools());
             registry
@@ -774,6 +776,90 @@ mod tests {
         )
         .expect("native system prompt");
         (registry, prompt)
+    }
+
+    #[test]
+    fn configured_tool_selection_bounds_registry_and_discovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        let config: Config = serde_json::from_value(json!({
+            "defaultTools": ["read", "ast_grep"],
+            "memory": { "backend": "local" },
+            "browser": { "enableBrowser": true },
+            "computer": { "enableComputer": true },
+            "media": { "enableMedia": true, "enableReadMedia": true },
+            "tools": {
+                "enableEval": true,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": true
+            }
+        }))
+        .expect("configured tool selection");
+        let enabled = cli.enabled_tools(&config);
+        let index = prompt_index_for_cli(&cli, &enabled, Some(&config));
+        assert_eq!(
+            index
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["ast_grep"]
+        );
+
+        let (registry, prompt) = selected_registry_and_prompt(&cli, &config, temp.path());
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("ast_grep").is_some());
+        assert!(registry.is_discoverable("ast_grep"));
+        assert!(registry.get("xdev").is_some());
+        assert!(prompt.contains("- ast_grep:"));
+        for name in [
+            "bash",
+            "write",
+            "manage_skill",
+            "retain",
+            "recall",
+            "reflect",
+            "memory_edit",
+            "learn",
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "eval",
+            "github",
+            "security_scan",
+            "subagent",
+        ] {
+            assert!(registry.get(name).is_none(), "unexpected tool {name}");
+            assert!(
+                !prompt.contains(&format!("- {name}:")),
+                "unexpected tool advert {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_configured_tool_selection_disables_registry_and_discovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        for defaults in [json!([]), json!([" ", "\t"])] {
+            let config: Config = serde_json::from_value(json!({
+                "defaultTools": defaults,
+                "memory": { "backend": "local" },
+                "media": { "enableMedia": true },
+                "tools": { "enableEval": true, "enableSubagent": true }
+            }))
+            .expect("empty configured tool selection");
+            let enabled = cli.enabled_tools(&config);
+            assert!(enabled.is_empty());
+            assert!(prompt_index_for_cli(&cli, &enabled, Some(&config)).is_empty());
+            let (registry, prompt) = selected_registry_and_prompt(&cli, &config, temp.path());
+            assert!(registry.tools().is_empty());
+            assert!(!prompt.contains("Additional tools are available via the `xdev` dispatcher"));
+            assert!(!prompt.contains("Use `xdev` with action"));
+        }
     }
 
     #[test]

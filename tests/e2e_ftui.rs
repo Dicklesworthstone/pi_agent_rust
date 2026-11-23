@@ -1416,7 +1416,8 @@ fn ftui_vcr_system_prompt_for(
     let mut parsed: Vec<&str> = vec!["pi"];
     parsed.extend(args.iter().map(String::as_str));
     let cli = pi::cli::Cli::try_parse_from(parsed).expect("parse ftui vcr args"); // ubs:ignore test setup expect
-    let enabled_tools = cli.enabled_tools(&pi::config::Config::default());
+    let config = pi::config::Config::default();
+    let enabled_tools = cli.enabled_tools(&config);
     let global_dir = env_root.join("agent");
     let package_dir = env_root.join("packages");
     pi::app::build_system_prompt(
@@ -1429,7 +1430,7 @@ fn ftui_vcr_system_prompt_for(
         true,
         true,
         None,
-        &pi::config::Config::default(),
+        &config,
     )
     .expect("build ftui vcr system prompt") // ubs:ignore test setup expect
 }

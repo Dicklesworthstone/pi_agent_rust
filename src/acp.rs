@@ -2593,7 +2593,7 @@ fn build_acp_session_with_budget(
     let mut cli = options.launch.selection_cli()?;
     let enabled_tools = acp_enabled_tools(&cli, &options.config);
     let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
-    let tools = if cli.builtin_tools_disabled() {
+    let tools = if cli.builtin_tools_disabled(&options.config) {
         ToolRegistry::without_builtins(Some(&options.config))
     } else {
         let mut registry = ToolRegistry::with_builtin_tool_policy(
@@ -2607,7 +2607,7 @@ fn build_acp_session_with_budget(
                 .as_ref()
                 .is_some_and(crate::workspace_trust::WorkspaceTrustGuard::trusted),
             options.workspace_trust_guard.as_ref(),
-            !cli.no_implicit_tools,
+            cli.implicit_tools_allowed(&options.config),
         );
         registry.promote_tools(&cli.explicit_tools());
         registry
@@ -5827,6 +5827,74 @@ mod tests {
     }
 
     #[test]
+    fn acp_default_tools_restricts_the_editor_registry() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let root = tempfile::tempdir().expect("ACP workspace");
+        for names in [vec!["read", "todo", "ask", "submit_plan"], Vec::new()] {
+            let config: Config = serde_json::from_value(json!({
+                "defaultTools": names,
+                "tools": {
+                    "enableEval": true,
+                    "enableGithub": true,
+                    "enableSecurityScan": true,
+                    "enableSubagent": true
+                },
+                "browser": { "enableBrowser": true },
+                "computer": { "enableComputer": true },
+                "media": { "enableMedia": true },
+                "memory": { "backend": "local" }
+            }))
+            .expect("configured editor tools");
+            let mut options = selection_options(
+                config.clone(),
+                vec![ready_selection_model("openai", "gpt-4o")],
+                runtime.handle(),
+            );
+            options.launch.provider = Some("openai".to_string());
+            options.launch.model = Some("gpt-4o".to_string());
+            options.launch.api_key = Some("acp-default-tools-key".to_string());
+            options.launch.no_context_files = true;
+            let (session, save_enabled) = new_acp_session(None, &config, root.path());
+            let (_, state) = build_acp_session(
+                session,
+                save_enabled,
+                root.path().to_path_buf(),
+                &options,
+                None,
+            )
+            .expect("build editor session with configured tools");
+            let handle = state.agent_session.as_ref().expect("editor agent session");
+            assert_eq!(handle.has_tool("read"), !names.is_empty());
+            assert_eq!(handle.has_tool("todo"), !names.is_empty());
+            for excluded in [
+                "ask",
+                "submit_plan",
+                "bash",
+                "write",
+                "eval",
+                "github",
+                "security_scan",
+                "subagent",
+                "browser",
+                "computer",
+                "inspect_image",
+                "generate_image",
+                "tts",
+                "manage_skill",
+                "retain",
+                "recall",
+            ] {
+                assert!(!handle.has_tool(excluded), "unexpected tool {excluded}");
+            }
+            if names.is_empty() {
+                let registry = handle.session().agent.shared_tools().snapshot();
+                assert!(registry.tools().is_empty());
+                assert!(registry.discoverable_index().is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn acp_builtin_ceiling_requires_explicit_selection() {
         let mut launch = AcpLaunchOptions {
             no_implicit_tools: true,
@@ -5843,7 +5911,7 @@ mod tests {
         launch.no_tools = true;
         let cli = launch.selection_cli().expect("explicit disable-all policy");
         assert!(cli.no_implicit_tools);
-        assert!(cli.builtin_tools_disabled());
+        assert!(cli.builtin_tools_disabled(&Config::default()));
     }
 
     #[test]

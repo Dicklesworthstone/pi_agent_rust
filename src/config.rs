@@ -88,6 +88,12 @@ pub struct Config {
     /// path prefix wins.
     #[serde(alias = "modelScopeOverrides")]
     pub model_scope_overrides: Option<Vec<ModelScopeOverride>>,
+    /// Built-in tool selection when no explicit CLI or SDK list is supplied.
+    ///
+    /// An empty list disables all built-ins. A project list replaces the
+    /// global list; configured optional-tool flags cannot expand it.
+    #[serde(alias = "defaultTools")]
+    pub default_tools: Option<Vec<String>>,
     /// Optional-tool activation and load modes (`tools.loadMode`).
     pub tools: Option<ToolSettings>,
     /// Plan-mode settings (bd-cv653.3.5).
@@ -1173,6 +1179,7 @@ impl Config {
             },
             disabled_providers: other.disabled_providers.or(base.disabled_providers),
             model_scope_overrides: other.model_scope_overrides.or(base.model_scope_overrides),
+            default_tools: other.default_tools.or(base.default_tools),
             tools: merge_tools(base.tools, other.tools),
             plan: merge_plan(base.plan, other.plan),
             read: merge_read(base.read, other.read),
@@ -4007,6 +4014,134 @@ mod tests {
                     .contains(path.to_str().expect("UTF-8 path"))
             );
             assert!(error.to_string().contains("duplicate field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn default_tool_list_aliases_preserve_explicit_empty_selection() {
+        assert!(Config::default().default_tools.is_none());
+        for key in ["default_tools", "defaultTools"] {
+            for names in [vec!["read", "eval"], vec![], vec![" ", "\t"]] {
+                let content = json!({(key): &names}).to_string();
+                assert!(unrecognised_setting_keys(&content).is_empty());
+                let config: Config = serde_json::from_str(&content).expect("tool list");
+                assert_eq!(
+                    config.default_tools,
+                    Some(names.into_iter().map(str::to_string).collect()),
+                    "{key}"
+                );
+            }
+            let config: Config =
+                serde_json::from_value(json!({(key): null})).expect("null leaves the list unset");
+            assert!(config.default_tools.is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_default_tool_lists_name_the_settings_file() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let path = global_dir.join("settings.json");
+        for key in ["default_tools", "defaultTools"] {
+            for value in [
+                json!("read,bash"),
+                json!(true),
+                json!(["read", 1]),
+                json!({}),
+            ] {
+                write_file(&path, &json!({(key): value}).to_string());
+                let error = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect_err("tool selection requires an array of strings");
+                assert!(
+                    error
+                        .to_string()
+                        .contains(path.to_str().expect("UTF-8 path")),
+                    "{error}"
+                );
+            }
+        }
+        write_file(
+            &path,
+            r#"{"default_tools":["read"],"defaultTools":["bash"]}"#,
+        );
+        let error = Config::load_with_roots(None, &global_dir, &cwd)
+            .expect_err("duplicate aliases must not choose a list silently");
+        assert!(error.to_string().contains("duplicate field"), "{error}");
+    }
+
+    #[test]
+    fn default_tool_lists_replace_global_values_only_in_trusted_projects() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let project_path = cwd.join(".pi/settings.json");
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{"defaultTools":["read","eval"],"tools":{"enableGithub":true}}"#,
+        );
+        for (project, expected) in [
+            (
+                r#"{"default_tools":["grep","subagent"]}"#,
+                vec!["grep", "subagent"],
+            ),
+            (r#"{"defaultTools":[]}"#, vec![]),
+            (r#"{"default_tools":[" ","\t"]}"#, vec![]),
+            (r#"{"defaultTools":null}"#, vec!["read", "eval"]),
+            (r"{}", vec!["read", "eval"]),
+        ] {
+            write_file(&project_path, project);
+            let trusted = Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, true)
+                .expect("trusted settings");
+            assert_eq!(cli.enabled_tools(&trusted), expected, "{project}");
+            assert_eq!(cli.builtin_tools_disabled(&trusted), expected.is_empty());
+            assert!(!cli.implicit_tools_allowed(&trusted));
+
+            let untrusted =
+                Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+                    .expect("untrusted project cannot replace global tools");
+            assert_eq!(cli.enabled_tools(&untrusted), ["read", "eval"]);
+        }
+        write_file(&project_path, r#"{"defaultTools":true}"#);
+        let untrusted = Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+            .expect("untrusted project is not parsed");
+        assert_eq!(cli.enabled_tools(&untrusted), ["read", "eval"]);
+        assert!(Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, true).is_err());
+    }
+
+    #[test]
+    fn default_tool_list_single_file_override_skips_global_and_project_selection() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let override_path = std::path::Path::new("custom-settings.json");
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{"defaultTools":["eval"],"tools":{"enableGithub":true}}"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"defaultTools":["subagent"]}"#,
+        );
+        for (content, expected) in [
+            (r#"{"defaultTools":["ls"]}"#, vec!["ls"]),
+            (r#"{"default_tools":[]}"#, vec![]),
+            (r"{}", crate::xdev::default_enabled_tools()),
+        ] {
+            write_file(&cwd.join(override_path), content);
+            for trusted in [true, false] {
+                let config = Config::load_with_roots_and_project_trust(
+                    Some(override_path),
+                    &global_dir,
+                    &cwd,
+                    trusted,
+                )
+                .expect("single-file override");
+                assert_eq!(cli.enabled_tools(&config), expected, "{content}");
+                assert!(config.tools.is_none());
+            }
         }
     }
 

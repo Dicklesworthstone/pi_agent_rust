@@ -2385,10 +2385,17 @@ async fn run(
     let shared_enabled_tools = cli.enabled_tools(&config);
     // A name the registry does not know is dropped without a word, so
     // `--tools read,bsah,edit` hands the model two tools and reports three.
+    let tool_selection_source = if cli.tools.is_some() {
+        "--tools"
+    } else {
+        "defaultTools"
+    };
     let unknown_tools = pi::tools::unknown_tool_names(&shared_enabled_tools);
     if !unknown_tools.is_empty() {
         for name in &unknown_tools {
-            eprintln!("Warning: --tools: \"{name}\" is not a tool pi provides; it is ignored");
+            eprintln!(
+                "Warning: {tool_selection_source}: \"{name}\" is not a tool pi provides; it is ignored"
+            );
         }
         // The constants group registry-built names ahead of host-coupled ones,
         // which is the right order to read the code in and the wrong one to
@@ -2400,16 +2407,19 @@ async fn run(
                 .map(|(name, _)| *name),
         );
         provided.sort_unstable();
-        eprintln!("Warning: --tools: pi provides {}", provided.join(", "));
+        eprintln!(
+            "Warning: {tool_selection_source}: pi provides {}",
+            provided.join(", ")
+        );
     }
     // A real tool the flag has no say over. Saying nothing invites the user to
     // conclude the tool is missing; saying "not a tool pi provides" — which is
     // what this printed before — tells them something false about a tool they
     // can actually have.
     for (name, how) in pi::tools::unselectable_tool_names(&shared_enabled_tools) {
-        eprintln!("Warning: --tools: \"{name}\": {how}");
+        eprintln!("Warning: {tool_selection_source}: \"{name}\": {how}");
     }
-    let shared_tools = pi::tools::SharedToolRegistry::new(if cli.builtin_tools_disabled() {
+    let shared_tools = pi::tools::SharedToolRegistry::new(if cli.builtin_tools_disabled(&config) {
         ToolRegistry::without_builtins(Some(&config))
     } else {
         let mut registry = ToolRegistry::with_builtin_tool_policy(
@@ -2420,7 +2430,7 @@ async fn run(
             Some(&workspace),
             workspace_trusted,
             Some(&workspace_trust_guard),
-            !cli.no_implicit_tools,
+            cli.implicit_tools_allowed(&config),
         );
         registry.promote_tools(&cli.explicit_tools());
         registry
@@ -2773,7 +2783,15 @@ async fn run(
         None
     };
 
-    let enabled_tools = cli.enabled_tools(&config);
+    let enabled_tool_names = cli
+        .enabled_tools(&config)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let enabled_tools = enabled_tool_names
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
     // `clamp_max_tool_iterations` keeps invalid values out of the loop and
     // emits a warning instead of failing the run.
@@ -12560,6 +12578,22 @@ mod tests {
                 ftui_tool_selection(&cli, &cli.enabled_tools(&config)),
                 expected,
                 "{args:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "ftui")]
+    #[test]
+    fn ftui_configured_tool_lists_do_not_become_launch_overrides() {
+        let cli = cli::Cli::try_parse_from(["pi"]).expect("settings-driven launch");
+        for names in [vec!["read", "grep"], Vec::new()] {
+            let config: Config = serde_json::from_value(json!({ "defaultTools": names }))
+                .expect("configured default tools");
+            let selected = cli.enabled_tools(&config);
+            assert_eq!(selected, names);
+            assert!(
+                ftui_tool_selection(&cli, &selected).is_none(),
+                "session replacements must resolve defaultTools again"
             );
         }
     }

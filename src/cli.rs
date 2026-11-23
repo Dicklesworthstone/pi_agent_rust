@@ -552,10 +552,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated), overriding optional-tool
-    /// activation in settings. When omitted, use the default tool set plus
-    /// configured opt-ins (`tools.enableEval`, `enableGithub`,
-    /// `enableSecurityScan`, `enableSubagent`).
+    /// Specific tools to enable (comma-separated), overriding `defaultTools`
+    /// and optional-tool activation in settings. When omitted, use the
+    /// configured defaultTools list, or the built-in defaults plus configured
+    /// opt-ins when no list is configured.
     #[arg(long, value_name = "TOOLS")]
     pub tools: Option<String>,
 
@@ -1789,6 +1789,119 @@ mod tests {
     }
 
     #[test]
+    fn configured_default_tools_replace_defaults_and_optional_flags_in_all_modes() {
+        let config = serde_json::from_value(serde_json::json!({
+            "defaultTools": [" read ", "eval", "read", "", " subagent ", "eval"],
+            "tools": {
+                "enableEval": false,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": false
+            }
+        }))
+        .expect("configured tool list");
+        for args in [
+            vec!["pi"],
+            vec!["pi", "-p"],
+            vec!["pi", "--rpc"],
+            vec!["pi", "--acp"],
+        ] {
+            let cli = Cli::parse_from(args);
+            assert_eq!(cli.enabled_tools(&config), ["read", "eval", "subagent"]);
+            assert!(!cli.builtin_tools_disabled(&config));
+            assert!(!cli.implicit_tools_allowed(&config));
+            assert!(
+                cli.explicit_tools().is_empty(),
+                "settings selection does not promote discoverable tools"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_default_tools_respect_off_modes_until_cli_selects_them() {
+        let config = serde_json::from_value(serde_json::json!({
+            "defaultTools": ["read", "eval", "subagent", "lsp"],
+            "tools": {
+                "loadMode": {
+                    "eval": " OFF ",
+                    "subagent": "off",
+                    "lsp": "discoverable"
+                }
+            }
+        }))
+        .expect("configured tool modes");
+        let cli = Cli::parse_from(["pi"]);
+        assert_eq!(cli.enabled_tools(&config), ["read", "lsp"]);
+        assert!(!cli.implicit_tools_allowed(&config));
+        assert!(cli.explicit_tools().is_empty());
+
+        let explicit = Cli::parse_from(["pi", "--tools", "eval,subagent"]);
+        assert_eq!(explicit.enabled_tools(&config), ["eval", "subagent"]);
+        assert_eq!(explicit.explicit_tools(), ["eval", "subagent"]);
+        assert!(explicit.implicit_tools_allowed(&config));
+    }
+
+    #[test]
+    fn empty_configured_default_tools_disable_builtins_and_implicit_additions() {
+        for names in [vec![], vec![" ", "\t", "\n"]] {
+            let config = crate::config::Config {
+                default_tools: Some(names.into_iter().map(str::to_string).collect()),
+                ..optional_tool_config(true)
+            };
+            let cli = Cli::parse_from(["pi"]);
+            assert!(cli.enabled_tools(&config).is_empty());
+            assert!(cli.builtin_tools_disabled(&config));
+            assert!(!cli.implicit_tools_allowed(&config));
+
+            let explicit = Cli::parse_from(["pi", "--tools", "read,bash"]);
+            assert_eq!(explicit.enabled_tools(&config), ["read", "bash"]);
+            assert!(!explicit.builtin_tools_disabled(&config));
+            assert!(explicit.implicit_tools_allowed(&config));
+        }
+    }
+
+    #[test]
+    fn explicit_cli_lists_and_disable_flags_override_default_tools() {
+        let config = crate::config::Config {
+            default_tools: Some(vec!["eval".to_string(), "subagent".to_string()]),
+            ..optional_tool_config(true)
+        };
+        for (args, expected) in [
+            (
+                vec!["pi", "--tools", "read, read,grep"],
+                vec!["read", "grep"],
+            ),
+            (vec!["pi", "--tools=github"], vec!["github"]),
+            (vec!["pi", "--tools", " ,\t, "], vec![]),
+            (vec!["pi", "--no-tools"], vec![]),
+            (vec!["pi", "--no-tools", "--tools", "read"], vec![]),
+        ] {
+            let cli = Cli::parse_from(args);
+            assert_eq!(cli.enabled_tools(&config), expected);
+            assert_eq!(cli.builtin_tools_disabled(&config), expected.is_empty());
+            assert_eq!(cli.implicit_tools_allowed(&config), !expected.is_empty());
+        }
+    }
+
+    #[test]
+    fn default_tool_selection_does_not_weaken_native_child_ceilings() {
+        let config = crate::config::Config {
+            default_tools: Some(vec!["eval".to_string(), "github".to_string()]),
+            ..optional_tool_config(true)
+        };
+        let cli = Cli::parse_from(["pi", "--tools", "read", "--no-implicit-tools"]);
+        assert_eq!(cli.enabled_tools(&config), ["read"]);
+        assert!(!cli.builtin_tools_disabled(&config));
+        assert!(!cli.implicit_tools_allowed(&config));
+        assert!(cli.explicit_tools().is_empty());
+
+        let ordinary = Cli::parse_from(["pi"]);
+        let config = optional_tool_config(true);
+        assert!(ordinary.implicit_tools_allowed(&config));
+        assert!(!ordinary.builtin_tools_disabled(&config));
+    }
+
+    #[test]
     fn optional_tools_remain_disabled_unless_configured() {
         let cli = Cli::parse_from(["pi"]);
         for config in [
@@ -1961,7 +2074,7 @@ mod tests {
             "read,eval",
             "--no-tools",
         ]);
-        assert!(cli.builtin_tools_disabled());
+        assert!(cli.builtin_tools_disabled(&config));
         assert!(cli.enabled_tools(&config).is_empty());
     }
 
@@ -2002,7 +2115,7 @@ mod tests {
             (vec!["pi", "--no-tools", "--tools", "read"], true),
         ] {
             let cli = Cli::parse_from(args);
-            assert_eq!(cli.builtin_tools_disabled(), disabled);
+            assert_eq!(cli.builtin_tools_disabled(&config), disabled);
             if disabled {
                 assert!(cli.enabled_tools(&config).is_empty());
             }
@@ -2072,9 +2185,13 @@ mod tests {
     fn absent_and_unknown_load_modes_do_not_cancel_opt_in_activation() {
         let cli = Cli::parse_from(["pi"]);
         let mut config = optional_tool_config(true);
-        let expected = cli.enabled_tools(&config);
+        let expected = cli
+            .enabled_tools(&config)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         assert!(
-            expected.contains(&"subagent"),
+            expected.iter().any(|name| name == "subagent"),
             "default Off is not a settings veto"
         );
         config.tools.as_mut().expect("tool settings").load_mode = Some(
@@ -2102,7 +2219,7 @@ mod tests {
             ..Default::default()
         };
         assert!(cli.enabled_tools(&config).is_empty());
-        assert!(!cli.builtin_tools_disabled());
+        assert!(!cli.builtin_tools_disabled(&config));
     }
 
     // ── 7. Invalid inputs ────────────────────────────────────────────
@@ -3658,30 +3775,43 @@ impl Cli {
             .collect()
     }
 
-    /// Whether the invocation explicitly disables all built-in tools.
+    /// Whether the effective selection disables all built-in tools.
     ///
-    /// An explicit list containing only commas and whitespace is empty after
-    /// normalization, just like `--tools ""`. Host construction must use this
-    /// policy as well as selection so implicit built-ins cannot reappear.
+    /// Empty CLI lists and empty or whitespace-only configured lists disable
+    /// implicit built-ins too. An explicit CLI list overrides defaultTools,
+    /// while `--no-tools` always wins.
     #[must_use]
-    pub fn builtin_tools_disabled(&self) -> bool {
+    pub fn builtin_tools_disabled(&self, config: &crate::config::Config) -> bool {
         self.no_tools
-            || self
-                .tools
-                .as_deref()
-                .is_some_and(|tools| tools.split(',').all(|name| name.trim().is_empty()))
+            || match self.tools.as_deref() {
+                Some(tools) => tools.split(',').all(|name| name.trim().is_empty()),
+                None => config
+                    .default_tools
+                    .as_ref()
+                    .is_some_and(|tools| tools.iter().all(|name| name.trim().is_empty())),
+            }
+    }
+
+    /// Whether registry construction may add built-ins beyond the selected list.
+    ///
+    /// A configured defaultTools list is a ceiling. Explicit CLI lists retain
+    /// their existing implicit additions unless this is a native child ceiling.
+    #[must_use]
+    pub fn implicit_tools_allowed(&self, config: &crate::config::Config) -> bool {
+        !self.builtin_tools_disabled(config)
+            && !self.no_implicit_tools
+            && (self.tools.is_some() || config.default_tools.is_none())
     }
 
     /// Resolve the enabled tool names from CLI selection and effective settings.
     ///
     /// Callers must supply configuration loaded with the workspace-trust
-    /// decision. An explicit `--tools` list (including an empty list or the
-    /// default list) is authoritative: configured opt-ins must not expand a
-    /// restricted SDK session or native child agent's tool access. Without an
-    /// explicit list, configured `loadMode: "off"` entries disable both default
-    /// tools and configured opt-ins before the registry is constructed.
-    pub fn enabled_tools(&self, config: &crate::config::Config) -> Vec<&str> {
-        if self.builtin_tools_disabled() {
+    /// decision. Explicit CLI/SDK lists override defaultTools and optional-tool
+    /// flags. A configured list replaces defaults without adding opt-ins.
+    /// Settings-selected tools still honor `loadMode: "off"`; explicitly named
+    /// CLI tools override that setting.
+    pub fn enabled_tools<'a>(&'a self, config: &'a crate::config::Config) -> Vec<&'a str> {
+        if self.builtin_tools_disabled(config) {
             return Vec::new();
         }
         if let Some(tools) = &self.tools {
@@ -3694,19 +3824,31 @@ impl Cli {
                 .collect();
         }
 
-        let mut enabled = crate::xdev::default_enabled_tools();
-        if let Some(settings) = &config.tools {
-            for (name, opt_in) in [
-                ("eval", settings.enable_eval),
-                ("github", settings.enable_github),
-                ("security_scan", settings.enable_security_scan),
-                ("subagent", settings.enable_subagent),
-            ] {
-                if opt_in == Some(true) && !enabled.contains(&name) {
-                    enabled.push(name);
+        let mut enabled = if let Some(tools) = &config.default_tools {
+            let mut seen = HashSet::new();
+            tools
+                .iter()
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .filter(|name| seen.insert(*name))
+                .collect::<Vec<_>>()
+        } else {
+            let mut enabled = crate::xdev::default_enabled_tools();
+            if let Some(settings) = &config.tools {
+                for (name, opt_in) in [
+                    ("eval", settings.enable_eval),
+                    ("github", settings.enable_github),
+                    ("security_scan", settings.enable_security_scan),
+                    ("subagent", settings.enable_subagent),
+                ] {
+                    if opt_in == Some(true) && !enabled.contains(&name) {
+                        enabled.push(name);
+                    }
                 }
             }
-        }
+            enabled
+        };
         enabled.retain(|name| {
             crate::xdev::configured_tier(name, Some(config)) != Some(crate::xdev::LoadMode::Off)
         });
@@ -3720,7 +3862,7 @@ impl Cli {
     /// an internal child-agent ceiling.
     #[must_use]
     pub fn explicit_tools(&self) -> Vec<&str> {
-        if self.builtin_tools_disabled() || self.no_implicit_tools {
+        if self.no_tools || self.no_implicit_tools {
             return Vec::new();
         }
         let Some(tools) = &self.tools else {

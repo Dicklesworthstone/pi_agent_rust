@@ -239,7 +239,8 @@ fn build_vcr_system_prompt_for_args(
     let mut args: Vec<&str> = vec!["pi"];
     args.extend(args_fn());
     let cli = cli::Cli::try_parse_from(args).expect("parse vcr cli args");
-    let enabled_tools = cli.enabled_tools(&pi::config::Config::default());
+    let config = pi::config::Config::default();
+    let enabled_tools = cli.enabled_tools(&config);
     let global_dir = env_root.join("agent");
     let package_dir = env_root.join("packages");
     build_system_prompt(
@@ -252,7 +253,7 @@ fn build_vcr_system_prompt_for_args(
         true,
         true,
         None,
-        &pi::config::Config::default(),
+        &config,
     )
     .expect("build vcr system prompt")
 }
