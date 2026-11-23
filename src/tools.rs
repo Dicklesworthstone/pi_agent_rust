@@ -5347,7 +5347,7 @@ fn atomic_parent_within_roots(canonical_parent: &Path, allowed_roots: &[PathBuf]
     })
 }
 
-fn atomic_replace_file(
+pub(crate) fn atomic_replace_file(
     target: &Path,
     allowed_roots: &[PathBuf],
     contents: &[u8],

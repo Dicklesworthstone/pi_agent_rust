@@ -1926,33 +1926,32 @@ async fn run_with_input(options: AcpOptions, mut input: AcpInput, out_tx: AcpOut
                                 continue;
                             }
                         };
-                        let session_id = request.params.get("sessionId").and_then(Value::as_str);
-
-                        if let Err(msg) =
-                            validate_file_path(path_str, session_id, &sessions, &cx).await
-                        {
-                            let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
-                            continue;
-                        }
-
-                        let max_bytes = 10 * 1024 * 1024; // 10MB limit for ACP
-                        match asupersync::fs::metadata(path_str).await {
-                            Ok(meta) if meta.len() > max_bytes => {
-                                let _ = out_tx.send(json_rpc_error(
-                            id,
-                            INTERNAL_ERROR,
-                            format!(
-                                "File too large ({} bytes). Maximum allowed via ACP is {} bytes.",
-                                meta.len(),
-                                max_bytes
-                            ),
-                        ));
+                        let session_id = match file_operation_session_id(&request.params) {
+                            Ok(session_id) => session_id,
+                            Err(message) => {
+                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, message));
                                 continue;
                             }
-                            _ => {}
-                        }
-
-                        match asupersync::fs::read(path_str).await {
+                        };
+                        let roots = match file_operation_roots(session_id, &sessions, &cx).await {
+                            Ok(roots) => roots,
+                            Err(msg) => {
+                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
+                                continue;
+                            }
+                        };
+                        let path = PathBuf::from(path_str);
+                        // Containment and the byte cap belong to the actual
+                        // open/read, not a pathname check before an await.
+                        let read = asupersync::runtime::spawn_blocking_io(move || {
+                            crate::tools::read_file_capped_within_roots_sync(
+                                &path,
+                                &roots,
+                                MAX_ACP_TEXT_FILE_BYTES,
+                            )
+                        })
+                        .await;
+                        match read {
                             Ok(bytes) => {
                                 let contents = String::from_utf8_lossy(&bytes).into_owned();
                                 let _ =
@@ -1961,7 +1960,7 @@ async fn run_with_input(options: AcpOptions, mut input: AcpInput, out_tx: AcpOut
                             Err(err) => {
                                 let _ = out_tx.send(json_rpc_error(
                                     id,
-                                    INTERNAL_ERROR,
+                                    file_operation_error_code(&err),
                                     format!("Failed to read file: {err}"),
                                 ));
                             }
@@ -1989,23 +1988,34 @@ async fn run_with_input(options: AcpOptions, mut input: AcpInput, out_tx: AcpOut
                             ));
                             continue;
                         };
-                        let session_id = request.params.get("sessionId").and_then(Value::as_str);
-
-                        if let Err(msg) =
-                            validate_file_path(path_str, session_id, &sessions, &cx).await
-                        {
-                            let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
-                            continue;
-                        }
-
-                        match asupersync::fs::write(path_str, contents.as_bytes()).await {
+                        let session_id = match file_operation_session_id(&request.params) {
+                            Ok(session_id) => session_id,
+                            Err(message) => {
+                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, message));
+                                continue;
+                            }
+                        };
+                        let roots = match file_operation_roots(session_id, &sessions, &cx).await {
+                            Ok(roots) => roots,
+                            Err(msg) => {
+                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
+                                continue;
+                            }
+                        };
+                        let path = PathBuf::from(path_str);
+                        let contents = contents.as_bytes().to_vec();
+                        let written = asupersync::runtime::spawn_blocking_io(move || {
+                            write_acp_text_file(&path, &roots, &contents)
+                        })
+                        .await;
+                        match written {
                             Ok(()) => {
                                 let _ = out_tx.send(json_rpc_ok(id, json!({ "success": true })));
                             }
                             Err(err) => {
                                 let _ = out_tx.send(json_rpc_error(
                                     id,
-                                    INTERNAL_ERROR,
+                                    file_operation_error_code(&err),
                                     format!("Failed to write file: {err}"),
                                 ));
                             }
@@ -2147,85 +2157,98 @@ fn permission_response_to_decision(response: &Value) -> ToolApprovalDecision {
 }
 
 // ============================================================================
-// Path validation
+// Scoped file operations
 // ============================================================================
 
-/// Validate that a file path is under at least one session's cwd.
-/// If a sessionId is provided, validates against that specific session.
-/// Otherwise, validates against any active session's cwd.
-/// Returns `Ok(())` if valid, `Err(message)` if rejected.
-async fn validate_file_path(
-    path_str: &str,
+const MAX_ACP_TEXT_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+fn file_operation_session_id(params: &Value) -> std::result::Result<Option<&str>, &'static str> {
+    match params.get("sessionId") {
+        None => Ok(None),
+        Some(Value::String(id)) if !id.trim().is_empty() => Ok(Some(id)),
+        // Only omission selects the legacy union of workspaces. An invalid
+        // explicit scope must never silently grant access to other sessions.
+        Some(_) => Err("sessionId must be a non-empty string when supplied"),
+    }
+}
+
+fn file_operation_error_code(error: &io::Error) -> i64 {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied
+        | io::ErrorKind::InvalidInput
+        | io::ErrorKind::IsADirectory
+        | io::ErrorKind::NotADirectory => INVALID_PARAMS,
+        _ => INTERNAL_ERROR,
+    }
+}
+
+/// Snapshot the host-owned roots before entering blocking file I/O. The scoped
+/// read/replacement primitives validate the actual opened source or pinned
+/// replacement parent against these roots; a separate canonicalize-then-open
+/// check would allow symlink swaps and dangling links to escape the workspace.
+async fn file_operation_roots(
     session_id: Option<&str>,
     sessions: &AcpSessionsMap,
     cx: &AgentCx,
-) -> std::result::Result<(), String> {
-    let resolved = if let Ok(p) = std::path::Path::new(path_str).canonicalize() {
-        p
-    } else {
-        // If the file doesn't exist yet (write case), canonicalize the parent.
-        let parent = std::path::Path::new(path_str).parent();
-        match parent.and_then(|p| p.canonicalize().ok()) {
-            Some(p) => p.join(
-                std::path::Path::new(path_str)
-                    .file_name()
-                    .unwrap_or_default(),
-            ),
-            None => {
-                return Err(format!(
-                    "Path does not exist and parent is invalid: {path_str}"
-                ));
-            }
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let states = {
+        let guard = sessions
+            .lock(cx)
+            .await
+            .map_err(|e| format!("Lock failed: {e}"))?;
+        if guard.is_empty() {
+            return Err("No active sessions — cannot validate file path".to_string());
+        }
+        if let Some(sid) = session_id {
+            vec![
+                guard
+                    .get(sid)
+                    .cloned()
+                    .ok_or_else(|| format!("Session not found: {sid}"))?,
+            ]
+        } else {
+            guard.values().cloned().collect::<Vec<_>>()
         }
     };
-
-    // OwnedMutexGuard: the sessions guard is held across the per-session
-    // lock awaits below, and the borrowed guard is !Send (future_not_send).
-    let guard = OwnedMutexGuard::lock(Arc::clone(sessions), cx)
-        .await
-        .map_err(|e| format!("Lock failed: {e}"))?;
-
-    if guard.is_empty() {
-        return Err("No active sessions — cannot validate file path".to_string());
+    let mut roots = Vec::with_capacity(states.len());
+    for state in states {
+        let guard = state
+            .lock(cx)
+            .await
+            .map_err(|_| "Session lock failed".to_string())?;
+        roots.push(guard.cwd.clone());
     }
+    Ok(roots)
+}
 
-    let allowed_cwds: Vec<PathBuf> = if let Some(sid) = session_id {
-        match guard.get(sid) {
-            Some(state) => {
-                if let Ok(s) = OwnedMutexGuard::lock(Arc::clone(state), cx).await {
-                    vec![s.cwd.clone()]
-                } else {
-                    return Err("Session lock failed".to_string());
-                }
-            }
-            None => return Err(format!("Session not found: {sid}")),
-        }
+fn write_acp_text_file(
+    path: &std::path::Path,
+    roots: &[PathBuf],
+    contents: &[u8],
+) -> io::Result<()> {
+    // Preserve the existing process-cwd interpretation of relative protocol
+    // paths. The read primitive resolves them the same way; in particular a
+    // bare filename must not hand an empty parent to atomic replacement.
+    let path = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        let mut cwds = Vec::new();
-        for state in guard.values() {
-            if let Ok(s) = OwnedMutexGuard::lock(Arc::clone(state), cx).await {
-                cwds.push(s.cwd.clone());
-            }
-        }
-        cwds
+        std::env::current_dir()?.join(path)
     };
-
-    // Canonicalize each cwd and check if the resolved path starts with it.
-    for cwd in &allowed_cwds {
-        if let Ok(canonical_cwd) = cwd.canonicalize()
-            && resolved.starts_with(&canonical_cwd)
-        {
-            return Ok(());
+    // Refuse special files and final symlinks, including dangling links whose
+    // target does not exist yet. An atomic replacement also avoids modifying
+    // an outside inode through an otherwise in-workspace hard link.
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ACP writes require a regular file or a new file path",
+            ));
         }
-        // Also check without canonicalization for cwd (it may not exist on disk).
-        if resolved.starts_with(cwd) {
-            return Ok(());
-        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
-
-    Err(format!(
-        "Path '{path_str}' is outside all session working directories",
-    ))
+    crate::tools::atomic_replace_file(&path, roots, contents)
 }
 
 // ============================================================================
@@ -4229,6 +4252,303 @@ mod tests {
             assert_eq!(frames[0]["error"]["code"], PARSE_ERROR);
             assert_eq!(frames[1]["id"], 7);
             assert_eq!(frames[1]["result"]["protocolVersion"], 1);
+        });
+    }
+
+    fn run_acp_file_requests(
+        root: &std::path::Path,
+        cwd: &std::path::Path,
+        requests: Vec<Value>,
+    ) -> Vec<Value> {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let mut options = acp_workspace_options(root, runtime.handle());
+        options.launch.no_extensions = true;
+        options.launch.no_mcp = true;
+        options.launch.no_skills = true;
+        let mut frames = vec![
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {"cwd": cwd, "mcpServers": []}
+            }),
+        ];
+        frames.extend(requests);
+        let (sender, receiver) = asupersync::channel::mpsc::channel(frames.len());
+        for frame in frames {
+            sender.try_send(frame.to_string()).unwrap();
+        }
+        drop(sender);
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        runtime.block_on(async {
+            Box::pin(run(options, receiver, AcpOutput::new(tx)))
+                .await
+                .expect("bounded file requests must leave ACP usable");
+        });
+        let frames = rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            frames.iter().any(|frame| {
+                frame["id"] == 2 && frame["result"]["sessionId"].is_string()
+            }),
+            "the real dispatcher must create the requested session: {frames:?}"
+        );
+        frames
+    }
+
+    #[test]
+    fn acp_file_dispatch_preserves_normal_io_and_bounds_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let target = cwd.join("note.txt");
+        let oversized = cwd.join("oversized.txt");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_ACP_TEXT_FILE_BYTES + 1)
+            .unwrap();
+        let frames = run_acp_file_requests(
+            root.path(),
+            &cwd,
+            vec![
+                json!({
+                    "jsonrpc": "2.0", "id": 3, "method": "write_text_file",
+                    "params": {"path": target, "contents": "initial longer content\n"}
+                }),
+                json!({
+                    "jsonrpc": "2.0", "id": 4, "method": "write_text_file",
+                    "params": {"path": target, "contents": "short\n"}
+                }),
+                json!({
+                    "jsonrpc": "2.0", "id": 5, "method": "read_text_file",
+                    "params": {"path": oversized}
+                }),
+                json!({
+                    "jsonrpc": "2.0", "id": 6, "method": "read_text_file",
+                    "params": {"path": target}
+                }),
+            ],
+        );
+        for id in [3, 4] {
+            assert_eq!(
+                frames.iter().find(|frame| frame["id"] == id).unwrap()["result"]["success"],
+                true
+            );
+        }
+        assert!(
+            frames.iter().find(|frame| frame["id"] == 5).unwrap()["error"].is_object()
+        );
+        assert_eq!(
+            frames.iter().find(|frame| frame["id"] == 6).unwrap()["result"]["contents"],
+            "short\n"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"short\n");
+    }
+
+    #[test]
+    fn acp_file_dispatch_rejects_malformed_session_scopes_without_broadening_access() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let target = cwd.join("sentinel.txt");
+        std::fs::write(&target, "unchanged bytes").unwrap();
+        let mut requests = Vec::new();
+        let mut id = 3;
+        for session_id in [
+            Value::Null,
+            json!(7),
+            json!({}),
+            json!([]),
+            json!(false),
+            json!(""),
+            json!("   "),
+            json!("unknown-session"),
+        ] {
+            for method in ["read_text_file", "write_text_file"] {
+                requests.push(json!({
+                    "jsonrpc": "2.0", "id": id, "method": method,
+                    "params": {
+                        "sessionId": session_id,
+                        "path": target,
+                        "contents": "must not be written"
+                    }
+                }));
+                id += 1;
+            }
+        }
+        requests.push(json!({
+            "jsonrpc": "2.0", "id": id, "method": "read_text_file",
+            "params": {"path": target}
+        }));
+        let frames = run_acp_file_requests(root.path(), &cwd, requests);
+        for rejected_id in 3..id {
+            assert_eq!(
+                frames.iter().find(|frame| frame["id"] == rejected_id).unwrap()["error"]["code"],
+                INVALID_PARAMS,
+                "request {rejected_id}: explicit invalid scope must fail closed"
+            );
+        }
+        assert_eq!(
+            frames.iter().find(|frame| frame["id"] == id).unwrap()["result"]["contents"],
+            "unchanged bytes",
+            "omitting the optional scope still permits the existing workspace union"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acp_file_dispatch_cannot_create_or_change_outside_targets_through_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let absent = outside.join("must-not-be-created.txt");
+        let sentinel = outside.join("sentinel.txt");
+        std::fs::write(&sentinel, "outside bytes").unwrap();
+        let dangling = cwd.join("dangling.txt");
+        let existing = cwd.join("existing-link.txt");
+        let parent_link = cwd.join("parent-link");
+        let hard_link = cwd.join("hard-link.txt");
+        symlink(&absent, &dangling).unwrap();
+        symlink(&sentinel, &existing).unwrap();
+        symlink(&outside, &parent_link).unwrap();
+        std::fs::hard_link(&sentinel, &hard_link).unwrap();
+
+        let mut requests = Vec::new();
+        for (id, path) in [
+            (3, dangling.clone()),
+            (4, existing.clone()),
+            (5, parent_link.join("sentinel.txt")),
+            (6, absent.clone()),
+        ] {
+            requests.push(json!({
+                "jsonrpc": "2.0", "id": id, "method": "write_text_file",
+                "params": {"path": path, "contents": "must not escape"}
+            }));
+        }
+        requests.push(json!({
+            "jsonrpc": "2.0", "id": 7, "method": "read_text_file",
+            "params": {"path": existing}
+        }));
+        requests.push(json!({
+            "jsonrpc": "2.0", "id": 8, "method": "write_text_file",
+            "params": {"path": hard_link, "contents": "workspace replacement"}
+        }));
+        let frames = run_acp_file_requests(root.path(), &cwd, requests);
+        for id in 3..=7 {
+            assert_eq!(
+                frames.iter().find(|frame| frame["id"] == id).unwrap()["error"]["code"],
+                INVALID_PARAMS,
+                "request {id} must be rejected"
+            );
+        }
+        assert_eq!(
+            frames.iter().find(|frame| frame["id"] == 8).unwrap()["result"]["success"],
+            true
+        );
+        assert!(
+            !absent.exists(),
+            "a dangling symlink must not create its target"
+        );
+        assert!(std::fs::symlink_metadata(&dangling).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside bytes");
+        assert_eq!(std::fs::read(&hard_link).unwrap(), b"workspace replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acp_file_dispatch_rejects_fifo_and_processes_the_next_request() {
+        use rustix::fs::{Mode, OFlags};
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let fifo = cwd.join("stream");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, Mode::RUSR | Mode::WUSR).unwrap();
+        let readable = cwd.join("ordinary.txt");
+        std::fs::write(&readable, "still responsive").unwrap();
+        let requests = vec![
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "read_text_file",
+                "params": {"path": fifo}
+            }),
+            json!({
+                "jsonrpc": "2.0", "id": 4, "method": "read_text_file",
+                "params": {"path": readable}
+            }),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(run_acp_file_requests(root.path(), &cwd, requests));
+        });
+        let result = rx.recv_timeout(Duration::from_secs(10));
+        if result.is_err() {
+            // A regression to fs::read must fail rather than hang the suite.
+            // Release a blocking FIFO reader and immediately send EOF.
+            drop(rustix::fs::open(
+                &fifo,
+                OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ));
+            // Bound the rescue as well: even a broken reader must not turn
+            // this regression into an unconditional join hang.
+            let _ = rx.recv_timeout(Duration::from_secs(10));
+        }
+        if worker.is_finished() {
+            worker.join().expect("ACP file dispatch worker");
+        }
+        let frames = result.expect("a FIFO must not stall ACP dispatch");
+        assert!(frames.iter().find(|frame| frame["id"] == 3).unwrap()["error"].is_object());
+        assert_eq!(
+            frames.iter().find(|frame| frame["id"] == 4).unwrap()["result"]["contents"],
+            "still responsive"
+        );
+    }
+
+    #[test]
+    fn acp_file_scope_never_borrows_another_sessions_workspace() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let options = acp_workspace_options(root.path(), runtime.handle());
+        let left = root.path().join("left");
+        let right = root.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        let (left_id, left_state) =
+            handle_session_new(&json!({"cwd": left, "mcpServers": []}), &options, None)
+                .unwrap();
+        let (right_id, right_state) =
+            handle_session_new(&json!({"cwd": right, "mcpServers": []}), &options, None)
+                .unwrap();
+        let sessions = Arc::new(Mutex::new(HashMap::from([
+            (left_id.clone(), Arc::new(Mutex::new(left_state))),
+            (right_id, Arc::new(Mutex::new(right_state))),
+        ])));
+        runtime.block_on(async {
+            let cx = AgentCx::for_current_or_request();
+            let roots = file_operation_roots(Some(&left_id), &sessions, &cx)
+                .await
+                .unwrap();
+            assert_eq!(roots, vec![left.canonicalize().unwrap()]);
+            assert!(write_acp_text_file(&right.join("denied.txt"), &roots, b"denied").is_err());
+            assert!(!right.join("denied.txt").exists());
+            assert!(
+                file_operation_roots(Some("unknown-session"), &sessions, &cx)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                file_operation_roots(None, &sessions, &cx)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
         });
     }
 
