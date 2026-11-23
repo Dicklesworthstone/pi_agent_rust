@@ -4774,6 +4774,7 @@ impl Agent {
                             &mut new_messages,
                             abort.clone(),
                             Arc::clone(&turn_latency),
+                            compatible_tool_parallelism_limit(),
                         )
                         .await
                     {
@@ -6418,12 +6419,22 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
         latency: SharedTurnLatencyAccumulator,
+        parallelism: usize,
     ) -> Vec<(usize, (ToolOutput, bool))> {
-        let parallelism = compatible_tool_parallelism_limit();
+        // Classification precedes secret restoration and policy callbacks.
+        // Calls sharing an execution slot with peers must remain read/network
+        // only at admission, even when a callback replaces their tool handle.
+        let parallel_only = batch.len() > 1 && parallelism > 1;
         let futures = batch.into_iter().map(|(idx, tc)| {
             let on_event = Arc::clone(&on_event);
             let latency = Arc::clone(&latency);
-            async move { (idx, self.execute_tool_owned(tc, on_event, latency).await) }
+            async move {
+                (
+                    idx,
+                    self.execute_tool_in_session(tc, on_event, latency, None, parallel_only)
+                        .await,
+                )
+            }
         });
 
         if let Some(signal) = abort.as_ref() {
@@ -6463,6 +6474,7 @@ impl Agent {
         new_messages: &mut Vec<Message>,
         abort: Option<AbortSignal>,
         latency: SharedTurnLatencyAccumulator,
+        parallelism: usize,
     ) -> Result<ToolExecutionOutcome> {
         // A cancelled/abandoned batch must never donate evidence to a later
         // request. Nested host calls contribute only while this batch runs.
@@ -6521,6 +6533,7 @@ impl Agent {
                     Arc::clone(&on_event),
                     abort.clone(),
                     Arc::clone(&latency),
+                    parallelism,
                 )
                 .await;
             batch_results.sort_by_key(|(idx, _)| *idx);
@@ -6739,7 +6752,7 @@ impl Agent {
         // A batch plan was made before secret restoration and policy awaits.
         // Never run a reclassified mutation or ordered call beside its peers.
         if parallel_only && !self.effects_for_call(&tool_call).parallel_safe() {
-            return (Self::parallel_tool_admission_changed(), true);
+            return (Self::parallel_tool_admission_changed(expected_session), true);
         }
 
         // Resolve before any policy await: an invalid route must not acquire
@@ -7129,15 +7142,6 @@ impl Agent {
         }
     }
 
-    async fn execute_tool_owned(
-        &self,
-        tool_call: ToolCall,
-        on_event: AgentEventHandler,
-        latency: SharedTurnLatencyAccumulator,
-    ) -> (ToolOutput, bool) {
-        self.execute_tool(tool_call, on_event, latency).await
-    }
-
     /// Resolve only an admitted xdev execution route. The same resolver runs
     /// before policy callbacks and against the executor's current snapshot.
     fn resolve_xdev_run(
@@ -7200,6 +7204,8 @@ impl Agent {
         &self,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
+        expected_session: Option<&str>,
+        parallel_only: bool,
     ) -> Option<ToolOutput> {
         // The dispatcher must itself be mounted. Keep the same snapshot for
         // its target so a disabled xdev cannot execute or promote other tools.
@@ -7218,6 +7224,12 @@ impl Agent {
                     return Some(Self::tool_not_found_output(&inner_call.name));
                 };
                 let inner_args = &inner_call.arguments;
+                // Retain the same handle for this check and execution. A
+                // policy await may have replaced the previously read-only
+                // discovery target with an ordered or mutating tool.
+                if parallel_only && !inner.effects_for_input(inner_args).parallel_safe() {
+                    return Some(Self::parallel_tool_admission_changed(expected_session));
+                }
                 let protect = |parts: &[&str]| {
                     let privacy = crate::text_completion::AuxiliaryPrivacy::from_settings(
                         self.config.secrets.as_ref(),
@@ -7240,7 +7252,11 @@ impl Agent {
                         None,
                         crate::tools::ToolInvocationContext {
                             protect: &protect,
-                            host: Some(&host),
+                            host: if expected_session.is_none() {
+                                Some(&host)
+                            } else {
+                                None
+                            },
                             snapshot_privacy: &snapshot_privacy,
                         },
                     )
@@ -7387,7 +7403,14 @@ impl Agent {
         // run/promote actions. The policy pipeline has already admitted both
         // the dispatcher and the resolved target; this lookup rechecks routing.
         if tool_call.name == "xdev"
-            && let Some(output) = self.dispatch_xdev(tool_call, Arc::clone(&on_event)).await
+            && let Some(output) = self
+                .dispatch_xdev(
+                    tool_call,
+                    Arc::clone(&on_event),
+                    expected_session,
+                    parallel_only,
+                )
+                .await
         {
             let is_error = output.is_error;
             return (output, is_error);
@@ -7461,7 +7484,7 @@ impl Agent {
         // is no await between this check and execution; replacing the registry
         // cannot swap in a writer after the check.
         if parallel_only && !tool.effects_for_input(&tool_call.arguments).parallel_safe() {
-            return (Self::parallel_tool_admission_changed(), true);
+            return (Self::parallel_tool_admission_changed(expected_session), true);
         }
         let outcome = tool
             .execute_with_invocation(
@@ -7504,9 +7527,16 @@ impl Agent {
         }
     }
 
-    fn parallel_tool_admission_changed() -> ToolOutput {
+    fn parallel_tool_admission_changed(expected_session: Option<&str>) -> ToolOutput {
+        let code = if expected_session.is_some() {
+            "EVAL_BRIDGE_EFFECTS_CHANGED"
+        } else {
+            "TOOL_BATCH_EFFECTS_CHANGED"
+        };
         Self::xdev_text_output(
-            "EVAL_BRIDGE_EFFECTS_CHANGED: tool is no longer safe for parallel execution; submit it in a new batch or call it individually",
+            &format!(
+                "{code}: tool is no longer safe for parallel execution; submit it in a new batch or call it individually"
+            ),
             true,
         )
     }
@@ -11206,6 +11236,274 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn top_level_batches_recheck_replaced_native_and_xdev_targets_after_approval() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for via_dispatcher in [false, true] {
+                for parallelism in [1, 2] {
+                    let root = tempfile::tempdir().expect("workspace");
+                    std::fs::write(root.path().join("peer.txt"), "unchanged peer")
+                        .expect("peer fixture");
+                    let config: crate::config::Config = serde_json::from_value(json!({
+                        "tools": { "loadMode": { "read": "discoverable" } },
+                    }))
+                    .expect("discovery config");
+                    let tools = ToolRegistry::with_builtin_tool_policy(
+                        &["read", "ls"],
+                        root.path(),
+                        Some(&config),
+                        None,
+                        None,
+                        false,
+                        None,
+                        false,
+                    );
+                    assert!(tools.is_discoverable("read"));
+                    let mut agent =
+                        Agent::new(Arc::new(NoopProvider), tools, AgentConfig::default());
+                    let registry = agent.tools.clone();
+                    let cwd = root.path().to_path_buf();
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let entered = Arc::clone(&calls);
+                    let approvals = Arc::new(StdMutex::new(Vec::new()));
+                    let approved = Arc::clone(&approvals);
+                    let (release, released) = futures::channel::oneshot::channel::<()>();
+                    let pending_approval = Arc::new(StdMutex::new(Some(released)));
+                    agent.config.tool_approval = Some(Arc::new(move |request| {
+                        approved
+                            .lock()
+                            .expect("approvals")
+                            .push(request.tool_call_id.clone());
+                        let pending = if request.tool_call_id == "replaced"
+                            && request.tool_name == "read"
+                        {
+                            pending_approval.lock().expect("pending approval").take()
+                        } else {
+                            None
+                        };
+                        let registry = registry.clone();
+                        let cwd = cwd.clone();
+                        let entered = Arc::clone(&entered);
+                        Box::pin(async move {
+                            if let Some(pending) = pending {
+                                pending.await.expect("release policy callback");
+                                registry.update(|tools| {
+                                    tools.push(Box::new(ReclassifiedNativeTool {
+                                        cwd,
+                                        writes: true,
+                                        calls: entered,
+                                    }));
+                                });
+                            }
+                            ToolApprovalDecision::Allow
+                        })
+                    }));
+                    let arguments = json!({
+                        "path": "result.txt", "content": "native writer ran"
+                    });
+                    let tool_calls = [
+                        ToolCall {
+                            id: "replaced".into(),
+                            name: if via_dispatcher { "xdev" } else { "read" }.into(),
+                            arguments: if via_dispatcher {
+                                json!({ "action": "run", "name": "read", "args": arguments })
+                            } else {
+                                arguments
+                            },
+                            thought_signature: None,
+                        },
+                        ToolCall {
+                            id: "peer".into(),
+                            name: "ls".into(),
+                            arguments: json!({ "path": "." }),
+                            thought_signature: None,
+                        },
+                    ];
+                    assert!(
+                        tool_calls
+                            .iter()
+                            .all(|call| agent.effects_for_call(call).parallel_safe())
+                    );
+                    let events = Arc::new(StdMutex::new(Vec::new()));
+                    let recorded = Arc::clone(&events);
+                    let on_event: AgentEventHandler = Arc::new(move |event| match event {
+                        AgentEvent::ToolExecutionStart { tool_call_id, .. } => recorded
+                            .lock()
+                            .expect("events")
+                            .push(("start", tool_call_id, false)),
+                        AgentEvent::ToolExecutionEnd {
+                            tool_call_id,
+                            is_error,
+                            ..
+                        } => recorded
+                            .lock()
+                            .expect("events")
+                            .push(("end", tool_call_id, is_error)),
+                        _ => {}
+                    });
+                    let mut new_messages = Vec::new();
+                    let mut execution = Box::pin(agent.execute_tool_calls(
+                        &tool_calls,
+                        on_event,
+                        &mut new_messages,
+                        None,
+                        test_turn_latency(),
+                        parallelism,
+                    ));
+                    assert!(futures::poll!(execution.as_mut()).is_pending());
+                    let parallel = parallelism > 1;
+                    assert_eq!(
+                        approvals
+                            .lock()
+                            .expect("approvals")
+                            .iter()
+                            .any(|id| id == "peer"),
+                        parallel,
+                        "a pending policy callback must not serialize compatible peers"
+                    );
+                    release.send(()).expect("release replacement");
+                    let outcome = execution.await.expect("batch outcome");
+                    assert_eq!(outcome.tool_results.len(), 2);
+                    let replaced = &outcome.tool_results[0];
+                    let peer = &outcome.tool_results[1];
+                    assert_eq!(replaced.tool_call_id, "replaced");
+                    assert_eq!(peer.tool_call_id, "peer");
+                    assert_eq!(replaced.is_error, parallel);
+                    assert!(!peer.is_error);
+                    assert!(peer.content.iter().any(|block| {
+                        matches!(block, ContentBlock::Text(text) if text.text.contains("peer.txt"))
+                    }));
+                    if parallel {
+                        assert!(replaced.content.iter().any(|block| {
+                            matches!(block, ContentBlock::Text(text) if text.text.contains("TOOL_BATCH_EFFECTS_CHANGED"))
+                        }));
+                        assert_eq!(calls.load(Ordering::SeqCst), 0);
+                        assert!(!root.path().join("result.txt").exists());
+                    } else {
+                        assert_eq!(calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(
+                            std::fs::read_to_string(root.path().join("result.txt"))
+                                .expect("native output"),
+                            "native writer ran"
+                        );
+                    }
+                    assert_eq!(
+                        *events.lock().expect("events"),
+                        [
+                            ("start", "replaced".to_string(), false),
+                            ("start", "peer".to_string(), false),
+                            ("end", "replaced".to_string(), parallel),
+                            ("end", "peer".to_string(), false),
+                        ]
+                    );
+                    assert_eq!(new_messages.len(), 2);
+                    for (message, result) in new_messages.iter().zip(&outcome.tool_results) {
+                        let Message::ToolResult(recorded) = message else {
+                            panic!("every planned call retains its transcript result");
+                        };
+                        assert!(Arc::ptr_eq(recorded, result));
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn top_level_batches_recheck_secret_restored_resource_effects_before_policy() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for via_dispatcher in [false, true] {
+                let root = tempfile::tempdir().expect("workspace");
+                std::fs::write(root.path().join("peer.txt"), "unchanged peer")
+                    .expect("peer fixture");
+                let config: crate::config::Config = serde_json::from_value(json!({
+                    "tools": { "loadMode": { "grep": "discoverable" } },
+                }))
+                .expect("discovery config");
+                let tools = ToolRegistry::with_builtin_tool_policy(
+                    &["grep", "read"],
+                    root.path(),
+                    Some(&config),
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                );
+                let approvals = Arc::new(StdMutex::new(Vec::new()));
+                let approved = Arc::clone(&approvals);
+                let mut agent = Agent::new(
+                    Arc::new(NoopProvider),
+                    tools,
+                    AgentConfig {
+                        secrets: Some(crate::secrets::SecretsSettings {
+                            extra_patterns: Some(vec![regex::escape("conflict://*")]),
+                            ..crate::secrets::SecretsSettings::default()
+                        }),
+                        tool_approval: Some(Arc::new(move |request| {
+                            approved.lock().expect("approvals").push(request.tool_call_id);
+                            Box::pin(async { ToolApprovalDecision::Allow })
+                        })),
+                        ..AgentConfig::default()
+                    },
+                );
+                let placeholder = agent
+                    .secrets_transform_outbound_text("conflict://*")
+                    .expect("hide configured resource");
+                assert_ne!(placeholder, "conflict://*");
+                let arguments = json!({ "pattern": "needle", "path": placeholder });
+                let tool_calls = [
+                    ToolCall {
+                        id: "restored".into(),
+                        name: if via_dispatcher { "xdev" } else { "grep" }.into(),
+                        arguments: if via_dispatcher {
+                            json!({ "action": "run", "name": "grep", "args": arguments })
+                        } else {
+                            arguments
+                        },
+                        thought_signature: None,
+                    },
+                    ToolCall {
+                        id: "peer".into(),
+                        name: "read".into(),
+                        arguments: json!({ "path": "peer.txt" }),
+                        thought_signature: None,
+                    },
+                ];
+                assert!(agent.effects_for_call(&tool_calls[0]).parallel_safe());
+                let restored = agent
+                    .restore_secrets_inbound(tool_calls[0].clone())
+                    .expect("restore configured resource");
+                assert!(agent.effects_for_call(&restored).processes());
+                let mut new_messages = Vec::new();
+                let outcome = agent
+                    .execute_tool_calls(
+                        &tool_calls,
+                        Arc::new(|_| {}),
+                        &mut new_messages,
+                        None,
+                        test_turn_latency(),
+                        2,
+                    )
+                    .await
+                    .expect("batch outcome");
+                assert_eq!(*approvals.lock().expect("approvals"), ["peer"]);
+                assert_eq!(outcome.tool_results.len(), 2);
+                assert!(outcome.tool_results[0].is_error);
+                assert!(outcome.tool_results[0].content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text(text) if text.text.contains("TOOL_BATCH_EFFECTS_CHANGED"))
+                }));
+                assert!(!outcome.tool_results[1].is_error);
+                assert!(outcome.tool_results[1].content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text(text) if text.text.contains("unchanged peer"))
+                }));
+                assert_eq!(new_messages.len(), 2);
+            }
+        });
+    }
+
+    #[test]
     fn nested_parallel_calls_recheck_replacement_after_approval() {
         use crate::tools::ToolInvocationHost;
 
@@ -11734,7 +12032,7 @@ mod extensions_integration_tests {
                 };
                 let result = session
                     .agent
-                    .dispatch_xdev(&call, Arc::new(|_| {}))
+                    .dispatch_xdev(&call, Arc::new(|_| {}), None, false)
                     .await
                     .expect("native xdev execution");
                 assert!(!result.is_error);
@@ -11749,7 +12047,7 @@ mod extensions_integration_tests {
                 };
                 let result = session
                     .agent
-                    .dispatch_xdev(&promote, Arc::new(|_| {}))
+                    .dispatch_xdev(&promote, Arc::new(|_| {}), None, false)
                     .await
                     .expect("native xdev promotion");
                 assert!(!result.is_error);
@@ -16574,6 +16872,7 @@ mod extensions_integration_tests {
             let mut new_messages = Vec::new();
             let mut execution = Box::pin(agent.execute_tool_calls(
                 &calls, on_event, &mut new_messages, None, test_turn_latency(),
+                compatible_tool_parallelism_limit(),
             ));
             assert!(futures::poll!(execution.as_mut()).is_pending());
             // With concurrent read-effect scheduling, B and view would pass
