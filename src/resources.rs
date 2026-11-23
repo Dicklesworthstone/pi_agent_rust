@@ -2460,11 +2460,12 @@ fn is_cache_module_path_with_cache_dir(path: &Path, cache_dir: Option<&Path>) ->
     canonical.starts_with(&canonical_cache)
 }
 
-/// Derive the canonical extension ID from a filesystem path.
+/// Derive the filename key shared by a source entry and its transpiled copy.
 ///
-/// Uses the same heuristic as `JsExtensionLoadSpec::from_entry_path`: if the
-/// file stem is `index`, the parent directory name is the ID; otherwise the
-/// file stem itself is the ID.
+/// Cache files do not retain the declaring npm manifest, so this deliberately
+/// uses the original filename heuristic rather than the runtime's qualified
+/// package identity. It only suppresses cache copies; source entries with the
+/// same key must still reach provenance admission independently.
 fn extension_id_from_path(path: &Path) -> Option<String> {
     let canonical = canonical_identity_path(path);
     let stem = canonical.file_stem().and_then(|s| s.to_str())?.trim();
@@ -2487,8 +2488,8 @@ fn extension_dedupe_key_from_path(path: &Path) -> Option<String> {
     extension_id_from_path(path).map(|id| id.to_ascii_lowercase())
 }
 
-/// Deduplicate extension entries by canonical extension ID, preferring source
-/// entries over transpiled cache copies (Issue #37).
+/// Suppress transpiled cache copies when their filename key has a source
+/// entry (Issue #37), without merging unrelated source packages.
 ///
 /// When both a source `.ts` extension and its transpiled cache copy in
 /// `~/.pi/agent/cache/modules/` are discovered, the cache entry is dropped to

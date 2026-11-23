@@ -4070,6 +4070,64 @@ fn check_version_constraint_treats_bare_literals_as_exact_matches() {
 }
 
 #[test]
+fn qualified_npm_prompt_cache_inherits_only_applicable_filename_denials() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("permissions.json");
+    let owner = "npm:@fixture/fetch:src";
+    let mut store = PermissionStore::open(&path).unwrap();
+    store
+        .record_with_version("src", "exec", false, ">=2.0.0 <3.0.0")
+        .unwrap();
+    store.record("src", "http", false).unwrap();
+    store.record("src", "env", true).unwrap();
+    store.record(owner, "exec", true).unwrap();
+    store.record(owner, "http", true).unwrap();
+
+    let manager = extension_manager_no_persisted_permissions();
+    {
+        let mut guard = manager.inner.lock().unwrap();
+        ExtensionManager::load_persisted_permissions_from(&mut guard, &path);
+        guard
+            .extension_versions
+            .insert(owner.to_string(), "2.5.1".to_string());
+    }
+    assert_eq!(
+        manager.cached_policy_prompt_decision(owner, "exec"),
+        Some(false)
+    );
+    assert_eq!(
+        manager.cached_policy_prompt_decision(owner, "http"),
+        Some(false)
+    );
+    assert_eq!(
+        manager.cached_policy_prompt_decision(owner, "env"),
+        None,
+        "a filename allow must not authorize a newly distinct package"
+    );
+    assert_eq!(
+        manager.cached_policy_prompt_decision("npm:@fixture/search:src", "http"),
+        Some(false),
+        "an unversioned filename deny applies to each package"
+    );
+    assert_eq!(
+        manager.cached_policy_prompt_decision("npm:@fixture/search:src", "exec"),
+        None,
+        "a version-constrained decision needs a known matching package version"
+    );
+    manager
+        .inner
+        .lock()
+        .unwrap()
+        .extension_versions
+        .insert(owner.to_string(), "3.0.0".to_string());
+    assert_eq!(
+        manager.cached_policy_prompt_decision(owner, "exec"),
+        Some(true),
+        "an out-of-range legacy decision cannot override an applicable package decision"
+    );
+}
+
+#[test]
 fn cached_policy_prompt_decision_honors_compound_version_range() {
     let manager = extension_manager_no_persisted_permissions();
     {

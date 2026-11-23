@@ -973,3 +973,102 @@ fn quota_monotonic_total_never_decreases() {
     }
     assert_eq!(state.hostcalls_total, 100);
 }
+
+#[test]
+fn quota_manager_npm_identity_keeps_filename_limits_with_independent_usage() {
+    let manager = ExtensionManager::new();
+    let mut policy = ExtensionPolicy::default();
+    policy.per_extension.insert(
+        "src".to_string(),
+        ExtensionOverride {
+            quota: Some(ExtensionQuotaConfig {
+                max_hostcalls_total: Some(1),
+                max_hostcalls_per_second: None,
+                max_hostcalls_per_minute: None,
+                max_subprocesses: None,
+                max_write_bytes: None,
+                max_http_requests: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let owner = "npm:@fixture/fetch:src";
+    policy.per_extension.insert(
+        owner.to_string(),
+        ExtensionOverride {
+            quota: Some(ExtensionQuotaConfig {
+                max_hostcalls_total: Some(10),
+                ..ExtensionQuotaConfig::default()
+            }),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        manager.check_quota(Some(owner), "tool", 1000, &policy),
+        QuotaCheckResult::Allowed
+    );
+    assert!(matches!(
+        manager.check_quota(Some(owner), "tool", 1001, &policy),
+        QuotaCheckResult::Exceeded { reason } if reason.contains("total hostcalls")
+    ));
+    let peer = "npm:@fixture/search:src";
+    assert_eq!(
+        manager.check_quota(Some(peer), "tool", 1002, &policy),
+        QuotaCheckResult::Allowed,
+        "different packages cannot consume each other's quota"
+    );
+    assert!(matches!(
+        manager.check_quota(Some(peer), "tool", 1003, &policy),
+        QuotaCheckResult::Exceeded { reason } if reason.contains("total hostcalls")
+    ));
+    let events = manager.drain_quota_breach_events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].extension_id, owner);
+    assert_eq!(events[1].extension_id, peer);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.quota_config_source == "per_extension")
+    );
+
+    let tighter = "npm:@fixture/blocked:src";
+    policy.per_extension.insert(
+        tighter.to_string(),
+        ExtensionOverride {
+            quota: Some(ExtensionQuotaConfig {
+                max_hostcalls_total: Some(0),
+                ..ExtensionQuotaConfig::default()
+            }),
+            ..Default::default()
+        },
+    );
+    assert!(matches!(
+        manager.check_quota(Some(tighter), "tool", 1004, &policy),
+        QuotaCheckResult::Exceeded { reason } if reason.contains("total hostcalls")
+    ));
+}
+
+#[test]
+fn quota_manager_npm_identity_cannot_borrow_a_looser_filename_quota() {
+    let manager = ExtensionManager::new();
+    let mut policy = ExtensionPolicy::default();
+    policy.per_extension.insert(
+        "src".to_string(),
+        ExtensionOverride {
+            quota: Some(ExtensionQuotaConfig::for_mode(
+                ExtensionPolicyMode::Permissive,
+            )),
+            ..Default::default()
+        },
+    );
+    let owner = "npm:@fixture/fetch:src";
+    // The global default allows eight children; the old filename override
+    // allows thirty-two. Qualification must not inherit that extra authority.
+    for _ in 0..8 {
+        manager.record_subprocess_spawn(owner);
+    }
+    assert!(matches!(
+        manager.check_quota(Some(owner), "exec", 1000, &policy),
+        QuotaCheckResult::Exceeded { reason } if reason.contains("subprocesses")
+    ));
+}

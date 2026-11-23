@@ -1392,9 +1392,9 @@ fn quarantined_provider_cleanup_cannot_publish_new_tool_reservations() {
     });
 }
 
-/// Filename-derived policy IDs are not package identities. An ambiguous
-/// candidate must be rejected before a factory can run, and a failed reload
-/// must leave the previously loaded realm intact.
+/// Explicitly assigning one policy ID to unrelated packages is still
+/// ambiguous. Reject before a factory can run, and leave the previously
+/// loaded realm intact when such a reload fails.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn unrelated_same_id_packages_and_cross_package_coentries_fail_before_factories() {
@@ -1417,8 +1417,8 @@ fn unrelated_same_id_packages_and_cross_package_coentries_fail_before_factories(
     };
     let mut candidates = Vec::new();
 
-    // This is context-mode's actual package/adapter filename shape. Another
-    // independently installed package can naturally choose extension.js too.
+    // An explicit owner collision must still fail even though inferred IDs
+    // now disambiguate these common package/adapter filename shapes.
     let mut same_id = Vec::new();
     for name in ["context-mode", "unrelated-package"] {
         let package = format!("node_modules/{name}");
@@ -1430,12 +1430,33 @@ fn unrelated_same_id_packages_and_cross_package_coentries_fail_before_factories(
             }))
             .unwrap(),
         );
-        same_id.push(make_spec(&format!(
-            "{package}/build/adapters/pi/extension.js"
-        )));
+        let mut spec = make_spec(&format!("{package}/build/adapters/pi/extension.js"));
+        spec.extension_id = "extension".to_string();
+        same_id.push(spec);
     }
     assert!(same_id.iter().all(|spec| spec.extension_id == "extension"));
     candidates.push(same_id);
+
+    // Two installed copies of one named package still collide. Inferring an
+    // ID must not append an order-dependent suffix or silently merge realms.
+    let mut duplicate_installs = Vec::new();
+    for prefix in ["first-install", "second-install"] {
+        let package = format!("{prefix}/node_modules/@fixture/duplicate");
+        harness.create_file(
+            format!("{package}/package.json"),
+            br#"{"name":"@fixture/duplicate","pi":{"extensions":["./src/index.mjs"]}}"#,
+        );
+        duplicate_installs.push(make_spec(&format!("{package}/src/index.mjs")));
+    }
+    assert_eq!(
+        duplicate_installs[0].extension_id,
+        "npm:@fixture/duplicate:src"
+    );
+    assert_eq!(
+        duplicate_installs[0].extension_id,
+        duplicate_installs[1].extension_id
+    );
+    candidates.push(duplicate_installs);
 
     // A declaring workspace cannot absorb a nearer named package merely
     // because that package has no pi.extensions of its own.
@@ -1576,6 +1597,126 @@ fn start_provenance_fixture(
     .expect("start real provenance runtime");
     manager.set_js_runtime(runtime.clone());
     (manager, runtime)
+}
+
+/// Issue #288: independently installed packages routinely declare
+/// src/index.*. They need distinct realms without discarding existing
+/// filename-policy restrictions or granting access to their peer's files.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn scoped_npm_index_entries_keep_distinct_realms_and_legacy_policy_restrictions() {
+    let harness = common::TestHarness::new("provenance_scoped_npm_identity");
+    let mut specs = Vec::new();
+    for name in ["pi-web-fetch", "pi-web-search"] {
+        let package = format!("node_modules/@fixture/{name}");
+        harness.create_file(
+            format!("{package}/package.json"),
+            serde_json::to_vec(&json!({
+                "name": format!("@fixture/{name}"), "version": "2.3.4", "type": "module",
+                "pi": { "extensions": ["./src/index.mjs"] },
+            }))
+            .unwrap(),
+        );
+        harness.create_file(format!("{package}/asset.txt"), name.as_bytes());
+        harness.create_file(
+            format!("{package}/src/private.mjs"),
+            b"export default 'private peer module';",
+        );
+        // A module-format scope must not hide the declaring package.
+        if name == "pi-web-search" {
+            harness.create_file(
+                format!("{package}/src/package.json"),
+                br#"{"type":"module"}"#,
+            );
+        }
+        let entry = harness.create_file(format!("{package}/src/index.mjs"), br"
+            import { readFileSync, writeFileSync } from 'node:fs';
+            import { basename, dirname, join } from 'node:path';
+            import { fileURLToPath } from 'node:url';
+            export default function(pi) {
+                const root = dirname(dirname(fileURLToPath(import.meta.url)));
+                const owner = basename(root);
+                const peer = owner === 'pi-web-fetch' ? 'pi-web-search' : 'pi-web-fetch';
+                globalThis.packageOwner = owner;
+                pi.registerCommand('probe-' + owner, { handler: async () => {
+                    let read = false, write = false, imported = false, execError = '';
+                    try { readFileSync(join(root, '..', peer, 'asset.txt'), 'utf8'); read = true; } catch (_) {}
+                    try { writeFileSync(join(root, '..', peer, 'created.txt'), 'foreign'); write = true; } catch (_) {}
+                    try { await import('../../' + peer + '/src/private.mjs'); imported = true; } catch (_) {}
+                    try { await pi.exec('pi-provenance-command-that-must-not-run', []); }
+                    catch (error) { execError = String(error.message || error); }
+                    return { owner: globalThis.packageOwner, asset: readFileSync(join(root, 'asset.txt'), 'utf8'),
+                        read, write, imported, execError, env: process.env.PROVENANCE_TEST_VALUE ?? null };
+                }});
+            }
+        ");
+        let spec = JsExtensionLoadSpec::from_entry_path(entry).expect("package spec");
+        assert_eq!(spec.extension_id, format!("npm:@fixture/{name}:src"));
+        assert_eq!(spec.name, format!("@fixture/{name}"));
+        assert_eq!(spec.version, "2.3.4");
+        specs.push(spec);
+    }
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
+    policy
+        .default_caps
+        .extend(["exec".to_string(), "env".to_string()]);
+    policy.per_extension.insert(
+        "src".to_string(),
+        pi::extensions::ExtensionOverride {
+            deny: vec!["exec".to_string(), "env".to_string()],
+            ..Default::default()
+        },
+    );
+    // A package-specific allow cannot silently erase the generic deny.
+    policy.per_extension.insert(
+        specs[0].extension_id.clone(),
+        pi::extensions::ExtensionOverride {
+            allow: vec!["exec".to_string(), "env".to_string()],
+            ..Default::default()
+        },
+    );
+    let (manager, _) = start_provenance_fixture(&harness, policy);
+    common::run_async(async move {
+        for _ in 0..2 {
+            manager
+                .load_js_extensions(specs.clone())
+                .await
+                .expect("distinct package realms load");
+            for name in ["pi-web-fetch", "pi-web-search"] {
+                let observed = manager
+                    .execute_command(&format!("probe-{name}"), "", 5000)
+                    .await
+                    .expect("each package remains callable");
+                assert_eq!(observed["owner"], name, "independent global state");
+                assert_eq!(
+                    observed["asset"], name,
+                    "own package assets remain readable"
+                );
+                for key in ["read", "write", "imported"] {
+                    assert_eq!(observed[key], false, "peer access via {key}: {observed}");
+                }
+                assert!(
+                    observed["env"].is_null(),
+                    "old env deny remains active: {observed}"
+                );
+                assert!(
+                    observed["execError"]
+                        .as_str()
+                        .is_some_and(|error| error.to_ascii_lowercase().contains("denied")),
+                    "old exec deny remains active: {observed}"
+                );
+                assert!(
+                    !harness
+                        .temp_dir()
+                        .join(format!("node_modules/@fixture/{name}/created.txt"))
+                        .exists()
+                );
+            }
+            specs.reverse();
+        }
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
 }
 
 /// Declared entries of one package retain their shared realm and unchanged

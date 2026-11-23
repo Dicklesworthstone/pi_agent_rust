@@ -1,8 +1,8 @@
 //! Behavioral tests for compiled extension-policy snapshots.
 
 use super::{
-    ALL_CAPABILITIES, ExtensionOverride, ExtensionPolicy, PolicyDecision, PolicyProfile,
-    PolicySnapshot,
+    ALL_CAPABILITIES, ExtensionOverride, ExtensionPolicy, ExtensionPolicyMode, PolicyDecision,
+    PolicyProfile, PolicySnapshot,
 };
 
 fn make_policy_with_per_extension() -> ExtensionPolicy {
@@ -135,4 +135,178 @@ fn snapshot_global_deny_wins_over_per_extension_allow() {
     // ext.special allows "exec", but global deny remains authoritative.
     let ext = snapshot.lookup("exec", Some("ext.special"));
     assert_eq!(ext.decision, PolicyDecision::Deny);
+}
+
+#[test]
+fn npm_package_policy_retains_filename_denials_in_direct_and_compiled_lookups() {
+    let mut policy = ExtensionPolicy::from_profile(PolicyProfile::Permissive);
+    policy.per_extension.insert(
+        "src".to_string(),
+        ExtensionOverride {
+            deny: vec!["exec".to_string(), "env".to_string()],
+            ..Default::default()
+        },
+    );
+    policy.per_extension.insert(
+        "npm:@fixture/fetch:src".to_string(),
+        ExtensionOverride {
+            allow: vec!["exec".to_string(), "env".to_string()],
+            ..Default::default()
+        },
+    );
+    let snapshot = PolicySnapshot::compile(&policy);
+    for owner in ["npm:@fixture/fetch:src", "npm:@fixture/search:src"] {
+        assert!(policy.has_override(owner));
+        for capability in ["exec", "env"] {
+            for check in [
+                policy.evaluate_for(capability, Some(owner)),
+                snapshot.lookup(capability, Some(owner)),
+            ] {
+                assert_eq!(check.decision, PolicyDecision::Deny);
+                assert_eq!(check.reason, "extension_deny");
+            }
+        }
+        assert_eq!(
+            snapshot.lookup("http", Some(owner)).decision,
+            PolicyDecision::Allow
+        );
+    }
+    // A different filename does not inherit src's restrictions.
+    assert!(!policy.has_override("npm:@fixture/other:entry"));
+    assert_eq!(
+        snapshot
+            .lookup("exec", Some("npm:@fixture/other:entry"))
+            .decision,
+        PolicyDecision::Allow
+    );
+}
+
+#[test]
+fn npm_package_policy_preserves_restrictive_modes_without_borrowing_filename_grants() {
+    let owner = "npm:@fixture/fetch:src";
+    for (mode, expected) in [
+        (ExtensionPolicyMode::Strict, PolicyDecision::Deny),
+        (ExtensionPolicyMode::Prompt, PolicyDecision::Prompt),
+    ] {
+        let mut policy = ExtensionPolicy::from_profile(PolicyProfile::Permissive);
+        policy.per_extension.insert(
+            "src".to_string(),
+            ExtensionOverride {
+                mode: Some(mode),
+                ..Default::default()
+            },
+        );
+        policy.per_extension.insert(
+            owner.to_string(),
+            ExtensionOverride {
+                allow: vec!["exec".to_string()],
+                ..Default::default()
+            },
+        );
+        let snapshot = PolicySnapshot::compile(&policy);
+        for capability in ["exec", "unknown-capability"] {
+            assert_eq!(
+                policy.evaluate_for(capability, Some(owner)).decision,
+                expected
+            );
+            assert_eq!(snapshot.lookup(capability, Some(owner)).decision, expected);
+        }
+    }
+
+    let mut policy = ExtensionPolicy {
+        mode: ExtensionPolicyMode::Strict,
+        default_caps: Vec::new(),
+        deny_caps: Vec::new(),
+        ..Default::default()
+    };
+    policy.per_extension.insert(
+        "src".to_string(),
+        ExtensionOverride {
+            mode: Some(ExtensionPolicyMode::Permissive),
+            allow: vec!["exec".to_string()],
+            ..Default::default()
+        },
+    );
+    let snapshot = PolicySnapshot::compile(&policy);
+    assert_eq!(
+        policy.evaluate_for("exec", Some("src")).decision,
+        PolicyDecision::Allow
+    );
+    for capability in ["exec", "env", "unknown-capability"] {
+        assert_eq!(
+            policy.evaluate_for(capability, Some(owner)).decision,
+            PolicyDecision::Deny
+        );
+        assert_eq!(
+            snapshot.lookup(capability, Some(owner)).decision,
+            PolicyDecision::Deny
+        );
+    }
+    policy.per_extension.insert(
+        owner.to_string(),
+        ExtensionOverride {
+            allow: vec!["http".to_string()],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        PolicySnapshot::compile(&policy)
+            .lookup("http", Some(owner))
+            .decision,
+        PolicyDecision::Allow
+    );
+    policy.deny_caps.push("http".to_string());
+    assert_eq!(
+        PolicySnapshot::compile(&policy)
+            .lookup("http", Some(owner))
+            .decision,
+        PolicyDecision::Deny
+    );
+}
+
+#[test]
+fn npm_qualification_treats_the_filename_policy_alias_as_a_literal_key() {
+    let owner = "npm:outer:npm:inner:src";
+    let mut policy = ExtensionPolicy::from_profile(PolicyProfile::Permissive);
+    policy.per_extension.insert(
+        "src".to_string(),
+        ExtensionOverride {
+            deny: vec!["exec".to_string()],
+            ..Default::default()
+        },
+    );
+    policy.per_extension.insert(
+        "npm:inner:src".to_string(),
+        ExtensionOverride {
+            allow: vec!["exec".to_string()],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        policy.evaluate_for("exec", Some(owner)).decision,
+        PolicyDecision::Allow
+    );
+    assert_eq!(
+        PolicySnapshot::compile(&policy)
+            .lookup("exec", Some(owner))
+            .decision,
+        PolicyDecision::Allow,
+        "a filename containing the reserved prefix must not recursively inherit src"
+    );
+    policy
+        .per_extension
+        .get_mut("npm:inner:src")
+        .unwrap()
+        .deny
+        .push("exec".to_string());
+    assert_eq!(
+        policy.evaluate_for("exec", Some(owner)).decision,
+        PolicyDecision::Deny
+    );
+    assert_eq!(
+        PolicySnapshot::compile(&policy)
+            .lookup("exec", Some(owner))
+            .decision,
+        PolicyDecision::Deny
+    );
 }
