@@ -2111,9 +2111,12 @@ fn first_report_of(scope: &str, item: &str) -> bool {
 }
 
 /// Warn once per process for each unrecognised key in a settings file.
+///
+/// Keys that Pi's TypeScript implementation writes to the same file are not
+/// mistakes, so they are only logged at debug level (gh #287).
 fn warn_unrecognised_setting_keys(path: &Path, content: &str) {
-    let keys = unrecognised_setting_keys(content);
-    if keys.is_empty() {
+    let (keys, foreign) = classify_unrecognised_setting_keys(content);
+    if keys.is_empty() && foreign.is_empty() {
         return;
     }
 
@@ -2125,6 +2128,16 @@ fn warn_unrecognised_setting_keys(path: &Path, content: &str) {
                 setting = key,
                 file = file.as_str(),
                 "Unrecognised setting; it is being ignored"
+            );
+        }
+    }
+    for key in foreign {
+        if first_report_of(&file, &key) {
+            tracing::debug!(
+                target: USER_DIAGNOSTIC_TARGET,
+                setting = key,
+                file = file.as_str(),
+                "Setting belongs to Pi's TypeScript implementation; this build ignores it"
             );
         }
     }
@@ -2200,13 +2213,136 @@ fn warn_invalid_tool_load_modes(path: &Path, content: &str) {
 ///     need no special case: serde KEEPS them, so they move the shape, which
 ///     is the same evidence of being read that a struct field gives.
 pub(crate) fn unrecognised_setting_keys(content: &str) -> Vec<String> {
+    classify_unrecognised_setting_keys(content).0
+}
+
+/// The keys this build does not recognise that Pi's TypeScript
+/// implementation does, as dotted paths.
+#[cfg(test)]
+fn typescript_pi_setting_keys(content: &str) -> Vec<String> {
+    classify_unrecognised_setting_keys(content).1
+}
+
+/// Settings keys that Pi's TypeScript implementation reads and writes, as
+/// dotted paths. Both implementations use `~/.pi/agent/settings.json` and
+/// `.pi/settings.json`, so a user who runs both has these keys in a file this
+/// build also reads. The list is consulted only for keys this build does not
+/// recognise itself; those are not misspellings and must not warn on every
+/// start (gh #287).
+///
+/// Source: `packages/coding-agent/src/core/settings-schema.ts` in the
+/// TypeScript Pi repository, checked 2026-11-22. A key added there later warns
+/// here until it is added to this list, which is the safe direction.
+const TYPESCRIPT_PI_SETTING_KEYS: &[&str] = &[
+    "autocompleteMaxVisible",
+    "branchSummary",
+    "branchSummary.reserveTokens",
+    "branchSummary.skipPrompt",
+    "cacheWarming",
+    "codemode",
+    "codemode.inlineBudget",
+    "codemode.mode",
+    "collapseChangelog",
+    "compaction",
+    "compaction.enabled",
+    "compaction.keepRecentTokens",
+    "compaction.modelOverrides",
+    "compaction.reserveTokens",
+    "defaultModel",
+    "defaultProjectTrust",
+    "defaultProvider",
+    "defaultThinkingLevel",
+    "defaultTools",
+    "deviceId",
+    "doubleEscapeAction",
+    "editorPaddingX",
+    "enableAnalytics",
+    "enableInstallTelemetry",
+    "enableSkillCommands",
+    "enabledModels",
+    "extensionChangelogVersions",
+    "extensions",
+    "externalEditor",
+    "followUpMode",
+    "fullscreenCopyOnSelect",
+    "fullscreenExitOutput",
+    "fullscreenScrollbar",
+    "fullscreenWheelScrollLines",
+    "hideThinkingBlock",
+    "httpIdleTimeoutMs",
+    "httpProxy",
+    "images",
+    "images.autoResize",
+    "images.blockImages",
+    "lastChangelogVersion",
+    "markdown",
+    "markdown.codeBlockIndent",
+    "markdown.mermaid",
+    "modelThinkingLevels",
+    "npmCommand",
+    "outputPad",
+    "packages",
+    "prompts",
+    "queueMode",
+    "quietStartup",
+    "retry",
+    "retry.baseDelayMs",
+    "retry.enabled",
+    "retry.maxAgentDelayMs",
+    "retry.maxDelayMs",
+    "retry.maxRetries",
+    "retry.provider",
+    "retry.provider.maxRetries",
+    "retry.provider.maxRetryDelayMs",
+    "retry.provider.timeoutMs",
+    "selfUpdateCommand",
+    "sessionDir",
+    "sessionShareDestination",
+    "shellCommandPrefix",
+    "shellPath",
+    "showCacheMissNotices",
+    "showHardwareCursor",
+    "skills",
+    "skills.customDirectories",
+    "skills.enableSkillCommands",
+    "steeringMode",
+    "terminal",
+    "terminal.clearOnShrink",
+    "terminal.hyperlinks",
+    "terminal.imageWidthCells",
+    "terminal.images",
+    "terminal.showImages",
+    "terminal.showTerminalProgress",
+    "terminal.trueColor",
+    "theme",
+    "themes",
+    "thinkingBudgets",
+    "thinkingBudgets.high",
+    "thinkingBudgets.low",
+    "thinkingBudgets.medium",
+    "thinkingBudgets.minimal",
+    "trackingId",
+    "transport",
+    "treeFilterMode",
+    "tuiMode",
+    "warnings",
+    "warnings.anthropicExtraUsage",
+    "websocketConnectTimeoutMs",
+    "websockets",
+];
+
+/// Unrecognised keys split into (likely mistakes, keys of Pi's TypeScript
+/// implementation), both as dotted paths.
+fn classify_unrecognised_setting_keys(content: &str) -> (Vec<String>, Vec<String>) {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(content)
     else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut found = Vec::new();
     collect_unrecognised_keys(&[], &map, &mut found);
     found
+        .into_iter()
+        .partition(|key| !TYPESCRIPT_PI_SETTING_KEYS.contains(&key.as_str()))
 }
 
 fn collect_unrecognised_keys(
@@ -2999,7 +3135,8 @@ mod tests {
         extension_index_path_from_env, first_report_of, global_dir_from_env, merge_branch_summary,
         merge_compaction, merge_extension_policy, merge_extension_risk, merge_images,
         merge_repair_policy, merge_retry, merge_terminal, merge_thinking_budgets,
-        package_dir_from_env, sessions_dir_from_env, unrecognised_setting_keys,
+        package_dir_from_env, sessions_dir_from_env, typescript_pi_setting_keys,
+        unrecognised_setting_keys,
     };
     use crate::agent::QueueMode;
     use clap::Parser;
@@ -3166,6 +3303,57 @@ mod tests {
             config.secrets.and_then(|secrets| secrets.extra_patterns),
             Some(vec![String::from("sk-[a-z]+")])
         );
+    }
+
+    /// gh #287: Pi's TypeScript implementation reads and writes the same
+    /// `~/.pi/agent/settings.json`. Its own keys are not misspellings, so
+    /// they must not produce an "Unrecognised setting" warning on every
+    /// start, while a real misspelling still does, top-level and nested.
+    #[test]
+    fn typescript_pi_settings_in_a_shared_file_are_not_reported_as_unrecognised() {
+        let shared = r#"{
+            "cacheWarming": "idle",
+            "defaultProjectTrust": "ask",
+            "defaultTools": ["read", "bash", "+grep"],
+            "enableInstallTelemetry": false,
+            "extensionChangelogVersions": {"npm:pi-web-fetch": "0.18.0"},
+            "showCacheMissNotices": true,
+            "terminal": {"showTerminalProgress": true, "hyperlinks": "auto"},
+            "warnings": {"anthropicExtraUsage": false},
+            "lastChangelogVersion": "0.70.2"
+        }"#;
+        let mut reported = unrecognised_setting_keys(shared);
+        reported.sort();
+        assert!(
+            reported.is_empty(),
+            "TypeScript Pi settings reported as unrecognised: {reported:?}"
+        );
+        // `defaultTools` is in the TypeScript list but this build reads it
+        // too, so it is neither reported nor foreign.
+        let mut foreign = typescript_pi_setting_keys(shared);
+        foreign.sort();
+        assert_eq!(
+            foreign,
+            [
+                "cacheWarming",
+                "defaultProjectTrust",
+                "enableInstallTelemetry",
+                "extensionChangelogVersions",
+                "showCacheMissNotices",
+                "terminal.hyperlinks",
+                "terminal.showTerminalProgress",
+                "warnings",
+            ]
+        );
+
+        let misspelled = r#"{
+            "cacheWarmng": "idle",
+            "terminal": {"showTerminalProgres": true},
+            "warnings": {"anthropicExtraUsage": false}
+        }"#;
+        let mut reported = unrecognised_setting_keys(misspelled);
+        reported.sort();
+        assert_eq!(reported, ["cacheWarmng", "terminal.showTerminalProgres"]);
     }
 
     #[test]
