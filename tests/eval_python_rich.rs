@@ -386,8 +386,10 @@ picture
         let retained = cell(&tool, "picture").await;
         assert!(!retained.is_error, "{}", text(&retained));
         assert_eq!(retained.details.as_ref().unwrap()["restarted"], false);
-        assert!(matches!(retained.content.first(), Some(ContentBlock::Image(image))
-            if image.mime_type == "image/jpeg" && image.data == first_image.data));
+        assert!(
+            matches!(retained.content.first(), Some(ContentBlock::Image(image))
+            if image.mime_type == "image/jpeg" && image.data == first_image.data)
+        );
     });
 }
 

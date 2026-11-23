@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent::{Agent, AgentConfig, AgentEvent, AgentSession};
-use crate::compaction::ResolvedCompactionSettings;
+use crate::compaction::{ManualCompactionMode, ResolvedCompactionSettings};
 use crate::model::{
     AssistantMessage, ContentBlock, ImageContent, MediaContent, Message, StopReason, StreamEvent,
     TextContent,
@@ -1222,8 +1222,15 @@ fn compaction_recovery_requires_separate_review_of_before_command_and_after() {
             "before @old.txt",
         );
         let after = detached(&mut session, &payload(), "after @old.png");
-        let request =
-            RestoredInput::for_compaction(owner, None, before, "/shake".into(), None, true, after);
+        let request = RestoredInput::for_compaction(
+            owner,
+            None,
+            before,
+            "/shake".into(),
+            None,
+            ManualCompactionMode::Shake,
+            after,
+        );
         let stale = request.clone();
         let controls: TurnControlSlot = Arc::default();
         let (tx, _rx) = mpsc::channel();
@@ -1305,7 +1312,7 @@ fn native_and_maintenance_recovery_keep_escape_before_dequeue_and_during_admissi
                         Vec::new(),
                         "/compact retain decisions".into(),
                         Some("retain decisions".into()),
-                        false,
+                        ManualCompactionMode::Summary,
                         pending,
                     )
                 } else {
@@ -1428,7 +1435,7 @@ fn replay_keeps_its_maintenance_chain_when_nested_recall_and_compaction_are_refu
             before,
             "/shake".into(),
             None,
-            true,
+            ManualCompactionMode::Shake,
             after,
         );
         let controls: TurnControlSlot = Arc::default();
@@ -1584,7 +1591,7 @@ fn dropping_compaction_display_refresh_never_replays_an_installed_command() {
             Vec::new(),
             "/compact keep decisions".into(),
             Some("keep decisions".into()),
-            false,
+            ManualCompactionMode::Summary,
             after,
         );
         let stale = request.clone();

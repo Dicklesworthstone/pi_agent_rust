@@ -176,15 +176,25 @@ Creates a new session file starting from the current point (or a selected point)
 
 Manually triggers context compaction, without waiting for the automatic threshold. Pi also compacts automatically based on the `compaction` settings in `settings.json`.
 
-In the default terminal UI, `/compact [focus]`, `/compact shake`, and `/shake`
-can also be submitted while the agent is working. Earlier queued input runs
+In the default terminal UI, `/compact [focus]` summarizes older context with
+optional instructions. `/compact aggressive [focus]` (also `--aggressive`)
+halves the keep-recent window for this request without changing automatic
+compaction settings. It still preserves the latest authored turn, including
+native attachments, and complete tool-call/result pairs.
+`/compact shake [focus]` (also `--shake`) and `/shake [focus]` preserve
+conversation text and replace bulky older tool output with stubs without a
+summary model request. Shake focus text is passed to compaction extension hooks.
+
+All of these commands can also be submitted while the agent is working.
+Earlier queued input runs
 first; compaction waits for the active turn and its tools to finish and save.
 Later input waits behind compaction and then resumes with its prepared
 attachments and ordering intact. The command itself is never sent as a prompt.
 
 Only one compaction can be queued at a time. Before it starts, `Alt+Up` recalls
 unclaimed input for review, retaining captured attachment bytes and keeping
-the compaction command separate from model messages. Cancelling or failing
+the compaction command, chosen mode, and focus separate from model messages.
+Cancelling or failing
 the active turn returns unclaimed input to the owning session's editor
 instead of starting maintenance. Once compaction starts, the normal interrupt
 key cancels generation; an already admitted durable save finishes its

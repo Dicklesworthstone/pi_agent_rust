@@ -4,8 +4,9 @@
 //! actual compaction. A command never enters provider history as a user prompt.
 
 use super::{
-    EntryRole, PiFtuiModel, PiMsg, RestoredInput, Sender, TurnAbortSlot, TurnControlSlot,
-    UiCommand, run_controlled_turn_with_pending, send_conversation_reset, strip_command,
+    EntryRole, ManualCompactionMode, PiFtuiModel, PiMsg, RestoredInput, Sender, TurnAbortSlot,
+    TurnControlSlot, UiCommand, parse_compaction_command, run_controlled_turn_with_pending,
+    send_conversation_reset,
 };
 use crate::agent::AbortHandle;
 use crate::session_control::{PendingInput, SessionControlHandle, YieldBarrierId};
@@ -19,7 +20,7 @@ pub struct QueuedCompaction {
     barrier: YieldBarrierId,
     command: String,
     instructions: Option<String>,
-    shake: bool,
+    mode: ManualCompactionMode,
     abort: AbortHandle,
 }
 
@@ -28,7 +29,7 @@ impl std::fmt::Debug for QueuedCompaction {
         f.debug_struct("QueuedCompaction")
             .field("owner_session_id", &self.owner_session_id)
             .field("barrier", &self.barrier)
-            .field("shake", &self.shake)
+            .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
 }
@@ -53,7 +54,7 @@ impl QueuedCompaction {
             before,
             self.command.clone(),
             self.instructions.clone(),
-            self.shake,
+            self.mode,
             after,
         )
     }
@@ -61,13 +62,7 @@ impl QueuedCompaction {
 
 impl PiFtuiModel {
     pub(super) fn queue_compaction_command(&mut self, command: &str) -> bool {
-        let shake = command.eq_ignore_ascii_case("/shake")
-            || command.eq_ignore_ascii_case("/compact shake");
-        let focus = if shake {
-            ""
-        } else if let Some(focus) = strip_command(command, "/compact") {
-            focus.trim()
-        } else {
+        let Some((mode, instructions)) = parse_compaction_command(command) else {
             return false;
         };
         if self.replaying_input.is_some() {
@@ -126,8 +121,8 @@ impl PiFtuiModel {
             control,
             barrier,
             command: command.to_string(),
-            instructions: (!focus.is_empty()).then(|| focus.to_string()),
-            shake,
+            instructions: instructions.map(str::to_string),
+            mode,
             abort: AbortHandle::new().0,
         };
         // Publish the driver command before consuming the draft. A closed
@@ -283,19 +278,14 @@ pub(super) async fn run(
             let _ = tx.send(message);
         });
     let on_event = progress.callback();
-    let result = if request.shake {
-        handle
-            .shake_with_abort(request.abort.signal(), on_event)
-            .await
-    } else {
-        handle
-            .compact_with_abort(
-                request.instructions.as_deref(),
-                request.abort.signal(),
-                on_event,
-            )
-            .await
-    };
+    let result = handle
+        .compact_in_mode_with_abort(
+            request.mode,
+            request.instructions.as_deref(),
+            request.abort.signal(),
+            on_event,
+        )
+        .await;
     drop(progress);
     match result {
         Ok(true) => {

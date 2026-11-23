@@ -23349,8 +23349,13 @@ impl AgentSession {
         instructions: Option<&str>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
-        self.compact_manual(false, instructions, None, on_event)
-            .await
+        self.compact_manual(
+            compaction::ManualCompactionMode::Summary,
+            instructions,
+            None,
+            on_event,
+        )
+        .await
     }
 
     /// Manual compaction with explicit cancellation. Cancellation can retire
@@ -23362,7 +23367,26 @@ impl AgentSession {
         abort: &AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
-        self.compact_manual(false, instructions, Some(abort), on_event)
+        self.compact_manual(
+            compaction::ManualCompactionMode::Summary,
+            instructions,
+            Some(abort),
+            on_event,
+        )
+        .await
+    }
+
+    /// Compact with an invocation-specific policy and explicit cancellation.
+    /// Instructions reach extension hooks in every mode; only summary modes
+    /// send them to the summarizing provider.
+    pub async fn compact_now_in_mode_with_abort(
+        &mut self,
+        mode: compaction::ManualCompactionMode,
+        instructions: Option<&str>,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        self.compact_manual(mode, instructions, Some(abort), on_event)
             .await
     }
 
@@ -23374,7 +23398,13 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
-        self.compact_manual(true, None, None, on_event).await
+        self.compact_manual(
+            compaction::ManualCompactionMode::Shake,
+            None,
+            None,
+            on_event,
+        )
+        .await
     }
 
     /// Provider-free manual compaction with the same cancellation and durable
@@ -23384,23 +23414,33 @@ impl AgentSession {
         abort: &AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
-        self.compact_manual(true, None, Some(abort), on_event).await
+        self.compact_manual(
+            compaction::ManualCompactionMode::Shake,
+            None,
+            Some(abort),
+            on_event,
+        )
+        .await
     }
 
     async fn compact_manual(
         &mut self,
-        shake: bool,
+        mode: compaction::ManualCompactionMode,
         instructions: Option<&str>,
         abort: Option<&AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        let progress =
-            ManualCompactionProgress::start(on_event, shake.then(|| "shake".to_string()));
+        let progress_mode = match mode {
+            compaction::ManualCompactionMode::Summary => None,
+            compaction::ManualCompactionMode::Aggressive => Some("aggressive".to_string()),
+            compaction::ManualCompactionMode::Shake => Some("shake".to_string()),
+        };
+        let progress = ManualCompactionProgress::start(on_event, progress_mode);
         let outcome = self
             .compact_synchronous(
                 Arc::new(progress.callback()),
-                shake,
+                mode,
                 instructions,
                 None,
                 None,
@@ -23422,8 +23462,15 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false, None, Some(abort), None, None)
-            .await
+        self.compact_synchronous(
+            Arc::new(on_event),
+            compaction::ManualCompactionMode::Summary,
+            None,
+            Some(abort),
+            None,
+            None,
+        )
+        .await
     }
 
     /// Replace an older safe prefix with a model-generated continuation brief.
@@ -23452,7 +23499,7 @@ impl AgentSession {
         let changed = self
             .compact_synchronous(
                 Arc::new(on_event),
-                false,
+                compaction::ManualCompactionMode::Summary,
                 None,
                 None,
                 Some((focus, abort)),
@@ -24388,12 +24435,13 @@ impl AgentSession {
     async fn compact_synchronous(
         &mut self,
         on_event: AgentEventHandler,
-        shake: bool,
+        mode: compaction::ManualCompactionMode,
         instructions: Option<&str>,
         overflow_abort: Option<&AbortSignal>,
         handoff: Option<(&str, &AbortSignal)>,
         manual_abort: Option<&AbortSignal>,
     ) -> Result<bool> {
+        let shake = mode == compaction::ManualCompactionMode::Shake;
         // `compaction.enabled` is the automatic switch, as in OMP: it stops
         // overflow recovery, not a user's `/compact`, `/shake` or handoff.
         if !self.compaction_settings.enabled && overflow_abort.is_some() {
@@ -24456,6 +24504,9 @@ impl AgentSession {
                 )
             } else {
                 // `/compact` and `/shake`; automatic compaction does not run here.
+                if mode == compaction::ManualCompactionMode::Aggressive {
+                    settings.keep_recent_tokens /= 2;
+                }
                 compaction::prepare_manual_compaction(&entries, settings)
             };
             if let Some(prep) = prep.as_mut()

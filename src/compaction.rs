@@ -99,6 +99,20 @@ fn json_byte_len(value: &Value) -> usize {
 // Public types
 // =============================================================================
 
+/// Policy for one explicit compaction request. This never changes the
+/// session's automatic compaction configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ManualCompactionMode {
+    /// Summarize older context with the configured keep-recent window.
+    #[default]
+    Summary,
+    /// Summarize with half the configured keep-recent window, preserving
+    /// the latest authored turn and complete tool-call/result boundaries.
+    Aggressive,
+    /// Drop bulky tool output from older context without a model request.
+    Shake,
+}
+
 /// Auto-compaction mode policy (bd-cv653.3.18): how the automatic
 /// threshold-triggered compaction reclaims space. Manual `/compact` mode
 /// arguments override per invocation and do not consult this.

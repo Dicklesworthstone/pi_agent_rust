@@ -63,7 +63,7 @@ fn main() -> std::io::Result<()> {
                     let _ = agent_tx.send(PiMsg::System(note));
                     continue;
                 }
-                UiCommand::Compact { request, .. } | UiCommand::Shake { request } => {
+                UiCommand::Compact { request, .. } => {
                     let _ = agent_tx.send(PiMsg::CompactionFinished {
                         request_id: request.id().to_string(),
                         event: Box::new(PiMsg::System(String::from(

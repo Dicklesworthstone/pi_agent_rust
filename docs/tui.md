@@ -106,7 +106,8 @@ check the full `pi --version` output, including the commit hash.
 | `/changelog` | Show changelog entries. |
 | `/tree` | Show session branch tree summary. |
 | `/fork [id\|index]` | Fork from a user message (default: last on current path). |
-| `/compact [notes]` | Compact older context with optional instructions. |
+| `/compact [shake\|aggressive] [notes]` | Compact older context with optional instructions; `aggressive` keeps a smaller recent window, and `shake` drops bulky old tool output without a model request. |
+| `/shake [notes]` | Alias for `/compact shake [notes]`. |
 | `/reload` | Reload skills/prompts from disk. |
 | `/template <name> [args]` | Expand a prompt template by name. |
 | `/share` | Upload the current branch as bounded HTML to a secret, unlisted GitHub gist and show its URL. Secret gists are not private; anyone with the URL can view them. Pi redacts recognized secrets and the exact workspace cwd, but the transcript may still contain other sensitive local context. |
@@ -191,11 +192,19 @@ When Pi is busy generating a response or running tools, you can still type.
 
 The queue is visible above the editor when not empty.
 
-The default UI also accepts `/compact [focus]`, `/compact shake`, and `/shake`
-while working. They wait after earlier queued messages and hold later input
+The default UI also accepts `/compact [focus]`, `/compact aggressive [focus]`,
+`/compact shake [focus]`, and `/shake [focus]` while working. The mode flags
+`--aggressive` and `--shake` are accepted too. Aggressive compaction halves the
+configured keep-recent window for this request, preserving the latest authored
+turn and complete tool-call/result pairs. Shake keeps conversation text and
+drops bulky older tool output without asking the model to summarize it; focus
+text remains available to compaction extension hooks.
+
+These commands wait after earlier queued messages and hold later input
 until the current work is saved and compaction finishes. `Alt+Up` recalls
 waiting input for review, keeping a compaction command separate from model
-messages. Interrupting active compaction cancels its summary request and
+messages and preserving its chosen mode and focus. Interrupting active
+compaction cancels its summary request and
 preserves complete unclaimed input, including attachments. During recovered
 input replay, `Alt+Up` and new compaction requests are refused; Escape returns
 the unsent sequence. See [session compaction](session.md#compaction-compact)

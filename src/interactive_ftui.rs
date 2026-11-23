@@ -55,6 +55,7 @@ use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers, MouseEventKind};
 
 use crate::ask::{AskAnswer, AskResponse, AskUiRequest, QuestionReply};
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
+use crate::compaction::ManualCompactionMode;
 use crate::extensions::{ExtensionInteraction, ExtensionUiRequest, ExtensionUiResponse};
 use crate::interactive::{AutocompleteState, PiMsg, extension_commands_for_catalog};
 use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response};
@@ -1963,6 +1964,7 @@ pub enum UiCommand {
     /// compaction, with any focus text as summary instructions, and replays
     /// the rewritten history into the transcript.
     Compact {
+        mode: ManualCompactionMode,
         instructions: Option<String>,
         request: CompactionRequest,
     },
@@ -1973,9 +1975,6 @@ pub enum UiCommand {
         focus: String,
         request: HandoffRequest,
     },
-    /// OMP `/shake` (also `/compact shake`): compact by dropping bulky tool
-    /// output from the older span, with no model summary.
-    Shake { request: CompactionRequest },
     /// Control read-only planning and session-bound review (`/plan`).
     /// The driver retains the exact displayed proposal, not the UI command.
     Plan { action: String },
@@ -2226,6 +2225,33 @@ fn strip_command<'a>(input: &'a str, name: &str) -> Option<&'a str> {
     } else {
         None
     }
+}
+
+/// Parse maintenance intent once for immediate and queued requests. Only a
+/// leading, whole mode token is special; the remaining focus is literal text.
+fn parse_compaction_command(input: &str) -> Option<(ManualCompactionMode, Option<&str>)> {
+    let input = input.trim();
+    let (command, arguments) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+    let arguments = arguments.trim();
+    let (mode, instructions) = if command.eq_ignore_ascii_case("/shake") {
+        (ManualCompactionMode::Shake, arguments)
+    } else if command.eq_ignore_ascii_case("/compact") {
+        let (first, rest) = arguments
+            .split_once(char::is_whitespace)
+            .unwrap_or((arguments, ""));
+        if first.eq_ignore_ascii_case("shake") || first.eq_ignore_ascii_case("--shake") {
+            (ManualCompactionMode::Shake, rest.trim())
+        } else if first.eq_ignore_ascii_case("aggressive")
+            || first.eq_ignore_ascii_case("--aggressive")
+        {
+            (ManualCompactionMode::Aggressive, rest.trim())
+        } else {
+            (ManualCompactionMode::Summary, arguments)
+        }
+    } else {
+        return None;
+    };
+    Some((mode, (!instructions.is_empty()).then_some(instructions)))
 }
 
 /// Agent activity as the UI sees it. Drives which surfaces accept input:
@@ -5923,20 +5949,8 @@ impl PiFtuiModel {
             });
             return true;
         }
-        let canon = clean.to_ascii_lowercase();
-        if canon == "/shake" || canon == "/compact shake" {
-            self.start_compaction_command(clean, true, None);
-            return true;
-        }
-        if let Some(focus) = strip_command(clean, "/compact") {
-            // OMP parseCompactArgs: text after `/compact` is focus for the
-            // summary (it used to fall through to "not implemented").
-            let focus = focus.trim();
-            self.start_compaction_command(
-                clean,
-                false,
-                (!focus.is_empty()).then(|| focus.to_string()),
-            );
+        if let Some((mode, instructions)) = parse_compaction_command(clean) {
+            self.start_compaction_command(clean, mode, instructions.map(str::to_string));
             return true;
         }
         if let Some(rest) = strip_command(clean, "/undo") {
@@ -6040,7 +6054,7 @@ impl PiFtuiModel {
                 EntryRole::System,
                 String::from(
                     "pi commands: /model or /switch [model[:level]], /queue <message>, /resume, /new, \
-                     /session, /name <name>, /plan, /goal status, /compact [focus], /tree, /undo [n], /redo [n], \
+                     /session, /name <name>, /plan, /goal status, /compact [shake|aggressive] [focus], /tree, /undo [n], /redo [n], \
                      /export [path], /copy [code|cmd|link], /dump, /pin, /delete, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
                      /thinking or /effort [level], /fast [tier], /skillful [on|off|status], /branch (or Esc Esc), /theme [name], /changelog, /clear, /hotkeys, \
@@ -6881,7 +6895,7 @@ impl PiFtuiModel {
     fn start_compaction_command(
         &mut self,
         command: &str,
-        shake: bool,
+        mode: ManualCompactionMode,
         instructions: Option<String>,
     ) {
         let Some(owner_session_id) = self.displayed_session_id.clone() else {
@@ -6893,15 +6907,10 @@ impl PiFtuiModel {
             return;
         };
         let request = CompactionRequest::new(owner_session_id);
-        let work = if shake {
-            UiCommand::Shake {
-                request: request.clone(),
-            }
-        } else {
-            UiCommand::Compact {
-                instructions,
-                request: request.clone(),
-            }
+        let work = UiCommand::Compact {
+            mode,
+            instructions,
+            request: request.clone(),
         };
         if !self.try_send_command(work) {
             self.input.set_text(command);
@@ -6912,10 +6921,10 @@ impl PiFtuiModel {
             return;
         }
         self.compaction_request = Some(request);
-        let label = if shake {
-            "shaking conversation ..."
-        } else {
-            "compacting conversation ..."
+        let label = match mode {
+            ManualCompactionMode::Shake => "shaking conversation ...",
+            ManualCompactionMode::Aggressive => "compacting conversation aggressively ...",
+            ManualCompactionMode::Summary => "compacting conversation ...",
         };
         self.begin_busy(label);
         self.push_entry(EntryRole::System, label.to_string());
@@ -12212,12 +12221,12 @@ async fn run_prewalk_command(
 
 /// Handle `/compact` in the driver: run compaction with events translated to
 /// the UI, then replay the rewritten history into the transcript.
-/// `/compact`, or with `shake` OMP's `/shake` (drop bulky tool output, no
-/// model summary). The admitted request owns cancellation through the
+/// Supports ordinary/aggressive summaries and OMP's provider-free shake.
+/// The admitted request owns cancellation through the
 /// persistence boundary; only its terminal reply releases the UI owner.
 async fn run_compact_command(
     handle: &mut crate::sdk::AgentSessionHandle,
-    shake: bool,
+    mode: ManualCompactionMode,
     instructions: Option<&str>,
     request: CompactionRequest,
     agent_tx: &Sender<PiMsg>,
@@ -12226,7 +12235,7 @@ async fn run_compact_command(
 ) -> bool {
     run_compact_command_with_receipt(
         handle,
-        shake,
+        mode,
         instructions,
         request,
         agent_tx,
@@ -12242,7 +12251,7 @@ async fn run_compact_command(
 #[allow(clippy::too_many_arguments)]
 async fn run_compact_command_with_receipt(
     handle: &mut crate::sdk::AgentSessionHandle,
-    shake: bool,
+    mode: ManualCompactionMode,
     instructions: Option<&str>,
     request: CompactionRequest,
     agent_tx: &Sender<PiMsg>,
@@ -12253,10 +12262,10 @@ async fn run_compact_command_with_receipt(
     let _operation_abort =
         queued_compaction::OperationAbort::publish(turn_abort, turn_control, &request.abort);
     let signal = request.abort.signal();
-    let (label, done) = if shake {
-        ("shake", "conversation shaken: bulky tool output dropped")
-    } else {
-        ("compact", "conversation compacted")
+    let (label, done) = match mode {
+        ManualCompactionMode::Shake => ("shake", "conversation shaken: bulky tool output dropped"),
+        ManualCompactionMode::Aggressive => ("compact", "conversation compacted aggressively"),
+        ManualCompactionMode::Summary => ("compact", "conversation compacted"),
     };
     let owner = {
         let read = handle.with_session(|session| session.header.id.clone());
@@ -12275,13 +12284,9 @@ async fn run_compact_command_with_receipt(
                 let _ = tx.send(msg);
             });
             let on_event = progress.callback();
-            let result = if shake {
-                handle.shake_with_abort(signal, on_event).await
-            } else {
-                handle
-                    .compact_with_abort(instructions, signal, on_event)
-                    .await
-            };
+            let result = handle
+                .compact_in_mode_with_abort(mode, instructions, signal, on_event)
+                .await;
             drop(progress);
             match result {
                 // Once installation commits, refresh the durable result even
@@ -14974,12 +14979,13 @@ pub fn run(
                             .await;
                         }
                         Ok(UiCommand::Compact {
+                            mode,
                             instructions,
                             request,
                         }) => {
                             run_compact_command(
                                 &mut handle,
-                                false,
+                                mode,
                                 instructions.as_deref(),
                                 request,
                                 &agent_tx,
@@ -15000,18 +15006,6 @@ pub fn run(
                         }
                         Ok(UiCommand::Handoff { focus, request }) => {
                             run_handoff_command(&mut handle, &focus, request, &agent_tx).await;
-                        }
-                        Ok(UiCommand::Shake { request }) => {
-                            run_compact_command(
-                                &mut handle,
-                                true,
-                                None,
-                                request,
-                                &agent_tx,
-                                &driver_turn_control,
-                                &driver_turn_abort,
-                            )
-                            .await;
                         }
                         Ok(UiCommand::Plan { action }) => {
                             plans.run(&mut handle, &action, &agent_tx).await;
@@ -26251,12 +26245,14 @@ mod tests {
         type_str(&mut sim, "/compact");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         let UiCommand::Compact {
+            mode,
             instructions,
             request,
         } = submit_rx.try_recv().expect("routed")
         else {
             panic!("compact route");
         };
+        assert_eq!(mode, ManualCompactionMode::Summary);
         assert!(instructions.is_none());
         assert_eq!(request.owner_session_id, "compact-owner");
         assert!(!request.abort.signal().is_aborted());
@@ -26313,15 +26309,50 @@ mod tests {
     /// As in OMP and on the classic stack, the text steers the summary.
     #[test]
     fn slash_compact_passes_focus_text_as_instructions() {
-        for (typed, expected_instructions, shake) in [
+        for (typed, expected_instructions, expected_mode) in [
             (
                 "/compact keep the Auth decision",
                 Some("keep the Auth decision"),
-                false,
+                ManualCompactionMode::Summary,
             ),
-            ("/COMPACT", None, false),
-            ("/compact shake", None, true),
-            ("/shake", None, true),
+            ("/COMPACT", None, ManualCompactionMode::Summary),
+            ("/compact shake", None, ManualCompactionMode::Shake),
+            ("/shake", None, ManualCompactionMode::Shake),
+            (
+                "/compact aggressive",
+                None,
+                ManualCompactionMode::Aggressive,
+            ),
+            (
+                "/compact --aggressive Keep Auth",
+                Some("Keep Auth"),
+                ManualCompactionMode::Aggressive,
+            ),
+            (
+                "/compact AGGRESSIVE\tKeep  Spacing",
+                Some("Keep  Spacing"),
+                ManualCompactionMode::Aggressive,
+            ),
+            (
+                "/compact shake Keep Auth",
+                Some("Keep Auth"),
+                ManualCompactionMode::Shake,
+            ),
+            (
+                "/compact --shake Keep Auth",
+                Some("Keep Auth"),
+                ManualCompactionMode::Shake,
+            ),
+            (
+                "/shake Keep Auth",
+                Some("Keep Auth"),
+                ManualCompactionMode::Shake,
+            ),
+            (
+                "/compact aggressively preserve this",
+                Some("aggressively preserve this"),
+                ManualCompactionMode::Summary,
+            ),
         ] {
             let (_agent_tx, rx) = mpsc::channel();
             let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
@@ -26329,19 +26360,18 @@ mod tests {
             model.displayed_session_id = Some("compact-owner".into());
             let mut sim = ProgramSimulator::new(model);
             sim.init();
-            type_str(&mut sim, typed);
+            sim.model_mut().input.set_text(typed);
             sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-            let request = match submit_rx.try_recv().expect("compact command") {
-                UiCommand::Compact {
-                    instructions,
-                    request,
-                } if !shake => {
-                    assert_eq!(instructions.as_deref(), expected_instructions, "{typed}");
-                    request
-                }
-                UiCommand::Shake { request } if shake => request,
-                command => panic!("unexpected route for {typed}: {command:?}"),
+            let UiCommand::Compact {
+                mode,
+                instructions,
+                request,
+            } = submit_rx.try_recv().expect("compact command")
+            else {
+                panic!("unexpected route for {typed}");
             };
+            assert_eq!(mode, expected_mode, "{typed}");
+            assert_eq!(instructions.as_deref(), expected_instructions, "{typed}");
             assert_eq!(request.owner_session_id, "compact-owner");
             assert!(!request.abort.signal().is_aborted());
         }
@@ -27337,12 +27367,10 @@ mod tests {
             sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
             let command = submit_rx.try_recv().expect("routed");
             let reply = match &command {
-                UiCommand::Compact { request, .. } | UiCommand::Shake { request } => {
-                    PiMsg::CompactionFinished {
-                        request_id: request.id.clone(),
-                        event: Box::new(PiMsg::System("done".into())),
-                    }
-                }
+                UiCommand::Compact { request, .. } => PiMsg::CompactionFinished {
+                    request_id: request.id.clone(),
+                    event: Box::new(PiMsg::System("done".into())),
+                },
                 _ => PiMsg::System("done".into()),
             };
             sim.send(PiFtuiMsg::Agent(reply));
@@ -27372,7 +27400,13 @@ mod tests {
         );
         assert_eq!(send("/fresh"), UiCommand::Fresh);
         assert_eq!(send("/retry"), UiCommand::Retry);
-        assert!(matches!(send("/shake"), UiCommand::Shake { .. }));
+        assert!(matches!(
+            send("/shake"),
+            UiCommand::Compact {
+                mode: ManualCompactionMode::Shake,
+                ..
+            }
+        ));
         assert_eq!(
             send("/template"),
             UiCommand::Info(info_commands::InfoCommand::Templates)
@@ -27384,7 +27418,13 @@ mod tests {
                 args: String::from("src/a.rs")
             }
         );
-        assert!(matches!(send("/compact shake"), UiCommand::Shake { .. }));
+        assert!(matches!(
+            send("/compact shake"),
+            UiCommand::Compact {
+                mode: ManualCompactionMode::Shake,
+                ..
+            }
+        ));
         assert_eq!(
             send("/checkpoint before-refactor risky part"),
             UiCommand::Checkpoint {
@@ -32541,7 +32581,11 @@ mod tests {
             for command in [
                 "/compact",
                 "/compact keep decisions",
+                "/compact aggressive keep decisions",
+                "/compact --aggressive keep decisions",
                 "/compact shake",
+                "/compact shake keep decisions",
+                "/compact --shake keep decisions",
                 "/shake",
             ] {
                 let provider = Arc::new(NativePromptProbe::default());
@@ -32564,13 +32608,13 @@ mod tests {
                 sim.init();
                 type_str(&mut sim, command);
                 sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-                let (shake, instructions, request) = match submit_rx.try_recv().unwrap() {
-                    UiCommand::Compact {
-                        instructions,
-                        request,
-                    } => (false, instructions, request),
-                    UiCommand::Shake { request } => (true, None, request),
-                    command => panic!("unexpected compaction route: {command:?}"),
+                let UiCommand::Compact {
+                    mode,
+                    instructions,
+                    request,
+                } = submit_rx.try_recv().unwrap()
+                else {
+                    panic!("unexpected compaction route");
                 };
                 let signal = request.abort.signal();
                 // A previous turn and unrelated notices can arrive after UI
@@ -32609,7 +32653,7 @@ mod tests {
                 assert!(sim.model().compaction_request.is_some());
                 run_compact_command(
                     &mut handle,
-                    shake,
+                    mode,
                     instructions.as_deref(),
                     request,
                     &tx,
@@ -32626,7 +32670,7 @@ mod tests {
                 assert!(sim.model().busy.is_none());
                 assert_eq!(sim.model().state, AgentUiState::Ready);
                 assert_eq!(sim.model().input.text(), "waiting draft");
-                let cancelled = if shake {
+                let cancelled = if mode == ManualCompactionMode::Shake {
                     "shake cancelled"
                 } else {
                     "compact cancelled"
@@ -32682,6 +32726,199 @@ mod tests {
         )
     }
 
+    fn compaction_mode_handle(provider: Arc<NativePromptProbe>) -> crate::sdk::AgentSessionHandle {
+        use crate::compaction::{
+            AutoCompactionMethod, AutoCompactionMode, ResolvedCompactionSettings,
+        };
+        use crate::model::{
+            AssistantMessage, ContentBlock, ImageContent, TextContent, ToolCall, UserContent,
+        };
+        use crate::session::SessionMessage;
+
+        let mut stored = crate::session::Session::in_memory();
+        for index in 0..4 {
+            let mut content = vec![ContentBlock::Text(TextContent::new(
+                format!("question {index} with important decisions ").repeat(40),
+            ))];
+            if index == 3 {
+                content.push(ContentBlock::Image(ImageContent {
+                    data: "aGVsbG8=".into(),
+                    mime_type: "image/png".into(),
+                }));
+            }
+            stored.append_message(SessionMessage::User {
+                content: UserContent::Blocks(content),
+                timestamp: Some(index),
+            });
+            stored.append_message(SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        id: format!("read-{index}"),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": format!("notes-{index}.txt")}),
+                        thought_signature: None,
+                    })],
+                    stop_reason: StopReason::ToolUse,
+                    ..Default::default()
+                },
+            });
+            stored.append_message(SessionMessage::ToolResult {
+                tool_call_id: format!("read-{index}"),
+                tool_name: "read".into(),
+                content: vec![ContentBlock::Text(TextContent::new(
+                    format!("bulky-tool-{index} output line\n").repeat(100),
+                ))],
+                details: None,
+                is_error: false,
+                timestamp: Some(index),
+            });
+            stored.append_message(SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(format!(
+                        "answer {index}"
+                    )))],
+                    stop_reason: StopReason::Stop,
+                    ..Default::default()
+                },
+            });
+        }
+        // Put the ordinary budget inside the penultimate user's text. This
+        // selects two complete turns with either the heuristic or BPE counter;
+        // half that budget selects only the latest turn, including its image.
+        let messages = stored.to_messages_for_current_path();
+        let keep_recent_tokens = u32::try_from(
+            crate::compaction::estimate_model_context_tokens(&messages[8..])
+                - crate::compaction::estimate_model_context_tokens(&messages[8..9]) / 2,
+        )
+        .unwrap();
+        let mut agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::from_tools(Vec::new()),
+            crate::agent::AgentConfig::default(),
+        );
+        agent.replace_messages(messages);
+        crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            crate::agent::AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(stored)),
+                false,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    keep_recent_tokens,
+                    mode: AutoCompactionMode::Aggressive,
+                    method_order: Some(vec![
+                        AutoCompactionMethod::Shake,
+                        AutoCompactionMethod::Soft,
+                    ]),
+                    ..Default::default()
+                },
+            ),
+            crate::sdk::EventListeners::default(),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_compaction_modes_keep_safe_tails_and_invocation_only_settings() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (command, expected_cut, shake) in [
+                ("/compact Keep  migration IDs", 8, false),
+                ("/compact --aggressive Keep  migration IDs", 12, false),
+                ("/compact --shake Keep  migration IDs", 8, true),
+                ("/shake Keep  migration IDs", 8, true),
+            ] {
+                let provider = Arc::new(NativePromptProbe::default());
+                let mut handle = compaction_mode_handle(Arc::clone(&provider));
+                let settings = format!("{:?}", handle.compaction_settings());
+                let (owner, original, first_kept) = handle
+                    .with_session(|session| {
+                        (
+                            session.header.id.clone(),
+                            session.to_messages_for_current_path(),
+                            session.entries[expected_cut].base_id().unwrap().clone(),
+                        )
+                    })
+                    .await
+                    .unwrap();
+                let (submit, commands) = mpsc::channel();
+                let (_, model) = new_model();
+                let mut model = model.with_submit_channel(submit);
+                model.displayed_session_id = Some(owner);
+                model.input.set_text(command);
+                model.submit_input();
+                let UiCommand::Compact {
+                    mode,
+                    instructions,
+                    request,
+                } = commands.try_recv().unwrap()
+                else {
+                    panic!("manual command must reach its native driver");
+                };
+                let (tx, rx) = mpsc::channel();
+                let controls: TurnControlSlot = Arc::default();
+                let aborts: TurnAbortSlot = Arc::default();
+                assert!(
+                    run_compact_command(
+                        &mut handle,
+                        mode,
+                        instructions.as_deref(),
+                        request,
+                        &tx,
+                        &controls,
+                        &aborts,
+                    )
+                    .await,
+                    "{command}"
+                );
+                assert_eq!(format!("{:?}", handle.compaction_settings()), settings);
+                assert!(aborts.lock().unwrap().is_none());
+                assert!(rx.try_iter().any(|event| matches!(event,
+                    PiMsg::CompactionFinished { event, .. }
+                        if matches!(*event, PiMsg::ConversationReset { .. })
+                )));
+                handle
+                    .with_session(|session| {
+                        let crate::session::SessionEntry::Compaction(entry) =
+                            session.entries.last().unwrap()
+                        else {
+                            panic!("native compaction must install a checkpoint");
+                        };
+                        assert_eq!(entry.first_kept_entry_id, first_kept, "{command}");
+                        let active = session.to_messages_for_current_path();
+                        let tail = &original[expected_cut..];
+                        assert_eq!(
+                            serde_json::to_value(&active[active.len() - tail.len()..]).unwrap(),
+                            serde_json::to_value(tail).unwrap(),
+                            "authored text, native image and complete tool pairs survive {command}",
+                        );
+                        if shake {
+                            assert!(entry.summary.contains("Context Checkpoint (shake)"));
+                            assert!(entry.summary.contains("bytes dropped; re-run if needed"));
+                            assert!(entry.summary.contains("question 0"));
+                            assert!(!entry.summary.contains("bulky-tool-0 output line"));
+                        }
+                    })
+                    .await
+                    .unwrap();
+                let calls = provider.calls.lock().unwrap();
+                if shake {
+                    assert!(
+                        calls.is_empty(),
+                        "shake with notes never invokes the summarizer"
+                    );
+                } else {
+                    assert_eq!(calls.len(), 1);
+                    let prompt = serde_json::to_string(&calls[0].content).unwrap();
+                    assert!(prompt.contains("Keep  migration IDs"));
+                    assert!(!prompt.contains("--aggressive Keep"));
+                }
+            }
+        });
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn idle_compaction_cancels_session_admission_and_summary_on_escape_or_shutdown() {
@@ -32689,7 +32926,13 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            for (shake, lock_session) in [(false, true), (true, true), (false, false)] {
+            for (mode, lock_session) in [
+                (ManualCompactionMode::Summary, true),
+                (ManualCompactionMode::Shake, true),
+                (ManualCompactionMode::Aggressive, true),
+                (ManualCompactionMode::Summary, false),
+                (ManualCompactionMode::Aggressive, false),
+            ] {
                 for shutdown in [false, true] {
                     let provider = Arc::new(NativePromptProbe {
                         pause_after_record: true,
@@ -32720,7 +32963,7 @@ mod tests {
                     let held = lock_session.then(|| store.try_lock().unwrap());
                     let mut operation = Box::pin(run_compact_command(
                         &mut handle,
-                        shake,
+                        mode,
                         Some("retain decisions"),
                         request,
                         &tx,
@@ -32814,7 +33057,7 @@ mod tests {
                 let (tx, rx) = mpsc::channel();
                 run_compact_command(
                     &mut handle,
-                    false,
+                    ManualCompactionMode::Summary,
                     Some("preserve decisions"),
                     request,
                     &tx,
@@ -32866,6 +33109,168 @@ mod tests {
                             terminal[0], PiMsg::System(message)
                                 if message == "compact cancelled"
                         ));
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn queued_and_recalled_compaction_preserve_mode_focus_and_native_input_order() {
+        use crate::model::{ContentBlock, ImageContent, TextContent, UserContent};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for recall in [false, true] {
+                for (command, expected_cut, shake) in [
+                    ("/compact Keep  queued decisions", 8, false),
+                    ("/compact aggressive Keep  queued decisions", 12, false),
+                    ("/compact shake Keep  queued decisions", 8, true),
+                ] {
+                    let provider = Arc::new(NativePromptProbe::default());
+                    let mut handle = compaction_mode_handle(Arc::clone(&provider));
+                    let settings = format!("{:?}", handle.compaction_settings());
+                    let (owner, first_kept) = handle
+                        .with_session(|session| {
+                            (
+                                session.header.id.clone(),
+                                session.entries[expected_cut].base_id().unwrap().clone(),
+                            )
+                        })
+                        .await
+                        .unwrap();
+                    let turn = handle.prompt_controlled("initial".into(), |_| {});
+                    let control = turn.control();
+                    let controls = published_turn_control(control.clone());
+                    let aborts: TurnAbortSlot = Arc::default();
+                    let (submit, commands) = mpsc::channel();
+                    let (_, model) = new_model();
+                    let mut model = model
+                        .with_submit_channel(submit)
+                        .with_turn_control(Arc::clone(&controls))
+                        .with_turn_abort(Arc::clone(&aborts));
+                    model.displayed_session_id = Some(owner);
+                    control.follow_up("before").unwrap();
+                    assert!(model.queue_compaction_command(command));
+                    let after = UserContent::Blocks(vec![
+                        ContentBlock::Text(TextContent::new("prepared following input")),
+                        ContentBlock::Image(ImageContent {
+                            data: "d29ybGQ=".into(),
+                            mime_type: "image/png".into(),
+                        }),
+                    ]);
+                    control
+                        .follow_up_with_content(&after, "after @original.png")
+                        .unwrap();
+                    let UiCommand::QueuedCompact(request) = commands.try_recv().unwrap() else {
+                        panic!("native queued maintenance");
+                    };
+                    turn.await.unwrap();
+                    controls.lock().unwrap().current = None;
+                    assert!(request.is_pending());
+                    assert_eq!(
+                        provider.calls.lock().unwrap().len(),
+                        2,
+                        "earlier input completes while later input remains behind the barrier"
+                    );
+                    let (tx, rx) = mpsc::channel();
+                    if recall {
+                        let restored = model.take_queued_compaction().unwrap();
+                        assert_eq!(restored.text(), command);
+                        assert!(!control.has_yield_barrier());
+                        queued_compaction::run(&mut handle, request, &tx, &controls, &aborts).await;
+                        assert_eq!(
+                            provider.calls.lock().unwrap().len(),
+                            2,
+                            "the stale queued command cannot reclaim recalled input"
+                        );
+                        let (events, received) = mpsc::channel();
+                        goal_control::run_restored(
+                            &mut handle,
+                            restored,
+                            &tx,
+                            &events,
+                            &controls,
+                            Arc::clone(&aborts),
+                        )
+                        .await;
+                        assert_eq!(
+                            provider.calls.lock().unwrap().len(),
+                            if shake { 2 } else { 3 }
+                        );
+                        let goal_control::Event::Pending(following) = received.try_recv().unwrap()
+                        else {
+                            panic!("following input still requires separate review");
+                        };
+                        assert_eq!(following.text(), "after @original.png");
+                        assert!(received.try_recv().is_err());
+                        goal_control::run_restored(
+                            &mut handle,
+                            following,
+                            &tx,
+                            &events,
+                            &controls,
+                            Arc::clone(&aborts),
+                        )
+                        .await;
+                        assert!(received.try_recv().is_err());
+                    } else {
+                        queued_compaction::run(&mut handle, request, &tx, &controls, &aborts).await;
+                    }
+                    assert!(!control.has_yield_barrier());
+                    assert!(aborts.lock().unwrap().is_none());
+                    assert_eq!(format!("{:?}", handle.compaction_settings()), settings);
+                    assert!(!rx.try_iter().any(|event| matches!(
+                        event,
+                        PiMsg::AgentError(_) | PiMsg::RestorePreparedInput(_)
+                    )));
+                    handle
+                        .with_session(|session| {
+                            let checkpoints = session
+                                .entries
+                                .iter()
+                                .filter_map(|entry| match entry {
+                                    crate::session::SessionEntry::Compaction(entry) => Some(entry),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(checkpoints.len(), 1);
+                            assert_eq!(
+                                checkpoints[0].first_kept_entry_id, first_kept,
+                                "{command}, recalled={recall}"
+                            );
+                            if shake {
+                                assert!(
+                                    checkpoints[0]
+                                        .summary
+                                        .contains("Context Checkpoint (shake)")
+                                );
+                                assert!(
+                                    !checkpoints[0].summary.contains("bulky-tool-0 output line")
+                                );
+                            }
+                        })
+                        .await
+                        .unwrap();
+                    let calls = provider.calls.lock().unwrap();
+                    assert_eq!(calls.len(), if shake { 3 } else { 4 });
+                    assert!(
+                        matches!(&calls[0].content, UserContent::Text(text) if text == "initial")
+                    );
+                    assert!(
+                        matches!(&calls[1].content, UserContent::Text(text) if text == "before")
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&calls.last().unwrap().content).unwrap(),
+                        serde_json::to_value(&after).unwrap()
+                    );
+                    if !shake {
+                        let prompt = serde_json::to_string(&calls[2].content).unwrap();
+                        assert!(prompt.contains("Additional focus: Keep  queued decisions"));
+                        assert!(!prompt.contains(command));
                     }
                 }
             }

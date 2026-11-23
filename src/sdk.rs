@@ -47,7 +47,9 @@ pub use crate::agent::{
 pub use crate::agent_cx::AgentCx;
 pub use crate::approval::{ApprovalMode, ApprovalState};
 pub use crate::ask::{AskAnswer, AskResponse};
-pub use crate::compaction::{AutoCompactionMethod, CompactionReader, ResolvedCompactionSettings};
+pub use crate::compaction::{
+    AutoCompactionMethod, CompactionReader, ManualCompactionMode, ResolvedCompactionSettings,
+};
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
 pub use crate::extension_dispatcher::ExtensionUiHandler;
@@ -4273,6 +4275,23 @@ impl AgentSessionHandle {
         let on_event = self.make_combined_callback(on_event);
         self.session
             .compact_now_with_abort(instructions, &abort, on_event)
+            .await
+    }
+
+    /// Compact with an explicit policy for this request. Aggressive mode
+    /// halves the keep-recent window without changing automatic settings.
+    /// All modes preserve hooks, source validation and durable installation;
+    /// shake forwards instructions to hooks without a summary model request.
+    pub async fn compact_in_mode_with_abort(
+        &mut self,
+        mode: ManualCompactionMode,
+        instructions: Option<&str>,
+        abort: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session
+            .compact_now_in_mode_with_abort(mode, instructions, &abort, on_event)
             .await
     }
 

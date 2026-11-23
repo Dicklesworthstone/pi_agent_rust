@@ -298,7 +298,7 @@ pub struct RestoredInput {
 struct RestoredCompaction {
     command: String,
     instructions: Option<String>,
-    shake: bool,
+    mode: super::ManualCompactionMode,
     request: super::CompactionRequest,
 }
 
@@ -396,7 +396,7 @@ impl RestoredInput {
         before: Vec<PendingInput>,
         command: String,
         instructions: Option<String>,
-        shake: bool,
+        mode: super::ManualCompactionMode,
         after: Vec<PendingInput>,
     ) -> Self {
         let mut steps = VecDeque::new();
@@ -407,7 +407,7 @@ impl RestoredInput {
         maintenance.compaction = Some(RestoredCompaction {
             command,
             instructions,
-            shake,
+            mode,
             request: super::CompactionRequest::new(owner.clone()),
         });
         steps.push_back(maintenance);
@@ -986,7 +986,7 @@ pub(super) async fn run_restored(
     if let Some(compaction) = recovery.compaction.clone() {
         super::run_compact_command_with_receipt(
             handle,
-            compaction.shake,
+            compaction.mode,
             compaction.instructions.as_deref(),
             compaction.request,
             agent_tx,
