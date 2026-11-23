@@ -1122,27 +1122,10 @@ impl SubagentTask {
         previous: Option<&SubagentResult>,
     ) -> std::result::Result<(), &'static str> {
         let raw = previous.map_or("", |result| result.output.as_str());
-        let marker = concat!("{", "previous", "}");
-        let limit = task_file::MAX_BYTES;
-        // Count before replace allocates: a small repeated token can otherwise
-        // amplify a bounded file and bounded predecessor into gigabytes.
-        let count = self.task.matches(marker).count();
-        let unchanged = self.task.len() - count * marker.len();
-        if count
-            .checked_mul(raw.len())
-            .and_then(|bytes| bytes.checked_add(unchanged))
-            .is_none_or(|bytes| bytes > limit)
-        {
-            return Err(CHAIN_TASK_LIMIT);
-        }
-        let mut rendered = self.task.replace(marker, raw);
-        if let Some(data) = previous
+        let data = previous
             .filter(|result| result.schema_valid == Some(true))
-            .and_then(|result| result.data.as_ref())
-        {
-            rendered = render_previous_data_fields(&rendered, data, limit)?;
-        }
-        self.task = rendered;
+            .and_then(|result| result.data.as_ref());
+        self.task = render_chain_template(&self.task, raw, data, task_file::MAX_BYTES)?;
         Ok(())
     }
 }
@@ -1162,40 +1145,58 @@ fn push_chain_part(
     Ok(())
 }
 
-/// Replace `{{previous.data.<path>}}` tokens with values addressed out of the
-/// prior task's parsed `data`. Scalars render bare; objects/arrays render as
-/// compact JSON. Missing paths leave the token untouched.
-fn render_previous_data_fields(
+/// Interpret placeholders only in the authored template. Predecessor output
+/// and resolved field values are literal data, even when they contain another
+/// placeholder or form one together with adjacent template text. A closed
+/// typed candidate is one token, including any nested marker text, regardless
+/// of whether schema-valid data can resolve it. Bound every append before
+/// allocating an expanded prompt.
+fn render_chain_template(
     task: &str,
-    data: &Value,
+    raw: &str,
+    data: Option<&Value>,
     limit: usize,
 ) -> std::result::Result<String, &'static str> {
+    const RAW: &str = "{previous}";
     const OPEN: &str = "{{previous.data.";
     const CLOSE: &str = "}}";
-    let mut rendered = String::with_capacity(task.len());
+    let mut rendered = String::with_capacity(task.len().min(limit));
     let mut rest = task;
-    while let Some(start) = rest.find(OPEN) {
+    let mut typed_tokens_can_close = true;
+    while let Some(start) = rest.find('{') {
         push_chain_part(&mut rendered, &rest[..start], limit)?;
-        let after_open = &rest[start + OPEN.len()..];
-        let Some(end) = after_open.find(CLOSE) else {
-            push_chain_part(&mut rendered, &rest[start..], limit)?;
-            return Ok(rendered);
-        };
-        let path = &after_open[..end];
-        let pointer = format!("/{}", path.replace('.', "/"));
-        match data.pointer(&pointer) {
-            Some(Value::String(text)) => push_chain_part(&mut rendered, text, limit)?,
-            Some(Value::Null) | None => {
-                // Leave the token verbatim so the miss is visible.
-                push_chain_part(
-                    &mut rendered,
-                    &rest[start..start + OPEN.len() + end + CLOSE.len()],
-                    limit,
-                )?;
+        rest = &rest[start..];
+        if let Some(tail) = rest.strip_prefix(RAW) {
+            push_chain_part(&mut rendered, raw, limit)?;
+            rest = tail;
+        } else if typed_tokens_can_close
+            && let Some(after_open) = rest.strip_prefix(OPEN)
+        {
+            let Some(end) = after_open.find(CLOSE) else {
+                // No later typed token can close either. Stop searching for
+                // delimiters, but still expand later authored raw tokens.
+                typed_tokens_can_close = false;
+                continue;
+            };
+            let path = &after_open[..end];
+            let pointer = format!("/{}", path.replace('.', "/"));
+            match data.and_then(|value| value.pointer(&pointer)) {
+                Some(Value::String(text)) => push_chain_part(&mut rendered, text, limit)?,
+                Some(Value::Null) | None => {
+                    // Leave the token verbatim so the miss is visible.
+                    push_chain_part(
+                        &mut rendered,
+                        &rest[..OPEN.len() + end + CLOSE.len()],
+                        limit,
+                    )?;
+                }
+                Some(value) => push_chain_part(&mut rendered, &value.to_string(), limit)?, // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each authored typed substitution serializes a predecessor-bounded value before enforcing the total prompt byte limit.
             }
-            Some(value) => push_chain_part(&mut rendered, &value.to_string(), limit)?, // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each requested typed substitution serializes a predecessor-bounded value before enforcing the total prompt byte limit.
+            rest = &after_open[end + CLOSE.len()..];
+        } else {
+            push_chain_part(&mut rendered, "{", limit)?;
+            rest = &rest[1..];
         }
-        rest = &after_open[end + CLOSE.len()..];
     }
     push_chain_part(&mut rendered, rest, limit)?;
     Ok(rendered)
@@ -2595,6 +2596,108 @@ mod tests {
         invalid.data = Some(json!({"verdict": "pass"}));
         base.render_previous_result(Some(&invalid)).unwrap();
         assert!(base.task.contains("{{previous.data.verdict}}"));
+    }
+
+    #[test]
+    fn chain_substitutions_keep_predecessor_template_syntax_literal() {
+        let data = json!({
+            "value": "{{previous.data.number}} {previous}",
+            "number": 7,
+            "nested": {"text": "{{previous.data.number}}"},
+            "open": "{{"
+        });
+        let raw = "source: {previous} {{previous.data.number}} {{previous.data.";
+        let template = "raw=[{previous}] value=[{{previous.data.value}}] nested=[{{previous.data.nested}}]";
+        assert_eq!(
+            render_chain_template(template, raw, Some(&data), 4096).unwrap(),
+            format!(
+                "raw=[{raw}] value=[{}] nested=[{}]",
+                data["value"].as_str().unwrap(),
+                data["nested"]
+            )
+        );
+        // Tokens assembled across substitution boundaries are also data.
+        assert_eq!(
+            render_chain_template("{previous}previous.data.number}}", "{{", Some(&data), 4096)
+                .unwrap(),
+            "{{previous.data.number}}"
+        );
+        assert_eq!(
+            render_chain_template(
+                "{{previous.data.open}}previous.data.number}}",
+                raw,
+                Some(&data),
+                4096,
+            )
+            .unwrap(),
+            "{{previous.data.number}}"
+        );
+    }
+
+    #[test]
+    fn chain_template_bounds_final_utf8_bytes_and_preserves_unresolved_tokens() {
+        let data = json!({"value": "雪", "missing": null});
+        let template = "{previous}{{previous.data.value}}";
+        assert_eq!(
+            render_chain_template(template, "雪", Some(&data), 6).unwrap(),
+            "雪雪"
+        );
+        assert_eq!(
+            render_chain_template(template, "雪", Some(&data), 5),
+            Err(CHAIN_TASK_LIMIT)
+        );
+        assert_eq!(
+            render_chain_template("雪雪", "unused", None, 5),
+            Err(CHAIN_TASK_LIMIT)
+        );
+        assert_eq!(
+            render_chain_template("{previous}".repeat(10).as_str(), "雪", None, 29),
+            Err(CHAIN_TASK_LIMIT)
+        );
+        for template in ["{{previous.data.absent}}", "{{previous.data.missing}}"] {
+            assert_eq!(
+                render_chain_template(template, "unused", Some(&data), 4096).unwrap(),
+                template
+            );
+        }
+        assert_eq!(
+            render_chain_template(
+                "{{previous.data.unclosed {previous}",
+                "literal",
+                Some(&data),
+                4096,
+            )
+            .unwrap(),
+            "{{previous.data.unclosed literal"
+        );
+    }
+
+    #[test]
+    fn closed_chain_field_candidates_are_atomic_with_or_without_schema_data() {
+        let data = json!({"value": "selected"});
+        for data in [Some(&data), None] {
+            for template in [
+                "{{previous.data.absent {previous}}}",
+                "{{previous.data.absent {{previous.data.value}}}}",
+            ] {
+                assert_eq!(
+                    render_chain_template(template, "raw evidence", data, 4096).unwrap(),
+                    template
+                );
+            }
+            // An unclosed candidate cannot consume a later raw token. The
+            // grammar is the same before and after a schema-valid result.
+            assert_eq!(
+                render_chain_template(
+                    "{{previous.data.unclosed {previous}",
+                    "raw evidence",
+                    data,
+                    4096,
+                )
+                .unwrap(),
+                "{{previous.data.unclosed raw evidence"
+            );
+        }
     }
 
     /// bd-cv653.5.1: JSON extraction tolerates prose/fence wrapping, and
