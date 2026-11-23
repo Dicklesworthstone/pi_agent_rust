@@ -701,6 +701,392 @@ fn fs_promises_copy_rename() {
 }
 
 // ---------------------------------------------------------------------------
+// Directory rename preserves the subtree's namespace and retained identities.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fs_directory_rename_preserves_tree_metadata_links_and_open_descriptors() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(1_700_000_000_000)),
+            default_config(),
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(async fs => {
+                    fs.mkdirSync('/rename-source/tree/nested/empty', { recursive: true });
+                    fs.mkdirSync('/rename-target/empty', { recursive: true });
+                    fs.writeFileSync('/rename-source/tree/nested/file', 'original');
+                    fs.symlinkSync('nested/file', '/rename-source/tree/alias');
+                    const fd = fs.openSync('/rename-source/tree/nested/file', 'r+');
+                    const root = fs.statSync('/rename-source/tree');
+                    const nested = fs.statSync('/rename-source/tree/nested');
+                    const file = fs.fstatSync(fd);
+                    const link = fs.lstatSync('/rename-source/tree/alias');
+                    const replaced = fs.statSync('/rename-target/empty');
+                    const oldParent = fs.statSync('/rename-source');
+                    const newParent = fs.statSync('/rename-target');
+                    await fs.promises.rename('/rename-source/tree', '/rename-target/empty');
+                    const moved = fs.statSync('/rename-target/empty');
+                    const movedNested = fs.statSync('/rename-target/empty/nested');
+                    const movedFile = fs.statSync('/rename-target/empty/nested/file');
+                    const movedLink = fs.lstatSync('/rename-target/empty/alias');
+                    const checks = {
+                        sourceGone: !fs.existsSync('/rename-source/tree'),
+                        tree: fs.readdirSync('/rename-target/empty').join(',') === 'alias,nested'
+                            && fs.statSync('/rename-target/empty/nested/empty').isDirectory(),
+                        rootIdentity: moved.ino === root.ino && moved.ino !== replaced.ino
+                            && moved.birthtimeMs === root.birthtimeMs,
+                        rootTimes: moved.mtimeMs === root.mtimeMs && moved.ctimeMs > root.ctimeMs,
+                        descendantIdentity: movedNested.ino === nested.ino && movedFile.ino === file.ino
+                            && movedLink.ino === link.ino,
+                        descendantTimes: movedNested.mtimeMs === nested.mtimeMs
+                            && movedNested.ctimeMs === nested.ctimeMs && movedFile.ctimeMs === file.ctimeMs,
+                        link: fs.readlinkSync('/rename-target/empty/alias') === 'nested/file'
+                            && fs.readFileSync('/rename-target/empty/alias', 'utf8') === 'original',
+                        parentTimes: fs.statSync('/rename-source').mtimeMs > oldParent.mtimeMs
+                            && fs.statSync('/rename-target').mtimeMs > newParent.mtimeMs,
+                    };
+                    fs.renameSync('/rename-target/empty', '/rename-target/empty');
+                    checks.samePathNoop = fs.statSync('/rename-target/empty').ctimeMs === moved.ctimeMs;
+                    await new Promise((resolve, reject) => fs.rename('/rename-target/empty', '/rename-target/final',
+                        error => error ? reject(error) : resolve()));
+                    fs.writeSync(fd, 'XY', 0);
+                    checks.descriptor = fs.readFileSync('/rename-target/final/alias', 'utf8') === 'XYiginal'
+                        && fs.fstatSync(fd).ino === file.ino && fs.fstatSync(fd).nlink === 1;
+                    checks.noResurrection = !fs.existsSync('/rename-source/tree') && !fs.existsSync('/rename-target/empty');
+                    fs.closeSync(fd);
+                    globalThis.directoryRenameChecks = checks;
+                });
+                "#,
+            )
+            .await
+            .expect("rename virtual directory through promise and callback APIs");
+        runtime.drain_microtasks().await.expect("drain");
+        let checks = runtime
+            .read_global_json("directoryRenameChecks")
+            .await
+            .unwrap();
+        for (name, passed) in checks.as_object().expect("rename checks") {
+            assert_eq!(passed, &serde_json::Value::Bool(true), "{name}: {checks}");
+        }
+    });
+}
+
+#[test]
+fn fs_directory_rename_resolves_parent_links_but_preserves_final_link_entries() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(1_700_000_000_000)),
+            default_config(),
+        )
+        .await
+        .unwrap();
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    fs.writeFileSync('/rename-aliases/source/tree/file', 'payload');
+                    fs.mkdirSync('/rename-aliases/target');
+                    fs.symlinkSync('source', '/rename-aliases/source-alias');
+                    fs.symlinkSync('target', '/rename-aliases/target-alias');
+                    const tree = fs.statSync('/rename-aliases/source/tree');
+                    const sourceLink = fs.lstatSync('/rename-aliases/source-alias');
+                    const targetLink = fs.lstatSync('/rename-aliases/target-alias');
+                    fs.renameSync('/rename-aliases/source-alias/tree', '/rename-aliases/target-alias/moved');
+                    fs.symlinkSync('target/moved', '/rename-aliases/final-link');
+                    const finalLink = fs.lstatSync('/rename-aliases/final-link');
+                    fs.renameSync('/rename-aliases/final-link', '/rename-aliases/moved-link');
+                    globalThis.directoryAliasChecks = {
+                        oldNamesGone: !fs.existsSync('/rename-aliases/source/tree')
+                            && !fs.existsSync('/rename-aliases/source-alias/tree'),
+                        resolvedTree: fs.statSync('/rename-aliases/target/moved').ino === tree.ino
+                            && fs.lstatSync('/rename-aliases/target-alias/moved').isDirectory(),
+                        payload: fs.readFileSync('/rename-aliases/target-alias/moved/file', 'utf8') === 'payload',
+                        parentLinksRetained: fs.lstatSync('/rename-aliases/source-alias').ino === sourceLink.ino
+                            && fs.lstatSync('/rename-aliases/target-alias').ino === targetLink.ino,
+                        finalLinkMoved: !fs.existsSync('/rename-aliases/final-link')
+                            && fs.lstatSync('/rename-aliases/moved-link').ino === finalLink.ino
+                            && fs.readlinkSync('/rename-aliases/moved-link') === 'target/moved',
+                        finalTargetRetained: fs.statSync('/rename-aliases/target/moved').ino === tree.ino
+                            && fs.readFileSync('/rename-aliases/moved-link/file', 'utf8') === 'payload',
+                    };
+                });
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime.drain_microtasks().await.unwrap();
+        let checks = runtime.read_global_json("directoryAliasChecks").await.unwrap();
+        for (name, passed) in checks.as_object().unwrap() {
+            assert_eq!(passed, &serde_json::Value::Bool(true), "{name}: {checks}");
+        }
+    });
+}
+
+#[test]
+fn fs_directory_rename_rejects_invalid_destinations_without_partial_mutation() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(1_700_000_000_000)),
+            default_config(),
+        )
+        .await
+        .unwrap();
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    fs.writeFileSync('/rename-negative/source/nested/file', 'source');
+                    fs.writeFileSync('/rename-negative/occupied/retained', 'target');
+                    fs.writeFileSync('/rename-negative/plain', 'file');
+                    fs.symlinkSync('occupied', '/rename-negative/link');
+                    const paths = ['/rename-negative', '/rename-negative/source',
+                        '/rename-negative/source/nested', '/rename-negative/source/nested/file',
+                        '/rename-negative/occupied', '/rename-negative/occupied/retained',
+                        '/rename-negative/plain', '/rename-negative/link'];
+                    const snapshot = () => JSON.stringify(paths.map(path => {
+                        const stat = fs.lstatSync(path);
+                        return { path, ino: stat.ino, size: stat.size, mtime: stat.mtimeMs, ctime: stat.ctimeMs };
+                    }));
+                    const before = snapshot();
+                    const results = [];
+                    for (const [path, expected] of [
+                        ['/rename-negative/source/nested/moved', 'EINVAL'],
+                        ['/rename-negative/occupied', 'ENOTEMPTY'],
+                        ['/rename-negative/plain', 'ENOTDIR'],
+                        ['/rename-negative/link', 'ENOTDIR'],
+                        ['/rename-negative/missing/moved', 'ENOENT'],
+                        ['/rename-negative/plain/moved', 'ENOTDIR'],
+                        ['/rename-negative/plain/nested/moved', 'ENOTDIR'],
+                        ['/', 'EBUSY'],
+                    ]) {
+                        let code;
+                        try { fs.renameSync('/rename-negative/source', path); }
+                        catch (error) { code = error.code; }
+                        results.push({ code, expected, unchanged: snapshot() === before });
+                    }
+                    globalThis.invalidDirectoryRenames = results;
+                    globalThis.renameRetainedData = [fs.readFileSync('/rename-negative/source/nested/file', 'utf8'),
+                        fs.readFileSync('/rename-negative/occupied/retained', 'utf8')];
+                    globalThis.renameMissingParentAbsent = !fs.existsSync('/rename-negative/missing');
+                });
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime.drain_microtasks().await.unwrap();
+        let results = runtime
+            .read_global_json("invalidDirectoryRenames")
+            .await
+            .unwrap();
+        assert_eq!(results.as_array().unwrap().len(), 8);
+        for result in results.as_array().unwrap() {
+            assert_eq!(result["code"], result["expected"], "{result}");
+            assert_eq!(result["unchanged"], true, "{result}");
+        }
+        assert_eq!(
+            runtime.read_global_json("renameRetainedData").await.unwrap(),
+            serde_json::json!(["source", "target"])
+        );
+        assert_eq!(
+            runtime
+                .read_global_json("renameMissingParentAbsent")
+                .await
+                .unwrap(),
+            true
+        );
+    });
+}
+
+#[test]
+fn fs_directory_rename_preflights_nested_source_and_destination_admission() {
+    futures::executor::block_on(async {
+        for protected_side in ["source", "destination"] {
+            let workspace = tempfile::tempdir().unwrap();
+            let source = workspace.path().join("source");
+            let destination = workspace.path().join("destination");
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+                Arc::new(DeterministicClock::new(1_700_000_000_000)),
+                PiJsRuntimeConfig {
+                    cwd: workspace.path().display().to_string(),
+                    ..default_config()
+                },
+                None,
+                "rename.owner".to_string(),
+            )
+            .await
+            .unwrap();
+            runtime.add_extension_root_with_id(
+                workspace.path().to_path_buf(),
+                Some("rename.owner"),
+            );
+            let source_json = serde_json::to_string(&source.display().to_string()).unwrap();
+            let destination_json =
+                serde_json::to_string(&destination.display().to_string()).unwrap();
+            runtime
+                .eval(&format!(
+                    r#"
+                    import('node:fs').then(fs => {{
+                        globalThis.renameFs = fs;
+                        fs.writeFileSync({source_json} + '/public', 'retained');
+                        fs.writeFileSync({source_json} + '/private/secret', 'confined');
+                        globalThis.renameBefore = fs.statSync({source_json});
+                    }});
+                    "#
+                ))
+                .await
+                .unwrap();
+            runtime.drain_microtasks().await.unwrap();
+            runtime.add_extension_root_with_id(
+                workspace.path().join(protected_side).join("private"),
+                Some("rename.other"),
+            );
+            runtime
+                .eval(&format!(
+                    r#"
+                    let denied = false;
+                    try {{ renameFs.renameSync({source_json}, {destination_json}); }}
+                    catch (error) {{ denied = String(error).includes('denied'); }}
+                    const after = renameFs.statSync({source_json});
+                    globalThis.renameAdmission = {{
+                        denied, destinationAbsent: !renameFs.existsSync({destination_json}),
+                        unchanged: after.ino === renameBefore.ino && after.mtimeMs === renameBefore.mtimeMs
+                            && after.ctimeMs === renameBefore.ctimeMs,
+                        content: renameFs.readFileSync({source_json} + '/public', 'utf8'),
+                    }};
+                    "#
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime.read_global_json("renameAdmission").await.unwrap(),
+                serde_json::json!({
+                    "denied":true, "destinationAbsent":true, "unchanged":true, "content":"retained",
+                }),
+                "protected {protected_side} subtree"
+            );
+        }
+    });
+}
+
+#[test]
+fn fs_directory_rename_merges_into_an_uncached_native_parent() {
+    futures::executor::block_on(async {
+        let workspace = tempfile::tempdir().unwrap();
+        let parent = workspace.path().join("native-parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("native-sibling"), "native").unwrap();
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(0)),
+            PiJsRuntimeConfig {
+                cwd: workspace.path().display().to_string(),
+                ..default_config()
+            },
+        )
+        .await
+        .unwrap();
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    const cwd = process.cwd();
+                    fs.writeFileSync(cwd + '/source-tree/file', 'overlay');
+                    const before = fs.statSync(cwd + '/native-parent');
+                    fs.renameSync(cwd + '/source-tree', cwd + '/native-parent/moved-tree');
+                    const after = fs.statSync(cwd + '/native-parent');
+                    globalThis.nativeParentRename = {
+                        names: fs.readdirSync(cwd + '/native-parent'),
+                        identity: after.ino === before.ino && after.birthtimeMs === before.birthtimeMs,
+                        metadataChanged: after.mtimeMs !== before.mtimeMs,
+                        data: fs.readFileSync(cwd + '/native-parent/moved-tree/file', 'utf8'),
+                        sourceGone: !fs.existsSync(cwd + '/source-tree'),
+                    };
+                });
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            runtime.read_global_json("nativeParentRename").await.unwrap(),
+            serde_json::json!({
+                "names":["moved-tree", "native-sibling"], "identity":true,
+                "metadataChanged":true, "data":"overlay", "sourceGone":true,
+            })
+        );
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+        assert!(!parent.join("moved-tree").exists());
+        assert_eq!(
+            std::fs::read_to_string(parent.join("native-sibling")).unwrap(),
+            "native"
+        );
+    });
+}
+
+#[test]
+fn fs_directory_rename_rejects_partial_native_overlays_without_touching_host_files() {
+    futures::executor::block_on(async {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("native-source");
+        let target = workspace.path().join("native-target");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(source.join("host-file"), "host-data").unwrap();
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(0)),
+            PiJsRuntimeConfig {
+                cwd: workspace.path().display().to_string(),
+                ..default_config()
+            },
+        )
+        .await
+        .unwrap();
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    const cwd = process.cwd();
+                    fs.writeFileSync(cwd + '/native-source/overlay', 'virtual');
+                    fs.writeFileSync(cwd + '/virtual-source/overlay', 'virtual');
+                    const codes = [];
+                    for (const [source, target] of [
+                        ['native-source', 'moved'], ['virtual-source', 'native-target'],
+                    ]) {
+                        try { fs.renameSync(cwd + '/' + source, cwd + '/' + target); codes.push('success'); }
+                        catch (error) { codes.push(error.code); }
+                    }
+                    globalThis.nativeDirectoryRename = {
+                        codes, overlay: fs.readFileSync(cwd + '/native-source/overlay', 'utf8'),
+                        virtual: fs.readFileSync(cwd + '/virtual-source/overlay', 'utf8'),
+                        movedAbsent: !fs.existsSync(cwd + '/moved'),
+                    };
+                });
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            runtime.read_global_json("nativeDirectoryRename").await.unwrap(),
+            serde_json::json!({
+                "codes":["ERR_PI_SHIM_UNSUPPORTED_OPERATION", "ERR_PI_SHIM_UNSUPPORTED_OPERATION"],
+                "overlay":"virtual", "virtual":"virtual", "movedAbsent":true,
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("host-file")).unwrap(),
+            "host-data"
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        assert!(!workspace.path().join("moved").exists());
+    });
+}
+
+// ---------------------------------------------------------------------------
 // symlink/readlink + dirent/lstat semantics
 // ---------------------------------------------------------------------------
 
@@ -1291,6 +1677,85 @@ async fn poll_files(
         }
     }
     Err(format!("file polling did not settle after 256 ticks at {time} ms").into())
+}
+
+#[test]
+fn fs_watch_file_observes_directory_rename_and_retained_descriptor_writes() {
+    futures::executor::block_on(async {
+        let clock = Arc::new(DeterministicClock::new(0));
+        let runtime = PiJsRuntime::with_clock_and_config(clock.clone(), default_config())
+            .await
+            .unwrap();
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    globalThis.renameWatchFs = fs;
+                    fs.writeFileSync('/rename-watched/tree/nested/file', 'before');
+                    fs.mkdirSync('/rename-watched-target');
+                    globalThis.renameWatchFd = fs.openSync('/rename-watched/tree/nested/file', 'r+');
+                    globalThis.renameWatchEvents = [];
+                    globalThis.renameWatchers = [];
+                    for (const [name, path] of [
+                        ['oldRoot', '/rename-watched/tree'],
+                        ['oldFile', '/rename-watched/tree/nested/file'],
+                        ['newRoot', '/rename-watched-target/tree'],
+                        ['newFile', '/rename-watched-target/tree/nested/file'],
+                    ]) {
+                        renameWatchers.push(fs.watchFile(path, { interval: 10 }, (current, previous) => {
+                            renameWatchEvents.push({ name, current: current.ino, previous: previous.ino,
+                                exists: current.isFile() || current.isDirectory(),
+                                changed: current.mtimeMs > previous.mtimeMs });
+                        }));
+                    }
+                    fs.renameSync('/rename-watched/tree', '/rename-watched-target/tree');
+                });
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime.drain_microtasks().await.unwrap();
+        poll_files(&runtime, &clock, 10).await.unwrap();
+        let events = runtime.read_global_json("renameWatchEvents").await.unwrap();
+        let events = events.as_array().unwrap();
+        assert_eq!(events.len(), 4, "one transition per watched name: {events:?}");
+        for kind in ["Root", "File"] {
+            let old = events
+                .iter()
+                .find(|event| event["name"] == format!("old{kind}"))
+                .unwrap();
+            let new = events
+                .iter()
+                .find(|event| event["name"] == format!("new{kind}"))
+                .unwrap();
+            assert_eq!(old["exists"], false);
+            assert_eq!(old["current"], 0);
+            assert_eq!(new["exists"], true);
+            assert_eq!(new["previous"], 0);
+            assert_eq!(
+                old["previous"], new["current"],
+                "rename retains {kind} identity"
+            );
+        }
+        runtime
+            .eval(
+                "renameWatchEvents.length = 0; renameWatchFs.writeSync(renameWatchFd, 'after!', 0);",
+            )
+            .await
+            .unwrap();
+        poll_files(&runtime, &clock, 20).await.unwrap();
+        let events = runtime.read_global_json("renameWatchEvents").await.unwrap();
+        let events = events.as_array().unwrap();
+        assert_eq!(events.len(), 1, "detached names must stay quiet: {events:?}");
+        assert_eq!(events[0]["name"], "newFile");
+        assert_eq!(events[0]["current"], events[0]["previous"]);
+        assert_eq!(events[0]["changed"], true);
+        runtime
+            .eval("renameWatchFs.closeSync(renameWatchFd); for (const watcher of renameWatchers) watcher.close();")
+            .await
+            .unwrap();
+        assert!(!runtime.has_pending());
+    });
 }
 
 #[test]
