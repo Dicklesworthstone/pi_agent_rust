@@ -23,8 +23,9 @@ Run `pi --version` in your shell and keep the complete output, including the
 commit hash. Docs on `main` describe development code; a published release can
 have fewer features. Use the matching tag in GitHub's branch/tag selector, or
 start from the [release notes](https://github.com/Dicklesworthstone/pi_agent_rust/releases).
-For example, `/goal` was added after the published `v0.8.0` release. Some newer
-source builds still report package version `0.8.0`, so the hash matters.
+For example, `/goal` first shipped in `v0.9.0`; `v0.8.0` and earlier releases do
+not have it. A source build made between releases can still report the previous
+package version, so the hash matters.
 
 ### Where do I type this?
 

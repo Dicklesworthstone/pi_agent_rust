@@ -1203,17 +1203,17 @@ From:
 
 ### Curl Installer (Recommended)
 
-As of November 20, 2026, the latest published stable release is **v0.8.0**. It does
-not include `/goal`; the [goal guide](docs/goal-mode.md#availability) describes
-the newer implementation on `main`. Fetching the installer from `main` still selects a published release
-binary, so it does not install every feature documented on `main`. Check the full
-`pi --version` output, including its commit hash, when comparing an installation
-with the current documentation.
+As of November 21, 2026, the latest published stable release is **v0.9.0**. It is
+the first release that includes `/goal`; see the
+[goal guide](docs/goal-mode.md#availability). Fetching the installer from `main`
+still selects a published release binary, so it does not install features added to
+`main` after that release. Check the full `pi --version` output, including its
+commit hash, when comparing an installation with the current documentation.
 
 Use the current installer with `--version` to pin the **binary**. Installer fixes
-ship separately from binary releases: the installer on `main` includes fixes for
-stock macOS tar/xz support and older awk versions that are absent from the
-installer at the v0.8.0 tag.
+ship separately from binary releases: pinning an older binary such as v0.8.0 with
+the current installer keeps the fixes for stock macOS tar/xz support and older awk
+versions that are absent from the installer at the v0.8.0 tag.
 
 The current installer requires the **Minisign CLI** for official release binaries.
 Install it with `brew install minisign` on macOS or `sudo apt install minisign` on
@@ -1245,14 +1245,14 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/ma
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --yes --easy-mode
 
 # Pin the binary release while using the current installer
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --version v0.8.0
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --version v0.9.0
 
 # Install the Linux x86-64 artifact with its published checksum
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
   bash -s -- \
-    --version v0.8.0 \
-    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.8.0/pi-linux-amd64.tar.xz" \
-    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.8.0/pi-linux-amd64.tar.xz.sha256"
+    --version v0.9.0 \
+    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.9.0/pi-linux-amd64.tar.xz" \
+    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.9.0/pi-linux-amd64.tar.xz.sha256"
 
 # Skip completion setup (CI/non-interactive minimal install)
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
@@ -2387,7 +2387,7 @@ The previous stack, built on the `charmed_rust` library family (a Rust port of G
 | `/resume` (`/r`), `/session` (`/info`), `/name`, `/history` | Session picker, info, naming, input history |
 | `/settings`, `/theme`, `/hotkeys` (`/keys`), `/changelog` | Settings UI, themes (incl. `auto`), keybindings, changelog |
 | `/plan`, `/approval`, `/advisor` | Plan mode, approval modes, second-model turn review |
-| `/goal status` | Inspect a saved objective; see [goal commands](docs/goal-mode.md). Added after the published `v0.8.0` release |
+| `/goal status` | Inspect a saved objective; see [goal commands](docs/goal-mode.md). First released in `v0.9.0` |
 | `/btw <question>`, `/tan <work>` | Ephemeral smol-role side question; background task-role tangential work |
 | `/mcp`, `/usage`, `/rules`, `/omfg` | MCP server status, provider credit/quota, stream rules, grievances |
 | `/export`, `/share`, `/copy` (`/cp`) | HTML export, secret/unlisted GitHub Gist share (not private; anyone with the URL can view it), copy last reply |

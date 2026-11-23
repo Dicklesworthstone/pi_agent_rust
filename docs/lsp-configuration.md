@@ -11,7 +11,8 @@ server programs**. With the default tool selection, an installed server on
 `PATH` needs no `settings.json` entry for the file types below.
 
 The five defaults and executable overrides described here are available in
-`v0.8.0`. The later workspace-settings reference has a separate version note.
+`v0.8.0` and later. The later workspace-settings reference has a separate version
+note.
 
 ## Quick start
 
@@ -183,8 +184,8 @@ Related references: [navigation](lsp-navigation.md),
 [active workspace diagnostics](lsp-workspace-diagnostics.md).
 
 **Version note:** the per-server `settings` field and the `configure` action
-in the following sections were added on `main` after the published `v0.8.0`
-release. They are not included in that release.
+in the following sections first shipped in `v0.9.0`. They are not included in
+`v0.8.0`.
 
 The native LSP client answers `workspace/configuration` and
 `workspace/workspaceFolders` requests, including requests made while its

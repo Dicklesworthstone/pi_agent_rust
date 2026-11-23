@@ -15,7 +15,7 @@ responses, and managing sessions.
 
 The stacks share the agent-event vocabulary (`PiMsg`), keybinding catalog,
 autocomplete infrastructure, and session persistence. Both interactive stacks
-support `/goal` (added after the published `v0.8.0` release). See
+support `/goal` (first released in `v0.9.0`). See
 [goal availability](goal-mode.md#availability) before trying the examples.
 
 ## Layout
