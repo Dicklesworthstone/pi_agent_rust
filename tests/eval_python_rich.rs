@@ -301,6 +301,97 @@ Picture()
 }
 
 #[test]
+fn python_image_formats_and_jpeg_hooks_reach_native_content_without_reencoding() {
+    if !available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tool = EvalTool::new(dir.path());
+    let observed = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let callback_observed = Arc::clone(&observed);
+    // These exercise bounded envelopes and transport, not raster decoding.
+    let code = r"
+import base64, struct
+jpeg = (b'\xff\xd8\xff\xc2\x00\x0b\x08\x00\x03\x00\x02\x01\x01\x11\x00'
+        b'\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x00\xff\xd9')
+gif = b'GIF89a\x02\x00\x03\x00\x00\x00\x00\x3b'
+webp = (b'RIFF' + struct.pack('<I', 22) + b'WEBPVP8X' + struct.pack('<I', 10)
+        + b'\x00\x00\x00\x00\x01\x00\x00\x02\x00\x00')
+display(jpeg, mime='image/jpeg')
+display(base64.b64encode(gif).decode('ascii'), mime='image/gif')
+display(bytearray(webp), mime='image/webp')
+class Picture:
+    def _repr_jpeg_(self):
+        return jpeg, {'width': 99999}
+picture = Picture()
+picture
+";
+    let output = run(tool.execute(
+        "rich-image-formats",
+        json!({"kernel": "python", "timeout_secs": 60, "code": code}),
+        Some(Box::new(move |update| {
+            for block in update.content {
+                if let ContentBlock::Image(image) = block {
+                    callback_observed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(image.mime_type);
+                }
+            }
+        })),
+    ))
+    .expect("cell transport");
+    assert!(!output.is_error, "{}", text(&output));
+    for mime in ["image/jpeg", "image/gif", "image/webp"] {
+        assert!(
+            observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(mime)
+        );
+    }
+    let images: Vec<_> = output
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image(image) => Some(image),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        images
+            .iter()
+            .map(|image| image.mime_type.as_str())
+            .collect::<Vec<_>>(),
+        ["image/jpeg", "image/gif", "image/webp", "image/jpeg"]
+    );
+    let first_image = images.first().expect("explicit JPEG result");
+    let rich_image = images.last().expect("rich JPEG result");
+    assert_eq!(first_image.data, rich_image.data);
+    let details = output.details.as_ref().unwrap();
+    for descriptor in details["displays"].as_array().unwrap() {
+        assert_eq!(descriptor["width"], 2);
+        assert_eq!(descriptor["height"], 3);
+    }
+    assert!(!details.to_string().contains(&first_image.data));
+    run(async {
+        let failed = cell(
+            &tool,
+            "display('accepted prefix'); display(b'invalid JPEG', mime='image/jpeg')",
+        )
+        .await;
+        assert!(failed.is_error);
+        assert!(text(&failed).contains("EVAL_DISPLAY_JPEG"));
+        assert!(text(&failed).contains("accepted prefix"));
+        let retained = cell(&tool, "picture").await;
+        assert!(!retained.is_error, "{}", text(&retained));
+        assert_eq!(retained.details.as_ref().unwrap()["restarted"], false);
+        assert!(matches!(retained.content.first(), Some(ContentBlock::Image(image))
+            if image.mime_type == "image/jpeg" && image.data == first_image.data));
+    });
+}
+
+#[test]
 fn automatic_pyplot_output_reaches_native_images_and_retains_closed_figure() {
     if !matplotlib_available() {
         return;

@@ -126,7 +126,7 @@ completion, while `pool.close()` cancels running and queued work. Worker
 lifetimes remain fixed from launch. See the linked contracts for supported
 isolation, schemas, partial admission and cleanup behavior.
 
-## JavaScript images
+## Python and JavaScript images
 
 JavaScript `display(value, mimeType)` accepts `image/png`, `image/jpeg`,
 `image/gif`, and `image/webp`. Pass a `Uint8Array` (including a subarray view)
@@ -138,12 +138,32 @@ display(jpegBytes, "image/jpeg");
 display(webpBase64, "image/webp");
 ```
 
+Python accepts the same formats with `display(value, mime=...)`, using `bytes`,
+`bytearray`, or canonical standard base64. Images returned by an enabled native
+tool can be displayed directly, subject to the existing display size limits:
+
+```python
+result = await tool.result("read", {"path": "diagram.jpg"})
+if not result["isError"]:
+    for block in result["content"]:
+        if block["type"] == "image":
+            display(block["data"], mime=block["mimeType"])
+```
+
+Python's rich-object protocol also accepts `_repr_jpeg_()` alongside
+`_repr_png_()`, and `_repr_mimebundle_()` can supply any of the four image types.
+A rich final expression uses the same validation and snapshot path as explicit
+`display`. Unsupported HTML/SVG representations are not requested or executed;
+an invalid preferred representation raises an error instead of silently falling
+back to text. Existing Pillow and Matplotlib adapters continue producing PNG.
+
 The model receives a native image content block, not a printed base64 string.
 The SDK display descriptor includes width, height, MIME type and encoded frame
 bytes, without another copy of the image. Inputs are explicit data: this helper
 does not read paths, fetch URLs, execute SVG/HTML, or invoke custom serializers.
-Python's public display helper remains PNG-only; this change extends the native
-JavaScript helper and the shared host MIME validator.
+Accepted image bytes retain their format without conversion or recompression.
+Python checks image envelopes and encoded size before publishing a complete
+frame; the shared host validator independently checks every received frame.
 
 Host checks preserve the existing limits: 32 displays per cell, 2 MiB per
 serialized frame, 4 MiB across frames, 16,384 pixels per axis, and 16,777,216
@@ -173,3 +193,16 @@ This executes the actual factory, including all four MIME types, byte views,
 base64 remainders, frame limits, unsupported types, snapshot semantics and
 captured-intrinsic tampering. It is not a substitute for native QuickJS and
 Rust integration tests.
+
+The Python subprocess harness exercises the bundled kernel's actual JSONL
+protocol, including all formats, rich JPEG hooks, MIME bundles, malformed and
+truncated envelopes, base64 canonicality, snapshots and byte/count/canvas limits:
+
+```sh
+python3 tests/eval_python_rich.py ImageDisplayTests RichProtocolTests
+```
+
+The public `EvalTool` integration regression is in `tests/eval_python_rich.rs`;
+it verifies native image blocks, live updates, dimensions and kernel reuse after
+an invalid image. The standalone Python harness does not replace the
+authoritative DSR Rust quality lane.

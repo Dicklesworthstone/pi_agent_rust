@@ -169,7 +169,7 @@ class _CellOutput:
     def display(self, sequence, snapshot):
         # A distinct display index leaves stdout/stderr accounting and console
         # archives unchanged. Send a complete bounded MIME snapshot, not text
-        # chunks that could expose a partial JSON value or PNG to the host.
+        # chunks that could expose a partial JSON value or image to the host.
         with _PROTOCOL_WRITE_LOCK:
             if not self.active or _OUTPUT_CONTEXT.get() is not self:
                 raise RuntimeError("EVAL_OUTPUT_CLOSED: display belongs to an inactive cell")
@@ -256,35 +256,144 @@ def _display_json_shape(value, depth=0, remaining=None):
         raise TypeError("EVAL_DISPLAY_JSON: use JSON values or an explicit text MIME type")
 
 
-def _display_png(value):
-    if type(value) not in (str, bytes, bytearray):
-        raise TypeError("EVAL_DISPLAY_PNG: expected PNG bytes or standard base64")
-    if len(value) > _MAX_DISPLAY_ITEM_BYTES:
-        raise ValueError("EVAL_DISPLAY_LIMIT: PNG exceeds the item budget")
-    if type(value) is str:
-        raw = base64.b64decode(value, validate=True)
-        encoded = base64.b64encode(raw).decode("ascii")
-        if encoded != value:
-            raise ValueError("EVAL_DISPLAY_PNG: use canonical standard base64")
-    else:
-        raw = value
-        encoded = base64.b64encode(raw).decode("ascii")
-    # Envelope admission only; no raster decompression in the kernel or host.
+_DISPLAY_IMAGE_MIMES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+
+
+def _display_png_dimensions(raw):
     if (len(raw) < 45 or raw[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
             or raw[-12:] != b"\x00\x00\x00\x00IEND\xaeB`\x82"):
         raise ValueError("EVAL_DISPLAY_PNG: missing PNG header or end marker")
-    width = int.from_bytes(raw[16:20], "big")
-    height = int.from_bytes(raw[20:24], "big")
-    _display_dimensions(width, height)
-    return encoded
+    return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
 
 
-def _display_dimensions(width, height):
+def _display_jpeg_dimensions(raw):
+    if len(raw) < 4 or raw[:2] != b"\xff\xd8" or raw[-2:] != b"\xff\xd9":
+        raise ValueError("EVAL_DISPLAY_JPEG: missing start or end marker")
+    end = len(raw) - 2
+    offset = 2
+    size = None
+    while offset < end:
+        if raw[offset] != 0xff:
+            raise ValueError("EVAL_DISPLAY_JPEG: expected a segment marker")
+        while offset < end and raw[offset] == 0xff:
+            offset += 1
+        if offset >= end:
+            raise ValueError("EVAL_DISPLAY_JPEG: truncated marker")
+        marker = raw[offset]
+        offset += 1
+        if marker == 0x01:
+            continue
+        if marker == 0 or 0xd0 <= marker <= 0xd9 or end - offset < 2:
+            raise ValueError("EVAL_DISPLAY_JPEG: invalid segment marker")
+        length = int.from_bytes(raw[offset:offset + 2], "big")
+        if length < 2 or length > end - offset:
+            raise ValueError("EVAL_DISPLAY_JPEG: truncated segment")
+        if 0xc0 <= marker <= 0xcf and marker not in (0xc4, 0xc8, 0xcc):
+            if (length < 8 or not 1 <= raw[offset + 7] <= 4
+                    or length != 8 + 3 * raw[offset + 7] or size is not None):
+                raise ValueError("EVAL_DISPLAY_JPEG: invalid frame header")
+            size = (int.from_bytes(raw[offset + 5:offset + 7], "big"),
+                    int.from_bytes(raw[offset + 3:offset + 5], "big"))
+        if marker == 0xda:
+            if (length < 6 or not 1 <= raw[offset + 2] <= 4
+                    or length != 6 + 2 * raw[offset + 2]):
+                raise ValueError("EVAL_DISPLAY_JPEG: invalid scan header")
+            if size is None:
+                raise ValueError("EVAL_DISPLAY_JPEG: scan precedes its frame header")
+            return size
+        offset += length
+    raise ValueError("EVAL_DISPLAY_JPEG: frame or scan header is missing")
+
+
+def _display_gif_dimensions(raw):
+    if len(raw) < 14 or raw[:6] not in (b"GIF87a", b"GIF89a") or raw[-1] != 0x3b:
+        raise ValueError("EVAL_DISPLAY_GIF: missing header or trailer")
+    if raw[10] & 0x80 and len(raw) < 14 + (3 << ((raw[10] & 7) + 1)):
+        raise ValueError("EVAL_DISPLAY_GIF: truncated color table")
+    return int.from_bytes(raw[6:8], "little"), int.from_bytes(raw[8:10], "little")
+
+
+def _display_webp_dimensions(raw):
+    if len(raw) < 20 or raw[:4] != b"RIFF" or raw[8:12] != b"WEBP":
+        raise ValueError("EVAL_DISPLAY_WEBP: missing RIFF header")
+    if int.from_bytes(raw[4:8], "little") + 8 != len(raw):
+        raise ValueError("EVAL_DISPLAY_WEBP: RIFF length does not match the image")
+    offset = 12
+    size = None
+    while offset < len(raw):
+        if len(raw) - offset < 8:
+            raise ValueError("EVAL_DISPLAY_WEBP: truncated chunk header")
+        kind = raw[offset:offset + 4]
+        length = int.from_bytes(raw[offset + 4:offset + 8], "little")
+        start = offset + 8
+        if length > len(raw) - start:
+            raise ValueError("EVAL_DISPLAY_WEBP: truncated chunk")
+        if offset == 12:
+            if kind == b"VP8X" and length == 10:
+                if raw[start] & 0xc1 or raw[start + 1:start + 4] != b"\x00\x00\x00":
+                    raise ValueError("EVAL_DISPLAY_WEBP: invalid extended header")
+                size = (int.from_bytes(raw[start + 4:start + 7], "little") + 1,
+                        int.from_bytes(raw[start + 7:start + 10], "little") + 1)
+            elif (kind == b"VP8L" and length >= 5 and raw[start] == 0x2f
+                  and raw[start + 4] >> 5 == 0):
+                packed = int.from_bytes(raw[start + 1:start + 5], "little")
+                size = ((packed & 0x3fff) + 1, ((packed >> 14) & 0x3fff) + 1)
+            elif (kind == b"VP8 " and length >= 10 and raw[start] & 1 == 0
+                  and raw[start + 3:start + 6] == b"\x9d\x01\x2a"):
+                size = (int.from_bytes(raw[start + 6:start + 8], "little") & 0x3fff,
+                        int.from_bytes(raw[start + 8:start + 10], "little") & 0x3fff)
+            else:
+                raise ValueError("EVAL_DISPLAY_WEBP: unsupported or malformed image header")
+        offset = start + length
+        if length & 1:
+            if offset >= len(raw) or raw[offset] != 0:
+                raise ValueError("EVAL_DISPLAY_WEBP: missing chunk padding")
+            offset += 1
+    if size is None:
+        raise ValueError("EVAL_DISPLAY_WEBP: image header is missing")
+    return size
+
+
+def _display_image(value, mime, byte_budget):
+    kind = mime.removeprefix("image/").upper()
+    if type(value) not in (str, bytes, bytearray):
+        raise TypeError(f"EVAL_DISPLAY_{kind}: expected {kind} bytes or standard base64")
+    # Bound both the encoded frame and the remaining cell budget before
+    # copying a bytearray, decoding base64, or allocating encoded image text.
+    overhead = len('{"mimeType":"' + mime + '","data":""}')
+    encoded_size = len(value) if type(value) is str else 4 * ((len(value) + 2) // 3)
+    if encoded_size + overhead > min(byte_budget, _MAX_DISPLAY_ITEM_BYTES):
+        raise ValueError("EVAL_DISPLAY_LIMIT: encoded image exceeds the remaining display budget")
+    if type(value) is str:
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except ValueError as error:
+            raise ValueError(f"EVAL_DISPLAY_{kind}: use canonical standard base64") from error
+        encoded = base64.b64encode(raw).decode("ascii")
+        if encoded != value:
+            raise ValueError(f"EVAL_DISPLAY_{kind}: use canonical standard base64")
+    else:
+        raw = bytes(value)
+        encoded = None
+    # Match the shared host envelope checks without raster decompression,
+    # image-library imports, format conversion or animation traversal.
+    inspectors = {
+        "image/png": _display_png_dimensions,
+        "image/jpeg": _display_jpeg_dimensions,
+        "image/gif": _display_gif_dimensions,
+        "image/webp": _display_webp_dimensions,
+    }
+    width, height = inspectors[mime](raw)
+    _display_dimensions(width, height, kind)
+    return encoded if encoded is not None else base64.b64encode(raw).decode("ascii")
+
+
+def _display_dimensions(width, height, kind="PNG"):
     # Also runs before optional libraries allocate/encode a raster. Fractional
     # figure pixels round up conservatively; NaN/inf fail the comparisons.
     if (not (0 < width <= 16384 and 0 < height <= 16384)
             or math.ceil(width) * math.ceil(height) > 16777216):
-        raise ValueError("EVAL_DISPLAY_PNG: dimensions exceed the display budget")
+        raise ValueError(f"EVAL_DISPLAY_{kind}: dimensions exceed the display budget")
 
 
 class _DisplayPngBuffer(io.BytesIO):
@@ -345,7 +454,7 @@ def _scientific_representation(value, byte_budget):
     return None
 
 
-_RICH_DISPLAY_MIMES = ("image/png", "application/json", "text/markdown", "text/plain")
+_RICH_DISPLAY_MIMES = _DISPLAY_IMAGE_MIMES + ("application/json", "text/markdown", "text/plain")
 _PLAIN_DISPLAY_TYPES = (str, int, float, bool, type(None), list, tuple, dict)
 
 
@@ -374,6 +483,7 @@ def _rich_representation(value, byte_budget):
                 if mime in bundle and (bundle[mime] is not None or mime == "application/json"):
                     return mime, bundle[mime]
     for mime, name in (("image/png", "_repr_png_"),
+                       ("image/jpeg", "_repr_jpeg_"),
                        ("application/json", "_repr_json_"),
                        ("text/markdown", "_repr_markdown_")):
         hook = getattr(value, name, None)
@@ -478,8 +588,8 @@ class _DisplaySink:
             else:
                 mime = "text/plain" if type(value) is str else "application/json"
         self.check_available()
-        if mime == "image/png":
-            data = _display_png(value)
+        if mime in _DISPLAY_IMAGE_MIMES:
+            data = _display_image(value, mime, _MAX_DISPLAY_BYTES - self.bytes)
         elif mime in ("text/plain", "text/markdown"):
             if type(value) is not str:
                 raise TypeError("EVAL_DISPLAY_TEXT: explicit text displays require a string")
@@ -487,7 +597,7 @@ class _DisplaySink:
         elif mime == "application/json":
             data = value
         else:
-            raise ValueError("EVAL_DISPLAY_MIME: supported types are text/plain, text/markdown, application/json, image/png")
+            raise ValueError("EVAL_DISPLAY_MIME: supported types are text/plain, text/markdown, application/json, image/png, image/jpeg, image/gif, image/webp")
         _display_json_shape(data)
         frame = {"mimeType": mime, "data": data}
         encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":"))
@@ -515,11 +625,13 @@ class _DisplaySink:
 
 
 def display(value, *, mime=None):
-    """Capture JSON/text/PNG or a top-level object's supported rich output.
+    """Capture JSON/text/images or a top-level object's supported rich output.
 
     Explicit mime bypasses representation hooks and validates the supplied
     value directly. Omitted mime permits synchronous notebook-style hooks;
     HTML, SVG, external URLs and arbitrary object serialization stay disabled.
+    Image MIME types are image/png, image/jpeg, image/gif and image/webp;
+    supply bytes, bytearray or canonical standard base64, never a path or URL.
     """
     sink = _DISPLAY_CONTEXT.get()
     if sink is None:

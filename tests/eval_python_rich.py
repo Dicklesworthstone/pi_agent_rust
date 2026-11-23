@@ -11,11 +11,13 @@ import json
 import os
 from pathlib import Path
 import queue
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -124,6 +126,338 @@ class KernelTestCase(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertIn(diagnostic, result["error"])
         return result, console
+
+
+
+def image_envelopes(width=2, height=3):
+    """Minimal format envelopes, deliberately not decoded raster fixtures.
+
+    The kernel and native host only authenticate bounded headers. The optional
+    Pillow probe below separately covers real encoded and decoded images.
+    """
+    def png_chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data)))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+           + png_chunk(b"IEND", b""))
+
+    def jpeg(marker):
+        return (b"\xff\xd8\xff\xe0\x00\x04\x00\x00\xff" + bytes([marker])
+                + b"\x00\x0b\x08" + struct.pack(">HH", height, width)
+                + b"\x01\x01\x11\x00\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
+                + b"\x00\xff\xd9")
+
+    def webp(kind, data):
+        chunk = kind + struct.pack("<I", len(data)) + data
+        if len(data) % 2:
+            chunk += b"\x00"
+        return b"RIFF" + struct.pack("<I", 4 + len(chunk)) + b"WEBP" + chunk
+
+    fixtures = [
+        ("png", "image/png", png),
+        ("jpeg-baseline", "image/jpeg", jpeg(0xc0)),
+        ("jpeg-progressive", "image/jpeg", jpeg(0xc2)),
+        ("gif87a", "image/gif",
+         b"GIF87a" + struct.pack("<HH", width, height) + b"\x00\x00\x00\x3b"),
+        ("gif89a", "image/gif",
+         b"GIF89a" + struct.pack("<HH", width, height) + b"\x00\x00\x00\x3b"),
+        ("webp-lossy", "image/webp",
+         webp(b"VP8 ", b"\x00\x00\x00\x9d\x01\x2a" + struct.pack("<HH", width, height))),
+    ]
+    if width > 0 and height > 0:
+        fixtures.append((
+            "webp-extended", "image/webp",
+            webp(b"VP8X", b"\x00\x00\x00\x00" + (width - 1).to_bytes(3, "little")
+                 + (height - 1).to_bytes(3, "little"))))
+        # VP8L's packed header cannot represent zero or dimensions above 16384.
+        if width <= 16384 and height <= 16384:
+            packed = (width - 1) | ((height - 1) << 14)
+            fixtures.append((
+                "webp-lossless", "image/webp",
+                webp(b"VP8L", b"\x2f" + struct.pack("<I", packed))))
+    return fixtures
+
+
+class ImageDisplayTests(KernelTestCase):
+    def test_all_image_formats_snapshot_bytes_bytearrays_and_base64(self):
+        fixtures = image_envelopes()
+        inputs = [(mime, base64.b64encode(raw).decode("ascii"))
+                  for _, mime, raw in fixtures]
+        result, _ = self.good(f"""
+import base64
+fixtures = {inputs!r}
+for mime, encoded in fixtures:
+    raw = base64.b64decode(encoded)
+    display(raw, mime=mime)
+    mutable = bytearray(raw)
+    display(mutable, mime=mime)
+    mutable[:] = b'\\x00' * len(mutable)
+    display(encoded, mime=mime)
+""")
+        expected = [{"mimeType": mime, "data": encoded}
+                    for mime, encoded in inputs for _ in range(3)]
+        self.assertEqual(result["displays"], expected)
+        self.assertIsNone(result["result"])
+
+    def test_jpeg_hook_is_a_rich_final_result_and_can_decline_png(self):
+        raw = next(raw for label, _, raw in image_envelopes() if label == "jpeg-progressive")
+        encoded = base64.b64encode(raw).decode("ascii")
+        result, _ = self.good(f"""
+import base64
+class Picture:
+    def _repr_png_(self):
+        return None
+    def _repr_jpeg_(self):
+        return bytearray(base64.b64decode({encoded!r})), {{'ignored': True}}
+    def _repr_markdown_(self):
+        raise AssertionError('WEAKER_HOOK_EXECUTED')
+picture = Picture()
+picture
+""")
+        self.assertIsNone(result["result"])
+        expected = [{"mimeType": "image/jpeg", "data": encoded}]
+        self.assertEqual(result["displays"], expected)
+        self.assertEqual(self.good("picture")[0]["displays"], expected)
+        self.assertEqual(self.good("6 * 7")[0]["result"], "42")
+
+    def test_bundles_advertise_every_image_format_before_text(self):
+        inputs = [(mime, base64.b64encode(raw).decode("ascii"))
+                  for _, mime, raw in image_envelopes()]
+        result, _ = self.good(f"""
+class Picture:
+    def __init__(self, mime, encoded):
+        self.mime, self.encoded = mime, encoded
+    def _repr_mimebundle_(self, include, exclude):
+        assert all(mime in include for mime in
+                   ('image/png', 'image/jpeg', 'image/gif', 'image/webp'))
+        assert 'text/html' not in include and 'image/svg+xml' not in include
+        assert exclude == []
+        return {{self.mime: self.encoded, 'text/plain': 'fallback',
+                 'application/json': {{'fallback': True}}}}
+    def _repr_png_(self):
+        raise AssertionError('HOOK_RAN_AFTER_BUNDLE')
+for mime, encoded in {inputs!r}:
+    display(Picture(mime, encoded))
+""")
+        self.assertEqual(result["displays"],
+                         [{"mimeType": mime, "data": encoded} for mime, encoded in inputs])
+
+    def test_invalid_preferred_images_do_not_downgrade_or_reset_state(self):
+        jpeg = next(raw for label, _, raw in image_envelopes() if label == "jpeg-baseline")
+        encoded = base64.b64encode(jpeg).decode("ascii")
+        result, _ = self.bad(f"""
+keep = 42
+class Picture:
+    def _repr_mimebundle_(self, **kwargs):
+        return {{'image/png': 'invalid', 'image/jpeg': {encoded!r},
+                 'text/plain': 'looks successful'}}
+display('accepted prefix')
+display(Picture())
+""", "Error")
+        self.assertEqual(result["displays"],
+                         [{"mimeType": "text/plain", "data": "accepted prefix"}])
+        self.assertEqual(self.good("keep")[0]["result"], "42")
+        result, _ = self.bad("""
+class Picture:
+    def _repr_jpeg_(self):
+        return b'not a JPEG'
+    def _repr_markdown_(self):
+        raise AssertionError('WEAKER_HOOK_EXECUTED')
+picture = Picture()
+display(picture)
+""", "EVAL_DISPLAY_JPEG")
+        self.assertEqual(result["displays"], [])
+        self.assertEqual(self.good("keep + 1")[0]["result"], "43")
+
+    def test_every_truncation_and_mismatched_mime_is_refused(self):
+        cases = []
+        for label, mime, raw in image_envelopes():
+            cases.extend((f"{label}-prefix-{end}", mime,
+                          base64.b64encode(raw[:end]).decode("ascii"))
+                         for end in range(len(raw)))
+            cases.extend((f"{label}-as-{other}", other,
+                          base64.b64encode(raw).decode("ascii"))
+                         for other in ("image/png", "image/jpeg", "image/gif", "image/webp")
+                         if other != mime)
+        result, _ = self.good(f"""
+import base64
+for label, mime, encoded in {cases!r}:
+    try:
+        display(base64.b64decode(encoded), mime=mime)
+    except (TypeError, ValueError) as error:
+        assert 'EVAL_DISPLAY_' in str(error), (label, str(error))
+    else:
+        raise AssertionError('malformed image accepted: ' + label)
+""")
+        self.assertEqual(result["displays"], [])
+
+    def test_segment_color_table_riff_chunk_and_padding_boundaries(self):
+        fixtures = {label: (mime, raw) for label, mime, raw in image_envelopes()}
+        cases = []
+
+        def change(label, offset, replacement, name):
+            mime, original = fixtures[label]
+            raw = bytearray(original)
+            raw[offset:offset + len(replacement)] = replacement
+            cases.append((name, mime, base64.b64encode(raw).decode("ascii")))
+
+        change("jpeg-baseline", 4, b"\x00\x00", "JPEG zero segment length")
+        change("jpeg-baseline", 4, b"\xff\xff", "JPEG oversized segment length")
+        change("jpeg-baseline", 17, b"\x00", "JPEG no frame components")
+        change("jpeg-baseline", 23, b"\x00\x00", "JPEG zero scan length")
+        mime, jpeg = fixtures["jpeg-baseline"]
+        cases.append(("JPEG duplicate frame", mime,
+                      base64.b64encode(jpeg[:21] + jpeg[8:21] + jpeg[21:]).decode("ascii")))
+        cases.append(("JPEG scan before frame", mime,
+                      base64.b64encode(jpeg[:2] + jpeg[21:]).decode("ascii")))
+        change("gif89a", 10, b"\x80", "GIF missing global color table")
+        change("webp-lossless", 4, b"\x00\x00\x00\x00", "WebP incorrect RIFF length")
+        change("webp-lossless", 16, b"\xff\xff\xff\xff", "WebP oversized chunk")
+        change("webp-lossless", len(fixtures["webp-lossless"][1]) - 1,
+               b"\x01", "WebP nonzero padding")
+        change("webp-lossless", 24, b"\xe0", "WebP unsupported lossless version")
+        change("webp-extended", 20, b"\xc1", "WebP reserved feature flags")
+        change("webp-extended", 21, b"\x01", "WebP reserved header bytes")
+        change("webp-lossy", 20, b"\x01", "WebP non-key frame")
+        change("webp-lossy", 23, b"\x00", "WebP missing key frame signature")
+        change("webp-lossy", 12, b"JPEG", "WebP unknown first chunk")
+        mime, webp = fixtures["webp-extended"]
+        extra = bytearray(webp + b"AB")
+        extra[4:8] = struct.pack("<I", len(extra) - 8)
+        cases.append(("WebP truncated trailing chunk", mime,
+                      base64.b64encode(extra).decode("ascii")))
+        result, _ = self.good(f"""
+import base64
+for label, mime, encoded in {cases!r}:
+    try:
+        display(base64.b64decode(encoded), mime=mime)
+    except ValueError as error:
+        assert 'EVAL_DISPLAY_' in str(error), (label, str(error))
+    else:
+        raise AssertionError('malformed envelope accepted: ' + label)
+""")
+        self.assertEqual(result["displays"], [])
+
+    def test_canvas_limits_reject_overflow_and_preserve_exact_boundary(self):
+        cases = []
+        for width, height in ((0, 1), (1, 0), (16385, 1), (4096, 4097)):
+            for label, mime, raw in image_envelopes(width, height):
+                # Lossy WebP stores each axis in 14 bits. Its encoded form of
+                # 16385 is a legal one-pixel width, not an oversized canvas.
+                if label == "webp-lossy" and width > 16383:
+                    continue
+                cases.append((f"{label}-{width}x{height}", mime,
+                              base64.b64encode(raw).decode("ascii")))
+        result, _ = self.good(f"""
+import base64
+for label, mime, encoded in {cases!r}:
+    try:
+        display(base64.b64decode(encoded), mime=mime)
+    except ValueError as error:
+        assert 'dimensions' in str(error), (label, str(error))
+    else:
+        raise AssertionError('oversized canvas accepted: ' + label)
+""")
+        self.assertEqual(result["displays"], [])
+        boundary = [(mime, base64.b64encode(raw).decode("ascii"))
+                    for _, mime, raw in image_envelopes(4096, 4096)]
+        result, _ = self.good(f"""
+import base64
+for mime, encoded in {boundary!r}:
+    display(base64.b64decode(encoded), mime=mime)
+""")
+        self.assertEqual(result["displays"],
+                         [{"mimeType": mime, "data": encoded} for mime, encoded in boundary])
+
+    def test_canonical_base64_exact_types_and_unsupported_mimes(self):
+        raw = next(raw for label, _, raw in image_envelopes() if label == "gif89a")
+        encoded = base64.b64encode(raw).decode("ascii")
+        self.assertTrue(encoded.endswith("="))
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        noncanonical = encoded[:-2] + alphabet[alphabet.index(encoded[-2]) | 1] + "="
+        self.assertEqual(base64.b64decode(noncanonical, validate=True), raw)
+        result, _ = self.good(f"""
+bad_encodings = {[encoded + chr(10), encoded.rstrip("="), noncanonical,
+                  "https://example.invalid/image.gif", "/tmp/image.gif"]!r}
+for encoded in bad_encodings:
+    try:
+        display(encoded, mime='image/gif')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('noncanonical image data accepted')
+hooks = []
+class Coercible:
+    def __bytes__(self):
+        hooks.append('bytes')
+        raise AssertionError('CUSTOM_CONVERSION')
+    def _repr_jpeg_(self):
+        hooks.append('hook')
+        raise AssertionError('CUSTOM_HOOK')
+class BytesSubclass(bytes):
+    pass
+for value in (Coercible(), memoryview(b'JPEG'), BytesSubclass(b'JPEG'), 42, {{'data': 'JPEG'}}):
+    try:
+        display(value, mime='image/jpeg')
+    except TypeError as error:
+        assert 'EVAL_DISPLAY_JPEG' in str(error)
+    else:
+        raise AssertionError('implicit image conversion accepted')
+assert hooks == []
+for mime in ('text/html', 'image/svg+xml', 'image/jpg', 'image/bmp'):
+    try:
+        display('ignored', mime=mime)
+    except ValueError as error:
+        assert 'EVAL_DISPLAY_MIME' in str(error)
+    else:
+        raise AssertionError('unsupported MIME accepted')
+""")
+        self.assertEqual(result["displays"], [])
+
+    def test_encoded_frame_overhead_is_part_of_image_item_budget(self):
+        raw = next(raw for label, _, raw in image_envelopes() if label == "jpeg-baseline")
+        encoded = base64.b64encode(raw).decode("ascii")
+        overhead = len(json.dumps({"mimeType": "image/jpeg", "data": ""},
+                                  separators=(",", ":")).encode("utf-8"))
+        raw_limit = ((2 * 1024 * 1024 - overhead) // 4) * 3
+        result, _ = self.bad(f"""
+import base64
+raw = base64.b64decode({encoded!r})
+boundary = raw[:-2] + b'\\x00' * ({raw_limit} - len(raw)) + raw[-2:]
+assert len(boundary) == {raw_limit}
+display(boundary, mime='image/jpeg')
+display(boundary[:-2] + b'\\x00' + boundary[-2:], mime='image/jpeg')
+""", "EVAL_DISPLAY_LIMIT")
+        self.assertEqual(len(result["displays"]), 1)
+        frame = result["displays"][0]
+        self.assertEqual(frame["mimeType"], "image/jpeg")
+        self.assertEqual(len(base64.b64decode(frame["data"], validate=True)), raw_limit)
+        self.assertLessEqual(len(json.dumps(frame, separators=(",", ":")).encode("utf-8")),
+                             2 * 1024 * 1024)
+        self.assertEqual(self.good("len(boundary)")[0]["result"], str(raw_limit))
+
+    def test_total_and_count_limits_preserve_already_streamed_prefix(self):
+        raw = next(raw for label, _, raw in image_envelopes() if label == "jpeg-baseline")
+        encoded = base64.b64encode(raw).decode("ascii")
+        result, _ = self.bad(f"""
+import base64
+raw = base64.b64decode({encoded!r})
+display('a' * 1500000)
+display('b' * 1500000)
+display(raw[:-2] + b'\\x00' * 1000000 + raw[-2:], mime='image/jpeg')
+""", "EVAL_DISPLAY_LIMIT")
+        self.assertEqual(len(result["displays"]), 2)
+        self.assertTrue(all(frame["mimeType"] == "text/plain" for frame in result["displays"]))
+        result, _ = self.bad("""
+for index in range(32):
+    display(raw, mime='image/jpeg')
+display(raw, mime='image/jpeg')
+""", "EVAL_DISPLAY_LIMIT")
+        self.assertEqual(len(result["displays"]), 32)
+        self.assertTrue(all(frame["data"] == encoded for frame in result["displays"]))
+        self.assertEqual(self.good("6 * 7")[0]["result"], "42")
 
 
 class RichProtocolTests(KernelTestCase):
@@ -396,6 +730,34 @@ image.putpixel((0, 0), (99, 88, 77, 66))
         later, _ = self.good("image")
         self.assertIsNone(later["result"])
         self.assertEqual(self.png(later["displays"][0], (3, 2)), (99, 88, 77, 66))
+
+    def test_real_encoded_png_jpeg_gif_and_webp_preserve_original_bytes(self):
+        self.need("PIL")
+        from PIL import Image, features
+
+        formats = [("PNG", "image/png", {}),
+                   ("JPEG", "image/jpeg", {"progressive": True}),
+                   ("GIF", "image/gif", {})]
+        if features.check("webp"):
+            formats.append(("WEBP", "image/webp", {"lossless": True}))
+        picture = Image.new("RGB", (3, 2), (12, 34, 56))
+        for kind, mime, options in formats:
+            with self.subTest(format=kind):
+                target = io.BytesIO()
+                picture.save(target, format=kind, **options)
+                raw = target.getvalue()
+                encoded = base64.b64encode(raw).decode("ascii")
+                result, _ = self.good(f"""
+import base64
+display(base64.b64decode({encoded!r}), mime={mime!r})
+""")
+                self.assertEqual(result["displays"], [{"mimeType": mime, "data": encoded}])
+                restored = base64.b64decode(result["displays"][0]["data"], validate=True)
+                self.assertEqual(restored, raw)
+                with Image.open(io.BytesIO(restored)) as decoded:
+                    decoded.load()
+                    self.assertEqual(decoded.format, kind)
+                    self.assertEqual(decoded.size, (3, 2))
 
     def test_pillow_dimension_refusal_precedes_encoding(self):
         self.need("PIL")
