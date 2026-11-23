@@ -9652,13 +9652,13 @@ impl ExtensionPolicy {
     /// Evaluate policy for a capability with optional extension context.
     ///
     /// Applies the full precedence chain documented above. Package-qualified
-    /// npm identities also retain restrictions from their old filename ID.
+    /// identities also retain restrictions from their old filename ID.
     /// An ambiguous filename allow cannot grant authority to a newly distinct
     /// package, and a package-specific allow cannot erase an existing deny.
     pub fn evaluate_for(&self, capability: &str, extension_id: Option<&str>) -> PolicyCheck {
         let check = self.evaluate_for_exact(capability, extension_id);
         if let Some(alias) = extension_id
-            .and_then(npm_extension_policy_alias)
+            .and_then(package_extension_policy_alias)
             .filter(|alias| self.per_extension.contains_key(*alias))
         {
             let inherited = self.evaluate_for_exact(capability, Some(alias));
@@ -9770,7 +9770,7 @@ impl ExtensionPolicy {
     /// Check whether a specific extension has any overrides configured.
     pub fn has_override(&self, extension_id: &str) -> bool {
         self.per_extension.contains_key(extension_id)
-            || npm_extension_policy_alias(extension_id)
+            || package_extension_policy_alias(extension_id)
                 .is_some_and(|alias| self.per_extension.contains_key(alias))
     }
 
@@ -9925,7 +9925,7 @@ impl PolicySnapshot {
                     .and_then(|id| self.per_extension.get(id))
                     .map_or(&self.global[idx], |arr| &arr[idx]);
                 if let Some(inherited) = extension_id
-                    .and_then(npm_extension_policy_alias)
+                    .and_then(package_extension_policy_alias)
                     .and_then(|alias| self.per_extension.get(alias))
                     .map(|arr| &arr[idx])
                     && decision_strictness(inherited.decision) > decision_strictness(entry.decision)
@@ -10893,18 +10893,18 @@ pub struct JsExtensionLoadSpec {
     pub api_version: String,
 }
 
-/// The reserved npm prefix distinguishes inferred package identities from
+/// Reserved prefixes distinguish inferred package identities from
 /// explicit extension-manifest IDs (which cannot contain `:`). The suffix is
 /// only a restrictive policy alias; it never supplies a permission grant.
-fn npm_extension_policy_alias(extension_id: &str) -> Option<&str> {
-    let (package, alias) = extension_id.strip_prefix("npm:")?.split_once(':')?;
+fn package_extension_policy_alias(extension_id: &str) -> Option<&str> {
+    let qualified = extension_id
+        .strip_prefix("npm:")
+        .or_else(|| extension_id.strip_prefix("package:"))?;
+    let (package, alias) = qualified.split_once(':')?;
     (!package.is_empty() && !alias.is_empty()).then_some(alias)
 }
 
-/// Confirm the package name against its installed location, independently of
-/// the stricter application-storage namespace rules. A package named `auth`,
-/// for example, has an identity but still cannot own Pi's auth directory.
-fn npm_extension_package_name<'a>(package_root: &Path, name: &'a str) -> Option<&'a str> {
+fn extension_package_name(name: &str) -> Option<&str> {
     let valid_component = |component: &str| {
         !component.is_empty()
             && component != "."
@@ -10913,32 +10913,60 @@ fn npm_extension_package_name<'a>(package_root: &Path, name: &'a str) -> Option<
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     };
-    let is_node_modules = |path: &Path| {
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| {
-                value == "node_modules"
-                    || (cfg!(windows) && value.eq_ignore_ascii_case("node_modules"))
-            })
+    let valid = if let Some(scoped) = name.strip_prefix('@') {
+        let (scope, package) = scoped.split_once('/')?;
+        valid_component(scope) && valid_component(package)
+    } else {
+        valid_component(name)
     };
+    valid.then_some(name)
+}
+
+fn is_node_modules_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            value == "node_modules"
+                || (cfg!(windows) && value.eq_ignore_ascii_case("node_modules"))
+        })
+}
+
+/// Confirm the package name against its installed location, independently of
+/// the stricter application-storage namespace rules. A package named `auth`,
+/// for example, has an identity but still cannot own Pi's auth directory.
+fn npm_extension_package_name<'a>(package_root: &Path, name: &'a str) -> Option<&'a str> {
+    let name = extension_package_name(name)?;
     if let Some(scoped) = name.strip_prefix('@') {
         let (scope, package) = scoped.split_once('/')?;
         let scope_root = package_root.parent()?;
-        if !valid_component(scope)
-            || !valid_component(package)
-            || package_root.file_name()?.to_str()? != package
+        if package_root.file_name()?.to_str()? != package
             || scope_root.file_name()?.to_str()? != format!("@{scope}")
-            || !is_node_modules(scope_root.parent()?)
+            || !is_node_modules_directory(scope_root.parent()?)
         {
             return None;
         }
-    } else if !valid_component(name)
-        || package_root.file_name()?.to_str()? != name
-        || !is_node_modules(package_root.parent()?)
+    } else if package_root.file_name()?.to_str()? != name
+        || !is_node_modules_directory(package_root.parent()?)
     {
         return None;
     }
     Some(name)
+}
+
+fn extension_package_identity_prefix(package_root: &Path, name: &str) -> Option<&'static str> {
+    extension_package_name(name)?;
+    if npm_extension_package_name(package_root, name).is_some() {
+        Some("npm")
+    } else if package_root.ancestors().any(is_node_modules_directory) {
+        // An installed package with a mismatching name must not bypass the
+        // install-name check by falling back to a local-package identity.
+        None
+    } else {
+        // The caller has established that the nearest owning manifest
+        // declares this exact entry. Git/local package names supply identity
+        // only, never npm storage grants or another package's roots.
+        Some("package")
+    }
 }
 
 impl JsExtensionLoadSpec {
@@ -11008,7 +11036,7 @@ impl JsExtensionLoadSpec {
         }
 
         // Nested entrypoints such as src/index.ts and dist/extension.js are
-        // common across unrelated installed packages. Qualify their inferred
+        // common across unrelated npm, Git and local packages. Qualify the
         // owner using the package that actually declares this exact entry,
         // never an arbitrary ancestor's display name. Explicit manifest IDs
         // still take the separate from_manifest path and remain unchanged.
@@ -11020,9 +11048,9 @@ impl JsExtensionLoadSpec {
             && let Some(package_name) = json
                 .get("name")
                 .and_then(Value::as_str)
-                .and_then(|name| npm_extension_package_name(&root, name))
+            && let Some(prefix) = extension_package_identity_prefix(&root, package_name)
         {
-            extension_id = format!("npm:{package_name}:{extension_id}");
+            extension_id = format!("{prefix}:{package_name}:{extension_id}");
             name = package_name.to_string();
             if let Some(package_version) = json.get("version").and_then(Value::as_str)
                 && !package_version.trim().is_empty()
@@ -15390,7 +15418,9 @@ mod application_storage_tests {
             ),
             ("node_modules/auth", "auth", "npm:auth:src"),
             ("node_modules/installed", "different-name", "src"),
-            ("loose-package", "loose-package", "src"),
+            ("loose-package", "loose-package", "package:loose-package:src"),
+            ("invalid-package", "invalid:name", "src"),
+            ("empty-package", "", "src"),
         ] {
             let (_, entry) = make_package(directory, name, "./src/index.mjs");
             assert_eq!(
@@ -15437,10 +15467,73 @@ mod application_storage_tests {
             "chosen-owner"
         );
         assert_eq!(
-            npm_extension_policy_alias("npm:pi.tool:entry:part"),
+            package_extension_policy_alias("npm:pi.tool:entry:part"),
             Some("entry:part")
         );
         assert!(npm_extension_package_name(Path::new("node_modules/foo:bar"), "foo:bar").is_none());
+    }
+
+    #[test]
+    fn local_package_identity_requires_owning_declaration_and_grants_no_npm_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("git/github.com/fixture/context-mode");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"context-mode","version":"1.0.0","pi":{"extensions":["./src/index.mjs"]}}"#,
+        )
+        .unwrap();
+        let entry = root.join("src/index.mjs");
+        fs::write(&entry, "export default function() {}").unwrap();
+        let spec = JsExtensionLoadSpec::from_entry_path(&entry).unwrap();
+        assert_eq!(spec.extension_id, "package:context-mode:src");
+        let original_identity = spec.extension_id.clone();
+        let specs = vec![spec];
+        let explicit = HashSet::from([safe_canonicalize(&entry)]);
+        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        let storage = collect_js_application_storage_namespaces(&grouped);
+        assert!(
+            storage.owned.iter().all(|(_, roots)| roots.is_empty()),
+            "a Git package name must not acquire npm application storage"
+        );
+        assert!(storage.denied.is_empty());
+
+        // Package updates and different checkout locations do not change the
+        // declared identity; unrelated copies still collide at group admission.
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"context-mode","version":"2.0.0","pi":{"extensions":["./src/index.mjs"]}}"#,
+        )
+        .unwrap();
+        let reloaded = JsExtensionLoadSpec::from_entry_path(&entry).unwrap();
+        assert_eq!(reloaded.extension_id, original_identity);
+        assert_eq!(reloaded.version, "2.0.0");
+
+        // Merely naming an ancestor package is insufficient: its declaration
+        // must cover this exact entry, and a nearer package remains a boundary.
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"context-mode","pi":{"extensions":["./different.mjs"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            JsExtensionLoadSpec::from_entry_path(&entry)
+                .unwrap()
+                .extension_id,
+            "src"
+        );
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"context-mode","pi":{"extensions":["./src/index.mjs"]}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/package.json"), r#"{"name":"nested"}"#).unwrap();
+        assert_eq!(
+            JsExtensionLoadSpec::from_entry_path(entry)
+                .unwrap()
+                .extension_id,
+            "src"
+        );
     }
 
     #[test]

@@ -4071,9 +4071,20 @@ fn check_version_constraint_treats_bare_literals_as_exact_matches() {
 
 #[test]
 fn qualified_npm_prompt_cache_inherits_only_applicable_filename_denials() {
+    assert_package_prompt_cache_restrictions("npm:@fixture/fetch:src", "npm:@fixture/search:src");
+}
+
+#[test]
+fn qualified_local_prompt_cache_inherits_only_applicable_filename_denials() {
+    assert_package_prompt_cache_restrictions(
+        "package:@fixture/fetch:src",
+        "package:@fixture/search:src",
+    );
+}
+
+fn assert_package_prompt_cache_restrictions(owner: &str, peer: &str) {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("permissions.json");
-    let owner = "npm:@fixture/fetch:src";
     let mut store = PermissionStore::open(&path).unwrap();
     store
         .record_with_version("src", "exec", false, ">=2.0.0 <3.0.0")
@@ -4105,12 +4116,12 @@ fn qualified_npm_prompt_cache_inherits_only_applicable_filename_denials() {
         "a filename allow must not authorize a newly distinct package"
     );
     assert_eq!(
-        manager.cached_policy_prompt_decision("npm:@fixture/search:src", "http"),
+        manager.cached_policy_prompt_decision(peer, "http"),
         Some(false),
         "an unversioned filename deny applies to each package"
     );
     assert_eq!(
-        manager.cached_policy_prompt_decision("npm:@fixture/search:src", "exec"),
+        manager.cached_policy_prompt_decision(peer, "exec"),
         None,
         "a version-constrained decision needs a known matching package version"
     );

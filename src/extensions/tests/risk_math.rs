@@ -976,6 +976,23 @@ fn quota_monotonic_total_never_decreases() {
 
 #[test]
 fn quota_manager_npm_identity_keeps_filename_limits_with_independent_usage() {
+    assert_package_quota_restrictions(
+        "npm:@fixture/fetch:src",
+        "npm:@fixture/search:src",
+        "npm:@fixture/blocked:src",
+    );
+}
+
+#[test]
+fn quota_manager_local_identity_keeps_filename_limits_with_independent_usage() {
+    assert_package_quota_restrictions(
+        "package:@fixture/fetch:src",
+        "package:@fixture/search:src",
+        "package:@fixture/blocked:src",
+    );
+}
+
+fn assert_package_quota_restrictions(owner: &str, peer: &str, tighter: &str) {
     let manager = ExtensionManager::new();
     let mut policy = ExtensionPolicy::default();
     policy.per_extension.insert(
@@ -992,7 +1009,6 @@ fn quota_manager_npm_identity_keeps_filename_limits_with_independent_usage() {
             ..Default::default()
         },
     );
-    let owner = "npm:@fixture/fetch:src";
     policy.per_extension.insert(
         owner.to_string(),
         ExtensionOverride {
@@ -1011,7 +1027,6 @@ fn quota_manager_npm_identity_keeps_filename_limits_with_independent_usage() {
         manager.check_quota(Some(owner), "tool", 1001, &policy),
         QuotaCheckResult::Exceeded { reason } if reason.contains("total hostcalls")
     ));
-    let peer = "npm:@fixture/search:src";
     assert_eq!(
         manager.check_quota(Some(peer), "tool", 1002, &policy),
         QuotaCheckResult::Allowed,
@@ -1031,7 +1046,6 @@ fn quota_manager_npm_identity_keeps_filename_limits_with_independent_usage() {
             .all(|event| event.quota_config_source == "per_extension")
     );
 
-    let tighter = "npm:@fixture/blocked:src";
     policy.per_extension.insert(
         tighter.to_string(),
         ExtensionOverride {

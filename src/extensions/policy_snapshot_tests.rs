@@ -310,3 +310,86 @@ fn npm_qualification_treats_the_filename_policy_alias_as_a_literal_key() {
         PolicyDecision::Deny
     );
 }
+
+#[test]
+fn local_package_policy_never_borrows_filename_or_npm_grants() {
+    let owner = "package:@fixture/fetch:src";
+    let mut policy = ExtensionPolicy {
+        mode: ExtensionPolicyMode::Strict,
+        default_caps: Vec::new(),
+        deny_caps: Vec::new(),
+        ..Default::default()
+    };
+    for alias in ["src", "npm:@fixture/fetch:src"] {
+        policy.per_extension.insert(
+            alias.to_string(),
+            ExtensionOverride {
+                mode: Some(ExtensionPolicyMode::Permissive),
+                allow: vec!["exec".to_string(), "env".to_string()],
+                ..Default::default()
+            },
+        );
+    }
+    assert!(policy.has_override(owner));
+    let snapshot = PolicySnapshot::compile(&policy);
+    for capability in ["exec", "env", "unknown-capability"] {
+        assert_eq!(
+            policy.evaluate_for(capability, Some(owner)).decision,
+            PolicyDecision::Deny
+        );
+        assert_eq!(
+            snapshot.lookup(capability, Some(owner)).decision,
+            PolicyDecision::Deny
+        );
+    }
+
+    policy.per_extension.insert(
+        owner.to_string(),
+        ExtensionOverride {
+            allow: vec!["exec".to_string()],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        PolicySnapshot::compile(&policy)
+            .lookup("exec", Some(owner))
+            .decision,
+        PolicyDecision::Allow,
+        "an explicit package grant remains usable"
+    );
+    for (mode, expected) in [
+        (ExtensionPolicyMode::Strict, PolicyDecision::Deny),
+        (ExtensionPolicyMode::Prompt, PolicyDecision::Prompt),
+    ] {
+        policy.per_extension.insert(
+            "src".to_string(),
+            ExtensionOverride {
+                mode: Some(mode),
+                ..Default::default()
+            },
+        );
+        assert_eq!(policy.evaluate_for("exec", Some(owner)).decision, expected);
+        assert_eq!(
+            PolicySnapshot::compile(&policy)
+                .lookup("exec", Some(owner))
+                .decision,
+            expected
+        );
+    }
+    policy
+        .per_extension
+        .get_mut("src")
+        .unwrap()
+        .deny
+        .push("exec".to_string());
+    assert_eq!(
+        policy.evaluate_for("exec", Some(owner)).decision,
+        PolicyDecision::Deny
+    );
+    assert_eq!(
+        PolicySnapshot::compile(&policy)
+            .lookup("exec", Some(owner))
+            .decision,
+        PolicyDecision::Deny
+    );
+}

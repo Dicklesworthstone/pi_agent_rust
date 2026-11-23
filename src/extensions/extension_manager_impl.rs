@@ -667,7 +667,7 @@ impl ExtensionManager {
             .per_extension
             .get(ext_id)
             .and_then(|ovr| ovr.quota.as_ref());
-        let inherited_quota = npm_extension_policy_alias(ext_id)
+        let inherited_quota = package_extension_policy_alias(ext_id)
             .and_then(|alias| policy.per_extension.get(alias))
             .and_then(|ovr| ovr.quota.as_ref());
         let mut quota_config = exact_quota
@@ -3208,7 +3208,7 @@ impl ExtensionManager {
                 .get(extension_id)
                 .and_then(|by_cap| by_cap.get(capability))
                 .cloned();
-            let inherited = npm_extension_policy_alias(extension_id)
+            let inherited = package_extension_policy_alias(extension_id)
                 .and_then(|alias| guard.policy_prompt_cache.get(alias))
                 .and_then(|by_cap| by_cap.get(capability))
                 .filter(|decision| !decision.allow)

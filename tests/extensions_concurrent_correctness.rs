@@ -1458,6 +1458,26 @@ fn unrelated_same_id_packages_and_cross_package_coentries_fail_before_factories(
     );
     candidates.push(duplicate_installs);
 
+    // Package names are not globally authoritative. Two unrelated Git/local
+    // roots claiming the same name must still fail before either factory runs.
+    let mut duplicate_checkouts = Vec::new();
+    for prefix in ["git/github.com/first/checkout", "local/second-checkout"] {
+        harness.create_file(
+            format!("{prefix}/package.json"),
+            br#"{"name":"@fixture/duplicate","pi":{"extensions":["./src/index.mjs"]}}"#,
+        );
+        duplicate_checkouts.push(make_spec(&format!("{prefix}/src/index.mjs")));
+    }
+    assert_eq!(
+        duplicate_checkouts[0].extension_id,
+        "package:@fixture/duplicate:src"
+    );
+    assert_eq!(
+        duplicate_checkouts[0].extension_id,
+        duplicate_checkouts[1].extension_id
+    );
+    candidates.push(duplicate_checkouts);
+
     // A declaring workspace cannot absorb a nearer named package merely
     // because that package has no pi.extensions of its own.
     harness.create_file(
@@ -1603,12 +1623,42 @@ fn start_provenance_fixture(
 /// src/index.*. They need distinct realms without discarding existing
 /// filename-policy restrictions or granting access to their peer's files.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn scoped_npm_index_entries_keep_distinct_realms_and_legacy_policy_restrictions() {
-    let harness = common::TestHarness::new("provenance_scoped_npm_identity");
+    assert_declared_index_package_isolation(
+        "provenance_scoped_npm_identity",
+        "node_modules/@fixture",
+        "npm",
+    );
+}
+
+#[test]
+fn local_index_entries_keep_distinct_realms_and_legacy_policy_restrictions() {
+    assert_declared_index_package_isolation(
+        "provenance_local_identity",
+        "local-extensions",
+        "package",
+    );
+}
+
+#[test]
+fn git_index_entries_keep_distinct_realms_and_legacy_policy_restrictions() {
+    assert_declared_index_package_isolation(
+        "provenance_git_identity",
+        ".pi/agent/git/github.com/fixture",
+        "package",
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_declared_index_package_isolation(
+    scenario: &'static str,
+    package_base: &'static str,
+    identity_prefix: &'static str,
+) {
+    let harness = common::TestHarness::new(scenario);
     let mut specs = Vec::new();
     for name in ["pi-web-fetch", "pi-web-search"] {
-        let package = format!("node_modules/@fixture/{name}");
+        let package = format!("{package_base}/{name}");
         harness.create_file(
             format!("{package}/package.json"),
             serde_json::to_vec(&json!({
@@ -1651,7 +1701,10 @@ fn scoped_npm_index_entries_keep_distinct_realms_and_legacy_policy_restrictions(
             }
         ");
         let spec = JsExtensionLoadSpec::from_entry_path(entry).expect("package spec");
-        assert_eq!(spec.extension_id, format!("npm:@fixture/{name}:src"));
+        assert_eq!(
+            spec.extension_id,
+            format!("{identity_prefix}:@fixture/{name}:src")
+        );
         assert_eq!(spec.name, format!("@fixture/{name}"));
         assert_eq!(spec.version, "2.3.4");
         specs.push(spec);
@@ -1679,8 +1732,17 @@ fn scoped_npm_index_entries_keep_distinct_realms_and_legacy_policy_restrictions(
     let (manager, _) = start_provenance_fixture(&harness, policy);
     common::run_async(async move {
         for _ in 0..2 {
+            let reloaded_specs = specs
+                .iter()
+                .map(|spec| {
+                    let reloaded = JsExtensionLoadSpec::from_entry_path(&spec.entry_path)
+                        .expect("reload declared package");
+                    assert_eq!(reloaded.extension_id, spec.extension_id);
+                    reloaded
+                })
+                .collect();
             manager
-                .load_js_extensions(specs.clone())
+                .load_js_extensions(reloaded_specs)
                 .await
                 .expect("distinct package realms load");
             for name in ["pi-web-fetch", "pi-web-search"] {
@@ -1709,7 +1771,7 @@ fn scoped_npm_index_entries_keep_distinct_realms_and_legacy_policy_restrictions(
                 assert!(
                     !harness
                         .temp_dir()
-                        .join(format!("node_modules/@fixture/{name}/created.txt"))
+                        .join(format!("{package_base}/{name}/created.txt"))
                         .exists()
                 );
             }
@@ -1719,8 +1781,8 @@ fn scoped_npm_index_entries_keep_distinct_realms_and_legacy_policy_restrictions(
     });
 }
 
-/// Declared entries of one package retain their shared realm and unchanged
-/// policy key, including an entry below a pure Node module-format scope.
+/// Declared entries of one package retain their shared realm and existing
+/// policy restrictions, including an entry below a pure Node module-format scope.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn declared_same_package_entries_preserve_order_assets_and_legacy_policy_denials() {
@@ -1762,7 +1824,11 @@ fn declared_same_package_entries_preserve_order_assets_and_legacy_policy_denials
         JsExtensionLoadSpec::from_entry_path(first).expect("first spec"),
         JsExtensionLoadSpec::from_entry_path(second).expect("second spec"),
     ];
-    assert!(specs.iter().all(|spec| spec.extension_id == "extension"));
+    assert!(
+        specs
+            .iter()
+            .all(|spec| spec.extension_id == "package:different-display-name:extension")
+    );
     let mut policy = pi::extensions::ExtensionPolicy::default();
     policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
     policy
