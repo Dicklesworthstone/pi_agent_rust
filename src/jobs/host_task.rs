@@ -310,9 +310,6 @@ where
             "PI_JOBS_TASK_TIMEOUT: original task deadline expired before launch",
         ));
     }
-    let _lifecycle = lifecycle_lock()
-        .lock()
-        .map_err(|_| Error::tool("jobs", "jobs lifecycle lock poisoned"))?;
     let check_admission = || {
         check_owner(&work.owner)?;
         ensure_session_spawn_generation(owner_session_id, admission.0.generation())?;
@@ -325,7 +322,25 @@ where
         Ok(())
     };
     check_admission()?;
+    // A peer may be stalled in filesystem setup while holding the lifecycle
+    // lane. Queued native launches share the shell-job capacity limit and
+    // must still retire when their owner, session or original deadline ends.
+    // Reserve before waiting so that contention cannot create an unbounded
+    // queue outside the ordinary eight-job admission limit.
     let (id, sequence, slot) = reserve_job_slot()?;
+    let _lifecycle = loop {
+        check_admission()?;
+        match lifecycle_lock().try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(TASK_POLL_INTERVAL);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(Error::tool("jobs", "jobs lifecycle lock poisoned"));
+            }
+        }
+    };
+    check_admission()?;
     let (artifact_path, artifact, artifact_cleanup) =
         task_artifact(artifact_root, &id, check_admission)?;
     let artifact = Arc::new(Mutex::new(ArtifactSink::new(artifact, MAX_ARTIFACT_BYTES)));
@@ -836,6 +851,217 @@ mod tests {
             }
             self.dropped.store(true, Ordering::Release);
         }
+    }
+
+    #[derive(Default)]
+    struct AdmissionProbe {
+        polled: AtomicBool,
+        drops: std::sync::atomic::AtomicUsize,
+        original_owner_drop: AtomicBool,
+    }
+
+    struct QueuedWork(Arc<AdmissionProbe>);
+
+    impl Future for QueuedWork {
+        type Output = Result<ToolOutput>;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            self.0.polled.store(true, Ordering::Release);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for QueuedWork {
+        fn drop(&mut self) {
+            self.0.drops.fetch_add(1, Ordering::AcqRel);
+            // Test callers install an unrelated context with no I/O authority.
+            // Retirement must restore the task's explicit, capable owner.
+            self.0.original_owner_drop.store(
+                asupersync::Cx::current().is_some_and(|cx| cx.capabilities().io),
+                Ordering::Release,
+            );
+        }
+    }
+
+    fn assert_rejected_admission(
+        session: &str,
+        root: &Path,
+        probe: &AdmissionProbe,
+        starting_jobs: usize,
+    ) {
+        assert!(!probe.polled.load(Ordering::Acquire));
+        assert_eq!(probe.drops.load(Ordering::Acquire), 1);
+        assert!(probe.original_owner_drop.load(Ordering::Acquire));
+        assert!(!root.join("jobs").exists());
+        assert!(super::super::list(session).expect("owner jobs").is_empty());
+        assert!(super::super::take_completion_notices(session).is_empty());
+        assert!(!super::super::has_pending_work(session).expect("owner admission"));
+        let reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(reg.starting_jobs, starting_jobs);
+        assert!(!reg.owner_spawns_in_flight.contains_key(session));
+        assert!(!reg.owner_shutdown_generations.contains_key(session));
+    }
+
+    #[test]
+    fn lifecycle_contention_respects_native_cancellation_deadline_and_shutdown() {
+        let _guard = super::super::process_test_guard();
+        for reason in ["deadline", "owner", "session"] {
+            let root = tempfile::tempdir().expect("native admission root");
+            let session = owner_id();
+            let admission = admit_owned_task(&session).expect("capture native admission");
+            let owner = AgentCx::for_request();
+            let worker_owner = owner.clone();
+            let worker_root = root.path().to_path_buf();
+            let probe = Arc::new(AdmissionProbe::default());
+            let worker_probe = Arc::clone(&probe);
+            let baseline_starting = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .starting_jobs;
+            let lifecycle = lifecycle_lock().lock().expect("hold peer lifecycle lane");
+            let (completed, completion) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let restricted =
+                    asupersync::Cx::for_request().restrict::<asupersync::cx::cap::None>();
+                let _caller = restricted.set_current_restricted();
+                let result = super::spawn_owned_task(
+                    admission,
+                    "queued native task",
+                    worker_owner,
+                    if reason == "deadline" {
+                        Duration::from_millis(100)
+                    } else {
+                        Duration::from_secs(30)
+                    },
+                    Some(&worker_root),
+                    privacy(),
+                    QueuedWork(worker_probe),
+                )
+                .map(|snapshot| snapshot.id)
+                .map_err(|error| error.to_string());
+                let _ = completed.send(result.clone());
+                result
+            });
+
+            let mut reserved = reason == "deadline";
+            if !reserved {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !worker.is_finished() && Instant::now() < deadline {
+                    reserved = registry()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .starting_jobs
+                        > baseline_starting;
+                    if reserved {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let shutdown = if reason == "session" {
+                Some(super::super::SessionShutdownAttempt::begin(&session).expect("close owner"))
+            } else {
+                None
+            };
+            if reason == "owner" {
+                owner.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancel native launch behind peer lifecycle lane"),
+                );
+            }
+            let before_release = completion.recv_timeout(Duration::from_secs(3));
+            // Release the contended lane before assertions, including on a
+            // regressed blocking acquisition, so test failure cannot strand
+            // the caller or poison the process-wide lifecycle mutex.
+            drop(lifecycle);
+            let joined = worker.join().expect("native lifecycle admission");
+            if let Ok(id) = &joined {
+                let _ = super::super::cancel(&session, id);
+            }
+            if let Some(shutdown) = shutdown {
+                shutdown.finish_success().expect("retire owner shutdown");
+            }
+            let expected = match reason {
+                "deadline" => "PI_JOBS_TASK_TIMEOUT",
+                "owner" => "PI_JOBS_TASK_CANCELLED",
+                _ => "PI_JOBS_SESSION_CLOSING",
+            };
+            assert!(reserved, "queued native work must reserve shared capacity");
+            assert!(
+                matches!(&before_release, Ok(Err(error)) if error.contains(expected)),
+                "{reason} must retire native admission while the peer lane is held: {before_release:?}"
+            );
+            assert!(joined.is_err());
+            assert_rejected_admission(&session, root.path(), &probe, baseline_starting);
+        }
+    }
+
+    #[test]
+    fn native_capacity_refusal_does_not_wait_for_the_lifecycle_lane() {
+        let _guard = super::super::process_test_guard();
+        let root = tempfile::tempdir().expect("native admission root");
+        let session = owner_id();
+        let admission = admit_owned_task(&session).expect("capture native admission");
+        let baseline_starting = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starting_jobs;
+        // These are the same reservations held by shell admission workers.
+        // Native work must fail promptly at that shared cap even when a peer
+        // owns the lifecycle lane; it must not create another queued launch.
+        let reservations: Vec<_> = (0..super::super::MAX_CONCURRENT_JOBS)
+            .map(|_| reserve_job_slot().expect("reserve shared job capacity"))
+            .collect();
+        let lifecycle = lifecycle_lock().lock().expect("hold peer lifecycle lane");
+        let probe = Arc::new(AdmissionProbe::default());
+        let worker_probe = Arc::clone(&probe);
+        let worker_root = root.path().to_path_buf();
+        let owner = AgentCx::for_request();
+        let (completed, completion) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let restricted = asupersync::Cx::for_request().restrict::<asupersync::cx::cap::None>();
+            let _caller = restricted.set_current_restricted();
+            let result = super::spawn_owned_task(
+                admission,
+                "over-capacity task",
+                owner,
+                Duration::from_secs(30),
+                Some(&worker_root),
+                privacy(),
+                QueuedWork(worker_probe),
+            )
+            .map(|snapshot| snapshot.id)
+            .map_err(|error| error.to_string());
+            let _ = completed.send(result.clone());
+            result
+        });
+        let before_release = completion.recv_timeout(Duration::from_secs(3));
+        drop(lifecycle);
+        let joined = worker.join().expect("over-capacity native admission");
+        if let Ok(id) = &joined {
+            let _ = super::super::cancel(&session, id);
+        }
+        drop(reservations);
+        assert!(
+            matches!(&before_release, Ok(Err(error)) if error.contains("PI_JOBS_AT_CAPACITY")),
+            "capacity refusal must not wait for a peer's lifecycle lane: {before_release:?}"
+        );
+        assert!(joined.is_err());
+        assert_rejected_admission(&session, root.path(), &probe, baseline_starting);
+
+        let next = spawn_owned_task(
+            &session,
+            "later task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            async { Ok(output("capacity recovered")) },
+        )
+        .expect("capacity available after queued rejection");
+        assert_eq!(settle(&session, &next.id).status, "exited");
     }
 
     #[test]
