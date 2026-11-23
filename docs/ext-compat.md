@@ -767,10 +767,30 @@ individual source identities. Flat sibling files retain directory-based
 filesystem access. Validated package roots keep the more specific entry
 directories that protect one owner's private files from another owner.
 
-If unrelated sources resolve to the same legacy extension ID, loading fails
-before their factories run. The loader preserves existing IDs because
-capability overrides, trust state, and resource limits use those exact keys.
-A rejected replacement leaves the previously loaded extensions available.
+An extension ID comes from the entry filename, or from its directory for an
+`index.*` entry. An entry that a named package declares in `pi.extensions`
+gets a package-qualified ID instead:
+
+- `npm:<package name>:<filename ID>` for an installed npm package, which must
+  sit in a `node_modules` directory whose name matches the manifest `name`,
+  for example `npm:@zeldrisho/pi-web-fetch:src`;
+- `package:<package name>:<filename ID>` for a local or Git package outside
+  `node_modules`, for example `package:context-mode:src`. Only the `npm:` form
+  receives npm application storage.
+
+Two unrelated packages that both declare `./src/index.ts` therefore load side
+by side, each in its own realm with its own package root. A package under
+`node_modules` whose directory does not match its manifest name, a package
+with an empty or invalid name, an explicit manifest ID, and a loose file
+outside any package keep their unqualified IDs.
+
+Policy entries, saved decisions, and quota limits keyed by the old filename ID
+still restrict a package-qualified extension: a deny or a lower limit there
+applies. An allow under the old ID grants nothing, because it cannot say which
+package it meant; key grants by the qualified ID. If unrelated sources still
+resolve to the same ID, for example loose files in different directories or
+two installs of the same package name, loading fails before their factories
+run. A rejected replacement leaves the previously loaded extensions available.
 
 ### Persistent application state
 
@@ -784,8 +804,9 @@ the installed `node_modules` path, manifest package name, and the declared
 `pi.extensions` entrypoint to agree. Thus `npm:context-mode` can create and
 reopen `~/.pi/context-mode/sessions` without receiving access to all of HOME or
 all of `.pi`. Pi's own configuration/authentication directories and unsafe
-namespace components are reserved. Shared legacy extension IDs across unrelated
-sources are rejected before runtime construction. Ambiguous application
+namespace components are reserved. Unrelated sources that still share an
+extension ID after package qualification are rejected before runtime
+construction. Ambiguous application
 namespaces suppress automatic grants and emit diagnostics; unrelated extensions
 retain their own grants. Invalid or linked automatic roots remain deny-only
 boundaries.
