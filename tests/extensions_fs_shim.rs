@@ -2641,7 +2641,10 @@ fn fs_host_reads_preserve_regular_bytes_and_directory_errors() {
             })
         );
         assert_eq!(
-            runtime.read_global_json("hostDirectoryErrors").await.unwrap(),
+            runtime
+                .read_global_json("hostDirectoryErrors")
+                .await
+                .unwrap(),
             serde_json::json!([
                 { "code": "EISDIR", "syscall": "open", "pathMatches": true },
                 { "code": "EISDIR", "syscall": "open", "pathMatches": true },

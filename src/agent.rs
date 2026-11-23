@@ -1895,7 +1895,10 @@ impl AbortSignal {
 /// on an unsent channel subscribes to owner cancellation without spawning a
 /// task; the timer also observes budgets that expire without a notification.
 /// An optional UI abort signal never replaces the invoking owner's lifetime.
-async fn wait_for_provider_cancellation(owner: &crate::agent_cx::AgentCx, abort: Option<&AbortSignal>) {
+async fn wait_for_provider_cancellation(
+    owner: &crate::agent_cx::AgentCx,
+    abort: Option<&AbortSignal>,
+) {
     let owner_cancelled = async {
         let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
         let _ = receiver.recv(owner.cx()).await;
@@ -18194,7 +18197,9 @@ mod abort_tests {
                     Poll::Ready(Some(Err(Error::api("ready stream failure"))))
                 }
                 ReadyProviderResult::StreamEof => Poll::Ready(None),
-                ReadyProviderResult::OpeningError => unreachable!("opening failed before streaming"),
+                ReadyProviderResult::OpeningError => {
+                    unreachable!("opening failed before streaming")
+                }
             }
         }
     }
@@ -18976,9 +18981,8 @@ mod abort_tests {
                 drops: Arc::clone(&drops),
                 calls: AtomicUsize::new(0),
             });
-            let tools = ToolRegistry::from_tools(vec![Box::new(crate::tools::WriteTool::new(
-                temp.path(),
-            ))]);
+            let tools =
+                ToolRegistry::from_tools(vec![Box::new(crate::tools::WriteTool::new(temp.path()))]);
             let mut agent = Agent::new(provider.clone(), tools, AgentConfig::default());
             let owner = crate::agent_cx::AgentCx::for_testing();
             let (abort_handle, abort_signal) = AbortHandle::new();
@@ -19096,9 +19100,8 @@ mod abort_tests {
                 drops: Arc::clone(&drops),
                 calls: AtomicUsize::new(0),
             });
-            let tools = ToolRegistry::from_tools(vec![Box::new(crate::tools::WriteTool::new(
-                temp.path(),
-            ))]);
+            let tools =
+                ToolRegistry::from_tools(vec![Box::new(crate::tools::WriteTool::new(temp.path()))]);
             let mut agent = Agent::new(provider.clone(), tools, AgentConfig::default());
             let events = Arc::new(StdMutex::new(Vec::new()));
             let event_sink = Arc::clone(&events);
@@ -19144,7 +19147,10 @@ mod abort_tests {
 
     #[test]
     fn cancellation_during_stream_error_or_eof_preserves_aborted_partial() {
-        for result in [ReadyProviderResult::StreamError, ReadyProviderResult::StreamEof] {
+        for result in [
+            ReadyProviderResult::StreamError,
+            ReadyProviderResult::StreamEof,
+        ] {
             for cancel_owner in [false, true] {
                 assert_provider_poll_cancellation(result, cancel_owner);
             }
