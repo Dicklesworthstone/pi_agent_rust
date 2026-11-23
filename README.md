@@ -1328,7 +1328,7 @@ command -v legacy-pi && legacy-pi --version
 
 Repository builds are tested with the exact toolchain pinned in
 `rust-toolchain.toml` (`nightly-2026-08-31`). The locked dependency graph
-requires Rust 1.95 or newer. Project builds are DSR-only:
+requires Rust 1.97 or newer. Project builds are DSR-only:
 
 ```bash
 dsr quality --tool pi_agent_rust
@@ -3326,7 +3326,7 @@ Pi is honest about what it doesn't do:
 | **No GUI** | Terminal-only by design |
 | **Some extensions need npm stubs** | Common stubs are provided; unlisted npm packages still require a stub. See docs/planning/EXTENSIONS.md §8.1 |
 | **English-centric** | Works but not optimized for other languages |
-| **Pinned Rust toolchain** | Releases are validated with `nightly-2026-08-31`; locked dependencies require Rust 1.95+ |
+| **Pinned Rust toolchain** | Releases are validated with `nightly-2026-08-31`; locked dependencies require Rust 1.97+ |
 
 ---
 

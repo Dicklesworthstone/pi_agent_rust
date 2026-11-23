@@ -1,5 +1,5 @@
 # Pinned to a specific nightly so builds and lint results are reproducible.
-# The locked dependency graph requires Rust 1.95 or newer; the repository's
+# The locked dependency graph requires Rust 1.97 or newer; the repository's
 # validated release toolchain is nightly-2026-08-31, the channel set below. An
 # unpinned `nightly` channel let clippy drift across toolchains: newer nightlies
 # strengthen the pedantic/nursery lint groups and can expose new warnings

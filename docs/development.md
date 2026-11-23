@@ -3,7 +3,7 @@
 ## Building
 
 Pi release builds use the exact `nightly-2026-08-31` toolchain pinned in
-`rust-toolchain.toml`. The locked dependency graph requires Rust 1.95 or newer;
+`rust-toolchain.toml`. The locked dependency graph requires Rust 1.97 or newer;
 use the repository pin so compiler and Clippy results remain reproducible.
 
 The one authoritative quality entry point is the registered DSR recipe; it
