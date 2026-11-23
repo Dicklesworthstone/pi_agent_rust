@@ -33519,22 +33519,19 @@ export default function init(pi) {
                     "prompt should succeed under inherited deadline: {response}"
                 );
 
-                // Wait for the agent_end event to ensure the provider is actually called
-                // before we drop the connection. Use timeout to prevent hanging.
+                // Wait for the agent_end event without blocking the single-threaded
+                // runtime so `run(...)` continues making progress while emitting events.
                 let mut saw_agent_end = false;
                 for _ in 0..50 {
-                    let Ok(msg) = client_out_rx
-                        .lock()
-                        .expect("lock rx")
-                        .recv_timeout(Duration::from_secs(5))
+                    let Ok(msg) = recv_line(&client_out_rx, "prompt(deadline) agent_end").await
                     else {
                         break;
                     };
-                    if let Ok(json) = serde_json::from_str::<Value>(&msg) {
-                        if json["type"] == "agent_end" {
-                            saw_agent_end = true;
-                            break;
-                        }
+                    if let Ok(json) = serde_json::from_str::<Value>(&msg)
+                        && json["type"] == "agent_end"
+                    {
+                        saw_agent_end = true;
+                        break;
                     }
                 }
                 assert!(saw_agent_end, "expected agent_end event before dropping");

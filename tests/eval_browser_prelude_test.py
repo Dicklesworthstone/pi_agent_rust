@@ -319,7 +319,7 @@ class Tool:
         return {"schema":"pi.eval.tool_result.v1","content":[],"details":args,"isError":False}
 async def _workpool(**options):
     from types import SimpleNamespace
-    return SimpleNamespace(concurrency=1)
+    return SimpleNamespace(concurrency=1, max_batch_size=1)
 NAMESPACE = {"__name__":"__main__","tool":Tool(),"workpool":_workpool}
 def main():
     import workspace_module

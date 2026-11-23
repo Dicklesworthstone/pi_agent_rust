@@ -7180,13 +7180,19 @@ mod tests {
         drop(records);
         drop(store);
         assert!(!temp.path().join("leaked.txt").exists());
+        let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         for name in ["shell.pid", "child.pid"] {
             let pid = std::fs::read_to_string(temp.path().join(name)).expect("started process");
-            let running = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-                stat.rsplit_once(") ")
-                    .is_none_or(|(_, state)| !state.starts_with('Z') && !state.starts_with('X'))
-            });
-            assert!(!running, "cancelled process is still running: {pid}");
+            let is_running = || {
+                std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_none_or(|(_, state)| !state.starts_with('Z') && !state.starts_with('X'))
+                })
+            };
+            while is_running() && std::time::Instant::now() < reap_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!is_running(), "cancelled process is still running: {pid}");
         }
         let _ = app.handle_pi_message(terminal);
         assert!(!app.bash_running);

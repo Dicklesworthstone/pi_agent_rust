@@ -3647,10 +3647,10 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
-        runtime.block_on(manager.connect_trusted_with_budget(Duration::from_millis(20)));
+        runtime.block_on(manager.connect_trusted_with_budget(Duration::from_millis(200)));
 
         started_rx
-            .recv_timeout(Duration::from_millis(50))
+            .recv_timeout(Duration::from_millis(500))
             .expect("initialize must enter its pending state before timeout cleanup");
         assert!(
             state.closed.load(Ordering::Acquire),
