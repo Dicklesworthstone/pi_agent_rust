@@ -432,7 +432,7 @@ impl Invocation<'_> {
             checkpoint(&owner, deadline).map_err(|error| error.to_string())?;
             let (start_tx, start_rx) = oneshot::channel::<JobProgress>();
             let result_privacy = privacy.clone();
-            let job = crate::jobs::spawn_owned_task(
+            let launch = crate::jobs::spawn_owned_task_async(
                 admission,
                 operation.label(),
                 owner.clone(),
@@ -455,9 +455,13 @@ impl Invocation<'_> {
                         .await
                 },
             )
+            .await
             .map_err(|_| {
                 "PI_MODEL_JOB_START: native job could not be admitted; no provider started"
                     .to_string()
+            })?;
+            let job = launch.snapshot().map_err(|_| {
+                "PI_MODEL_JOB_STOPPED: native job stopped before acknowledgment".to_string()
             })?;
             let acknowledgment = if operation == Operation::LegacyCompletion {
                 json!({
@@ -503,6 +507,11 @@ impl Invocation<'_> {
                 Ok(((), None))
             })
             .map_err(|_| {
+                "PI_MODEL_JOB_STOPPED: native job stopped before provider dispatch".to_string()
+            })?;
+            // The launch remains armed across every asynchronous host/session
+            // check. Only this final synchronous commit releases provider work.
+            launch.publish().map_err(|_| {
                 "PI_MODEL_JOB_STOPPED: native job stopped before provider dispatch".to_string()
             })?;
             Ok(encoded)

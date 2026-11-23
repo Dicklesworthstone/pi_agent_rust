@@ -3,8 +3,8 @@
 //! no borrowed Agent, approval callback or eval host crosses this boundary.
 
 use super::{
-    ArtifactCleanupOutcome, ArtifactRetentionPolicy, ArtifactSink, CancelDeadline, JobDelivery,
-    JobEntry, JobSnapshot, JobSnapshotSource, JobStatus, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES,
+    ArtifactCleanupOutcome, ArtifactRetentionPolicy, ArtifactSink, CancelDeadline, ForegroundJob,
+    JobDelivery, JobEntry, JobSnapshot, JobStatus, JobWaitHandle, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES,
     MAX_TOTAL_ARTIFACT_BYTES, MIN_RETAINED_ARTIFACT_FILES, OUTPUT_TAIL_BYTES, TailBuffer,
     acquire_artifact_budget_lock, capture_session_spawn_generation, create_job_artifact,
     enforce_artifact_retention, ensure_process_accepting_jobs, ensure_session_spawn_generation,
@@ -20,7 +20,8 @@ use asupersync::sync::Notify;
 use std::cell::RefCell;
 use std::future::Future;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -249,18 +250,9 @@ pub fn clear_owned_task_progress(owner_session_id: &str, id: &str) -> Result<()>
     Ok(())
 }
 
-/// Launch admitted native work under its original capabilities and budget.
-/// The caller must finish input validation, approval and owner selection
-/// before calling. The future must own its inputs and clean up on drop.
-/// Session shutdown, capacity, retention and notifications are shared with
-/// shell jobs. A timeout or cancellation never publishes a success result.
-// Spawning consumes the admission token; its Drop ends the spawn attempt.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::significant_drop_tightening,
-    clippy::needless_pass_by_value
-)]
+/// Exercise the shared launch engine from synchronous lifecycle fixtures.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_owned_task<F>(
     admission: TaskAdmission,
     label: &str,
@@ -273,13 +265,176 @@ pub fn spawn_owned_task<F>(
 where
     F: Future<Output = Result<ToolOutput>> + Send + 'static,
 {
-    // Even rejected, never-polled work is retired under its original owner.
     let work = OwnedWork {
         owner,
         future: Some(future),
     };
+    let prepared = prepare_native_task(
+        admission,
+        label,
+        work,
+        Instant::now(),
+        timeout,
+        artifact_root,
+        privacy,
+    )?;
+    spawn_prepared_native_task(prepared)?.publish()
+}
+
+/// Prepare admitted work without blocking the invoking runtime on filesystem
+/// or lifecycle locks. The returned guard must be published only after the
+/// caller finishes its own identity and privacy acknowledgment. Until then
+/// the native future is never polled, and dropping either this future or its
+/// returned guard abandons the launch without a background completion notice.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_owned_task_async<F>(
+    admission: TaskAdmission,
+    label: &str,
+    owner: AgentCx,
+    timeout: Duration,
+    artifact_root: Option<&Path>,
+    privacy: AuxiliaryPrivacySnapshot,
+    future: F,
+) -> impl Future<Output = Result<NativeTaskLaunch>> + Send + 'static
+where
+    F: Future<Output = Result<ToolOutput>> + Send + 'static,
+{
+    // Wrap eagerly, before constructing the async future: even a future that
+    // is dropped without one poll must retire its payload under this owner.
+    let work = OwnedWork {
+        owner,
+        future: Some(future),
+    };
+    let started = Instant::now();
+    let label = label.to_owned();
+    let artifact_root = artifact_root.map(Path::to_path_buf);
+    async move {
+        let prepared = prepare_native_task(
+            admission,
+            &label,
+            work,
+            started,
+            timeout,
+            artifact_root.as_deref(),
+            privacy,
+        )?;
+        let owner = prepared.work.owner.clone();
+        let attempt = Arc::clone(&prepared.attempt);
+        let timeout = prepared.timeout;
+        let _cancel_on_drop = CancelNativeAdmission(Arc::clone(&prepared.cancelled));
+        let (sender, mut receiver) = asupersync::channel::oneshot::channel();
+        // Reserve capacity before creating a real launch worker. spawn_blocking
+        // may run inline when the invoking owner has no blocking pool.
+        std::thread::Builder::new()
+            .name(format!("pi-task-{}-admission", prepared.reservation.0))
+            .spawn(move || {
+                let _current = prepared.work.owner.cx().clone().set_current_restricted();
+                let result = spawn_prepared_native_task(prepared);
+                // A disconnected receiver drops the armed launch whether it
+                // disappeared before send or while the result was queued.
+                let _ = sender.send_blocking(result);
+            })
+            .map_err(|error| {
+                Error::tool(
+                    "jobs",
+                    format!("PI_JOBS_TASK_ADMISSION: failed to start launch worker: {error}"),
+                )
+            })?;
+        let mut receiving = Box::pin(receiver.recv(owner.cx()));
+        let received = loop {
+            check_owner(&owner)?;
+            ensure_session_spawn_generation(&attempt.owner_session_id, attempt.generation())?;
+            check_task_deadline(started, timeout)?;
+            let time = owner.time();
+            let remaining = timeout
+                .saturating_sub(started.elapsed())
+                .min(TASK_POLL_INTERVAL);
+            let sleep = Box::pin(time.sleep(remaining));
+            match futures::future::select(receiving, sleep).await {
+                futures::future::Either::Left((result, _)) => break result,
+                futures::future::Either::Right(((), pending)) => receiving = pending,
+            }
+        };
+        let launch = received.map_err(|error| {
+            if error == asupersync::channel::oneshot::RecvError::Cancelled {
+                Error::tool("jobs", "PI_JOBS_TASK_CANCELLED: task owner cancelled")
+            } else {
+                Error::tool(
+                    "jobs",
+                    format!("PI_JOBS_TASK_ADMISSION: launch worker stopped: {error}"),
+                )
+            }
+        })??;
+        launch.check()?;
+        Ok(launch)
+    }
+}
+
+/// Own an admitted task until its complete caller acknowledgment is ready.
+/// The foreground guard only mutates registry state on drop; artifact cleanup
+/// and future destruction stay on the task's worker, never the tool executor.
+pub struct NativeTaskLaunch {
+    job: ForegroundJob,
+    attempt: Arc<super::SessionSpawnAttempt>,
+    owner: AgentCx,
+    started: Instant,
+    timeout: Duration,
+}
+
+impl NativeTaskLaunch {
+    fn check(&self) -> Result<()> {
+        check_owner(&self.owner)?;
+        ensure_session_spawn_generation(
+            &self.attempt.owner_session_id,
+            self.attempt.generation(),
+        )?;
+        check_task_deadline(self.started, self.timeout)
+    }
+
+    pub fn snapshot(&self) -> Result<JobSnapshot> {
+        self.check()?;
+        self.job.snapshot()
+    }
+
+    /// Publish once, synchronously, after every fallible async preflight step.
+    /// This transition is the first point at which the native future may run.
+    pub fn publish(self) -> Result<JobSnapshot> {
+        self.check()?;
+        self.job.publish_background(self.attempt.generation())
+    }
+}
+
+struct PreparedNativeTask<F> {
+    attempt: Arc<super::SessionSpawnAttempt>,
+    work: OwnedWork<F>,
+    label: String,
+    started: Instant,
+    timeout: Duration,
+    artifact_root: Option<PathBuf>,
+    privacy: AuxiliaryPrivacySnapshot,
+    reservation: (String, u64, super::StartingJobSlot),
+    cancelled: Arc<AtomicBool>,
+}
+
+struct CancelNativeAdmission(Arc<AtomicBool>);
+
+impl Drop for CancelNativeAdmission {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+fn prepare_native_task<F>(
+    admission: TaskAdmission,
+    label: &str,
+    work: OwnedWork<F>,
+    started: Instant,
+    timeout: Duration,
+    artifact_root: Option<&Path>,
+    privacy: AuxiliaryPrivacySnapshot,
+) -> Result<PreparedNativeTask<F>> {
     check_owner(&work.owner)?;
-    let owner_session_id = admission.0.owner_session_id.as_str();
     if timeout.is_zero() || timeout > Duration::from_hours(24) {
         return Err(Error::tool(
             "jobs",
@@ -300,26 +455,62 @@ where
             "PI_JOBS_PRIVACY: task label projection changed shape",
         ));
     };
-    let started = Instant::now();
     let timeout = admission.1.map_or(timeout, |deadline| {
         timeout.min(deadline.saturating_duration_since(started))
     });
-    if timeout.is_zero() {
+    check_task_deadline(started, timeout)?;
+    ensure_session_spawn_generation(&admission.0.owner_session_id, admission.0.generation())?;
+    let reservation = reserve_job_slot()?;
+    Ok(PreparedNativeTask {
+        attempt: Arc::new(admission.0),
+        work,
+        label: label.to_string(),
+        started,
+        timeout,
+        artifact_root: artifact_root.map(Path::to_path_buf),
+        privacy,
+        reservation,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+fn check_task_deadline(started: Instant, timeout: Duration) -> Result<()> {
+    if started.elapsed() >= timeout {
         return Err(Error::tool(
             "jobs",
             "PI_JOBS_TASK_TIMEOUT: original task deadline expired before launch",
         ));
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+fn spawn_prepared_native_task<F>(prepared: PreparedNativeTask<F>) -> Result<NativeTaskLaunch>
+where
+    F: Future<Output = Result<ToolOutput>> + Send + 'static,
+{
+    let PreparedNativeTask {
+        attempt,
+        work,
+        label,
+        started,
+        timeout,
+        artifact_root,
+        privacy,
+        reservation: (id, sequence, slot),
+        cancelled,
+    } = prepared;
+    let owner_session_id = attempt.owner_session_id.as_str();
     let check_admission = || {
         check_owner(&work.owner)?;
-        ensure_session_spawn_generation(owner_session_id, admission.0.generation())?;
-        if started.elapsed() >= timeout {
+        if cancelled.load(Ordering::Acquire) {
             return Err(Error::tool(
                 "jobs",
-                "PI_JOBS_TASK_TIMEOUT: original task deadline expired before launch",
+                "PI_JOBS_TASK_CANCELLED: task launch abandoned",
             ));
         }
-        Ok(())
+        ensure_session_spawn_generation(owner_session_id, attempt.generation())?;
+        check_task_deadline(started, timeout)
     };
     check_admission()?;
     // A peer may be stalled in filesystem setup while holding the lifecycle
@@ -327,7 +518,6 @@ where
     // must still retire when their owner, session or original deadline ends.
     // Reserve before waiting so that contention cannot create an unbounded
     // queue outside the ordinary eight-job admission limit.
-    let (id, sequence, slot) = reserve_job_slot()?;
     let _lifecycle = loop {
         check_admission()?;
         match lifecycle_lock().try_lock() {
@@ -342,7 +532,7 @@ where
     };
     check_admission()?;
     let (artifact_path, artifact, artifact_cleanup) =
-        task_artifact(artifact_root, &id, check_admission)?;
+        task_artifact(artifact_root.as_deref(), &id, check_admission)?;
     let artifact = Arc::new(Mutex::new(ArtifactSink::new(artifact, MAX_ARTIFACT_BYTES)));
     let tail = Arc::new(Mutex::new(TailBuffer::new(OUTPUT_TAIL_BYTES)));
     // Shutdown can publish its fence while artifact I/O holds the lifecycle
@@ -351,7 +541,8 @@ where
     check_admission()?;
     #[cfg(test)]
     super::invoke_before_native_registry_publication_hook(owner_session_id);
-    let source = {
+    check_admission()?;
+    let handle = {
         let mut reg = registry()
             .lock()
             .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
@@ -362,7 +553,7 @@ where
             .copied()
             .unwrap_or_default();
         if reg.closing_owners.contains_key(owner_session_id)
-            || generation != admission.0.generation()
+            || generation != attempt.generation()
         {
             return Err(session_closing_error(owner_session_id));
         }
@@ -371,9 +562,9 @@ where
             result: None,
             result_bytes: 0,
             owner_session_id: owner_session_id.to_string(),
-            delivery: JobDelivery::Background,
+            delivery: JobDelivery::Foreground,
             id: id.clone(),
-            command: label.to_string(),
+            command: label,
             started_at_ms: now_ms(),
             sequence,
             settled_sequence: None,
@@ -392,10 +583,16 @@ where
             settled_notify: Arc::new(Notify::new()),
             cancel_deadline: Arc::new(CancelDeadline::new()),
         };
-        let source = JobSnapshotSource::from_entry(&entry);
+        let handle = JobWaitHandle {
+            owner_session_id: owner_session_id.to_string(),
+            id: id.clone(),
+            settled_snapshot: Arc::clone(&entry.settled_snapshot),
+            settled_notify: Arc::clone(&entry.settled_notify),
+            cancel_deadline: Arc::clone(&entry.cancel_deadline),
+        };
         reg.jobs.insert(id.clone(), entry);
         slot.commit(&mut reg);
-        source
+        handle
     };
     // The caller retains cleanup ownership if the OS refuses a thread.
     let resources = Arc::new(Mutex::new(Some(TaskResources {
@@ -410,6 +607,7 @@ where
         session: owner_session_id.to_string(),
         job: id.clone(),
     };
+    let owner = work.owner.clone();
     let worker = std::thread::Builder::new().name(format!("pi-task-{id}"))
         .spawn(move || {
             // This dedicated thread runs a current-thread runtime below.
@@ -455,7 +653,22 @@ where
             .remove(&id);
         return Err(Error::tool("jobs", format!("PI_JOBS_TASK_SPAWN: {error}")));
     }
-    Ok(JobSnapshot::from_source_best_effort(&source))
+    let launch = NativeTaskLaunch {
+        job: ForegroundJob {
+            handle,
+            armed: true,
+        },
+        attempt,
+        owner,
+        started,
+        timeout,
+    };
+    #[cfg(test)]
+    super::invoke_after_registry_publication_hook(
+        &launch.attempt.owner_session_id,
+        &launch.job.handle.id,
+    );
+    Ok(launch)
 }
 
 fn check_owner(owner: &AgentCx) -> Result<()> {
@@ -532,6 +745,13 @@ impl<F: Future<Output = Result<ToolOutput>>> OwnedWork<F> {
             if started.elapsed() >= timeout {
                 return TaskOutcome::TimedOut;
             }
+            // Setup and logical acknowledgment may include several awaits.
+            // Never poll user work, including child readiness or progress,
+            // while its launching caller still owns an unpublished guard.
+            if !task_published(id) {
+                asupersync::time::sleep(asupersync::time::wall_now(), TASK_POLL_INTERVAL).await;
+                continue;
+            }
             // The monitor's timer lives in this worker runtime. Only the
             // task future is polled under the captured caller's context, so
             // a cancelled caller cannot park its own cleanup monitor.
@@ -561,6 +781,15 @@ fn task_cancelled(id: &str) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     reg.shutting_down || reg.jobs.get(id).is_none_or(|job| job.cancel_requested)
+}
+
+fn task_published(id: &str) -> bool {
+    registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .jobs
+        .get(id)
+        .is_some_and(|job| job.delivery == JobDelivery::Background)
 }
 
 struct TaskResources {
@@ -902,6 +1131,364 @@ mod tests {
         assert_eq!(reg.starting_jobs, starting_jobs);
         assert!(!reg.owner_spawns_in_flight.contains_key(session));
         assert!(!reg.owner_shutdown_generations.contains_key(session));
+    }
+
+    fn wait_for_native_admission_cleanup(session: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let retired = {
+                let reg = registry()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                !reg.owner_spawns_in_flight.contains_key(session)
+                    && !reg.jobs.values().any(|job| job.owner_session_id == session)
+            };
+            if retired {
+                return;
+            }
+            assert!(Instant::now() < deadline, "native admission did not retire");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn unpolled_and_rejected_async_native_work_keep_the_original_drop_owner() {
+        let _guard = super::super::process_test_guard();
+        for poll in [false, true] {
+            let session = owner_id();
+            let context = {
+                let restricted =
+                    asupersync::Cx::for_request().restrict::<asupersync::cx::cap::None>();
+                let _scope = restricted.set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            let dropped = Arc::new(AtomicBool::new(false));
+            let restricted_drop = Arc::new(AtomicBool::new(false));
+            let launch = spawn_owned_task_async(
+                admit_owned_task(&session).expect("native admission"),
+                "restricted async task",
+                context,
+                Duration::from_secs(30),
+                None,
+                privacy(),
+                PendingDrop {
+                    dropped: Arc::clone(&dropped),
+                    restricted_drop: Some(Arc::clone(&restricted_drop)),
+                },
+            );
+            let _ambient = asupersync::Cx::for_request().set_current_restricted();
+            if poll {
+                let error = futures::executor::block_on(launch)
+                    .err()
+                    .expect("restricted owner must be refused");
+                assert!(error.to_string().contains("PI_JOBS_TASK_CAPABILITY"));
+            } else {
+                drop(launch);
+            }
+            assert!(dropped.load(Ordering::Acquire));
+            assert!(restricted_drop.load(Ordering::Acquire));
+            wait_for_native_admission_cleanup(&session);
+            assert!(super::super::take_completion_notices(&session).is_empty());
+        }
+    }
+
+    #[test]
+    fn async_native_admission_keeps_the_current_thread_abort_loop_responsive() {
+        let _guard = super::super::process_test_guard();
+        let root = tempfile::tempdir().expect("native admission root");
+        let session = owner_id();
+        let owner = AgentCx::for_request();
+        let probe = Arc::new(AdmissionProbe::default());
+        let admission = admit_owned_task(&session).expect("native admission");
+        let lifecycle = lifecycle_lock().lock().expect("hold peer lifecycle lane");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let (result, ()) = runtime.block_on(async {
+            futures::join!(
+                spawn_owned_task_async(
+                    admission,
+                    "abort-responsive native task",
+                    owner.clone(),
+                    Duration::from_secs(2),
+                    Some(root.path()),
+                    privacy(),
+                    QueuedWork(Arc::clone(&probe)),
+                ),
+                async {
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(20),
+                    )
+                    .await;
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("abort from the same current-thread runtime"),
+                    );
+                },
+            )
+        });
+        // Release before assertions, including if a regressed synchronous
+        // launch blocked the abort future until its own timeout elapsed.
+        drop(lifecycle);
+        let error = result.err().expect("same-runtime abort must refuse launch");
+        wait_for_native_admission_cleanup(&session);
+        assert!(error.to_string().contains("PI_JOBS_TASK_CANCELLED"));
+        assert_rejected_admission(&session, root.path(), &probe, 0);
+    }
+
+    #[test]
+    fn async_native_admission_stops_waiting_while_setup_is_stalled() {
+        let _guard = super::super::process_test_guard();
+        for reason in ["deadline", "owner", "session"] {
+            let root = tempfile::tempdir().expect("native admission root");
+            let session = owner_id();
+            let owner = AgentCx::for_request();
+            let probe = Arc::new(AdmissionProbe::default());
+            let gate = Arc::new(super::super::tests::SpawnHookGate::default());
+            let hook_gate = Arc::clone(&gate);
+            let _hooks = super::super::install_spawn_background_test_hooks(
+                super::super::SpawnBackgroundTestHooks {
+                    owner_session_id: Some(session.clone()),
+                    before_native_registry_publication: Some(Arc::new(move || {
+                        hook_gate.enter_and_wait();
+                    })),
+                    ..super::super::SpawnBackgroundTestHooks::default()
+                },
+            );
+            let mut launch = Box::pin(spawn_owned_task_async(
+                admit_owned_task(&session).expect("native admission"),
+                "stalled native setup",
+                owner.clone(),
+                if reason == "deadline" {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_secs(30)
+                },
+                Some(root.path()),
+                privacy(),
+                QueuedWork(Arc::clone(&probe)),
+            ));
+            let mut task = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(launch.as_mut().poll(&mut task).is_pending());
+            gate.wait_until_entered();
+            let shutdown = if reason == "session" {
+                Some(super::super::SessionShutdownAttempt::begin(&session).expect("close owner"))
+            } else {
+                None
+            };
+            if reason == "owner" {
+                owner.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancel while native setup is stalled"),
+                );
+            }
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("current-thread runtime");
+            let result = runtime.block_on(launch);
+            // The launch thread remains inside the hook when the caller
+            // regains control. A receiver-only wait would hit the hook's own
+            // timeout and fail assert_not_timed_out after cleanup.
+            gate.release();
+            let error = result.err().expect("stalled admission must be refused");
+            wait_for_native_admission_cleanup(&session);
+            if let Some(shutdown) = shutdown {
+                shutdown.finish_success().expect("retire owner shutdown");
+            }
+            gate.assert_not_timed_out();
+            let expected = match reason {
+                "deadline" => "PI_JOBS_TASK_TIMEOUT",
+                "owner" => "PI_JOBS_TASK_CANCELLED",
+                _ => "PI_JOBS_SESSION_CLOSING",
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!probe.polled.load(Ordering::Acquire));
+            assert_eq!(probe.drops.load(Ordering::Acquire), 1);
+            assert!(probe.original_owner_drop.load(Ordering::Acquire));
+            assert!(super::super::take_completion_notices(&session).is_empty());
+            assert_eq!(registry().lock().expect("released capacity").starting_jobs, 0);
+        }
+    }
+
+    #[test]
+    fn async_native_admission_reserves_capacity_before_dispatch() {
+        let _guard = super::super::process_test_guard();
+        let root = tempfile::tempdir().expect("native admission root");
+        let session = owner_id();
+        let lifecycle = lifecycle_lock().lock().expect("hold peer lifecycle lane");
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        let mut launches = Vec::new();
+        let mut probes = Vec::new();
+        for _ in 0..super::super::MAX_CONCURRENT_JOBS {
+            let probe = Arc::new(AdmissionProbe::default());
+            let mut launch = Box::pin(spawn_owned_task_async(
+                admit_owned_task(&session).expect("native admission"),
+                "capacity-bound native task",
+                AgentCx::for_request(),
+                Duration::from_secs(30),
+                Some(root.path()),
+                privacy(),
+                QueuedWork(Arc::clone(&probe)),
+            ));
+            assert!(launch.as_mut().poll(&mut task).is_pending());
+            launches.push(launch);
+            probes.push(probe);
+        }
+        let reserved = registry().lock().expect("reserved capacity").starting_jobs;
+        let excess_probe = Arc::new(AdmissionProbe::default());
+        let mut excess = Box::pin(spawn_owned_task_async(
+            admit_owned_task(&session).expect("excess admission"),
+            "over-capacity native task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            QueuedWork(Arc::clone(&excess_probe)),
+        ));
+        let rejected = matches!(excess.as_mut().poll(&mut task), Poll::Ready(Err(error))
+            if error.to_string().contains("PI_JOBS_AT_CAPACITY"));
+        drop(excess);
+        drop(launches);
+        drop(lifecycle);
+        wait_for_native_admission_cleanup(&session);
+        assert_eq!(reserved, super::super::MAX_CONCURRENT_JOBS);
+        assert!(rejected, "the ninth task must not create a waiting launch worker");
+        probes.push(excess_probe);
+        for probe in probes {
+            assert_rejected_admission(&session, root.path(), &probe, 0);
+        }
+    }
+
+    #[test]
+    fn abandoned_native_handoff_never_polls_work_or_emits_a_notice() {
+        let _guard = super::super::process_test_guard();
+        let root = tempfile::tempdir().expect("native admission root");
+        let session = owner_id();
+        let probe = Arc::new(AdmissionProbe::default());
+        let gate = Arc::new(super::super::tests::SpawnHookGate::default());
+        let hook_gate = Arc::clone(&gate);
+        let _hooks = super::super::install_spawn_background_test_hooks(
+            super::super::SpawnBackgroundTestHooks {
+                owner_session_id: Some(session.clone()),
+                after_registry_publication: Some(Arc::new(move |_| hook_gate.enter_and_wait())),
+                ..super::super::SpawnBackgroundTestHooks::default()
+            },
+        );
+        let mut launch = Box::pin(spawn_owned_task_async(
+            admit_owned_task(&session).expect("native admission"),
+            "abandoned native handoff",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            QueuedWork(Arc::clone(&probe)),
+        ));
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(launch.as_mut().poll(&mut task).is_pending());
+        gate.wait_until_entered();
+        let unpublished = registry()
+            .lock()
+            .expect("unpublished native task")
+            .jobs
+            .values()
+            .any(|job| job.owner_session_id == session && job.delivery == JobDelivery::Foreground);
+        drop(launch);
+        gate.release();
+        wait_for_native_admission_cleanup(&session);
+        gate.assert_not_timed_out();
+        assert!(unpublished, "the race must include an actual admitted task");
+        assert!(!probe.polled.load(Ordering::Acquire));
+        assert_eq!(probe.drops.load(Ordering::Acquire), 1);
+        assert!(probe.original_owner_drop.load(Ordering::Acquire));
+        assert!(super::super::take_completion_notices(&session).is_empty());
+    }
+
+    #[test]
+    fn native_work_waits_for_final_acknowledgment_and_stale_guards_cannot_publish() {
+        let _guard = super::super::process_test_guard();
+        for action in ["drop", "queued", "publish", "owner", "deadline", "session"] {
+            let root = tempfile::tempdir().expect("native admission root");
+            let session = owner_id();
+            let owner = AgentCx::for_request();
+            let probe = Arc::new(AdmissionProbe::default());
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("current-thread runtime");
+            let mut launch = runtime
+                .block_on(spawn_owned_task_async(
+                    admit_owned_task(&session).expect("native admission"),
+                    "guarded native task",
+                    owner.clone(),
+                    Duration::from_secs(30),
+                    Some(root.path()),
+                    privacy(),
+                    QueuedWork(Arc::clone(&probe)),
+                ))
+                .expect("guarded native admission");
+            let snapshot = launch.snapshot().expect("unpublished snapshot");
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!probe.polled.load(Ordering::Acquire));
+            assert!(super::super::list(&session).expect("visible jobs").is_empty());
+            assert!(super::super::take_completion_notices(&session).is_empty());
+            if action == "publish" {
+                let published = launch.publish().expect("final native acknowledgment");
+                assert_eq!(snapshot.id, published.id);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !probe.polled.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let polled = probe.polled.load(Ordering::Acquire);
+                let cancelled = super::super::cancel(&session, &published.id)
+                    .expect("cancel published native task");
+                assert!(polled, "published task must become executable");
+                assert_eq!(cancelled.status, "killed");
+                assert_eq!(probe.drops.load(Ordering::Acquire), 1);
+                continue;
+            }
+            let shutdown = if action == "session" {
+                Some(super::super::SessionShutdownAttempt::begin(&session).expect("close owner"))
+            } else {
+                None
+            };
+            if action == "owner" {
+                owner.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancel acknowledgment"),
+                );
+            }
+            if action == "deadline" {
+                // The stalled-setup regression exercises the real timer.
+                // Expire this retained guard after successful admission so
+                // slow builders still reach the intended publication seam.
+                launch.timeout = Duration::ZERO;
+            }
+            if action == "drop" {
+                drop(launch);
+            } else if action == "queued" {
+                // Exercise the ready-but-never-received handoff with the
+                // same channel used by the real admission worker.
+                let (sender, receiver) = asupersync::channel::oneshot::channel();
+                assert!(sender.send_blocking(launch).is_ok());
+                drop(receiver);
+            } else {
+                let error = launch.publish().err().expect("stale handoff must be refused");
+                let expected = match action {
+                    "owner" => "PI_JOBS_TASK_CANCELLED",
+                    "deadline" => "PI_JOBS_TASK_TIMEOUT",
+                    _ => "PI_JOBS_SESSION_CLOSING",
+                };
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+            wait_for_native_admission_cleanup(&session);
+            if let Some(shutdown) = shutdown {
+                shutdown.finish_success().expect("retire owner shutdown");
+            }
+            assert!(!probe.polled.load(Ordering::Acquire));
+            assert_eq!(probe.drops.load(Ordering::Acquire), 1);
+            assert!(probe.original_owner_drop.load(Ordering::Acquire));
+            assert!(super::super::take_completion_notices(&session).is_empty());
+        }
     }
 
     #[test]

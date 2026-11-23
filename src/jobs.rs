@@ -38,9 +38,11 @@ use crate::file_identity::FileIdentity;
 use crate::model::{Message, UserContent, UserMessage};
 
 mod host_task;
+#[cfg(test)]
+pub(crate) use host_task::spawn_owned_task;
 pub(crate) use host_task::{
     NativeTaskOwner, admit_owned_task, clear_owned_task_progress, current_native_task,
-    publish_owned_task_progress, spawn_owned_task, with_owned_task_progress,
+    publish_owned_task_progress, spawn_owned_task_async, with_owned_task_progress,
 };
 
 /// Future returned by the live session-identity resolver shared by the jobs
