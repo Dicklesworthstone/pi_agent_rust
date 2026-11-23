@@ -57,7 +57,7 @@ shipping `x86_64-pc-windows-msvc` triple before tagging a release.
 **Two of those changed on 2026-09-22 and are worth understanding before
 anyone "simplifies" them back.**
 
-`--keep-going` on checks 2 and 3. Without it the first target that fails to
+`--keep-going` on checks 2, 3, 4, and 12. Without it the first target that fails to
 compile hides every other compile failure in the run. AGENTS.md documents the
 hazard by name — nineteen targets broken by one `asupersync` bump on
 2026-09-13 took nine sequential clippy runs to enumerate — and the recipe did
@@ -67,12 +67,13 @@ failing run is exactly when you want the whole list. Measured on 2026-09-21,
 its first use reported that the tree's single compile error really was
 single, replacing a guess about hidden breakage with a count.
 
-Not check 4: `--keep-going` is not a `cargo test` flag, and `--no-fail-fast`
+Not checks 5 and 6: `--keep-going` is not a `cargo test` flag, and `--no-fail-fast`
 — which the recipe already passes — governs test failures, not build
 failures. No test binary runs while any required target fails to build; that
 is expected, not a second defect.
 
-Check 8 is new. Nothing in the gate used to notice when README evidence
+Check 10 (`check_readme_evidence_freshness.py --structural-only`) enforces README
+evidence parity on every commit. Nothing in the gate used to notice when README evidence
 claims drifted away from `tests/perf/reports/budget_summary.json`, which is
 how the README spent a month advertising four passing budgets against an
 artifact whose rows were all `NO_DATA`
