@@ -6752,7 +6752,10 @@ impl Agent {
         // A batch plan was made before secret restoration and policy awaits.
         // Never run a reclassified mutation or ordered call beside its peers.
         if parallel_only && !self.effects_for_call(&tool_call).parallel_safe() {
-            return (Self::parallel_tool_admission_changed(expected_session), true);
+            return (
+                Self::parallel_tool_admission_changed(expected_session),
+                true,
+            );
         }
 
         // Resolve before any policy await: an invalid route must not acquire
@@ -7262,7 +7265,13 @@ impl Agent {
                     )
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
-                self.record_prewalk_evidence(inner, inner_args, &output);
+                if self
+                    .check_invocation_session(expected_session)
+                    .await
+                    .is_ok()
+                {
+                    self.record_prewalk_evidence(inner, inner_args, &output);
+                }
                 Some(output)
             }
             "promote" => {
@@ -7484,7 +7493,10 @@ impl Agent {
         // is no await between this check and execution; replacing the registry
         // cannot swap in a writer after the check.
         if parallel_only && !tool.effects_for_input(&tool_call.arguments).parallel_safe() {
-            return (Self::parallel_tool_admission_changed(expected_session), true);
+            return (
+                Self::parallel_tool_admission_changed(expected_session),
+                true,
+            );
         }
         let outcome = tool
             .execute_with_invocation(
