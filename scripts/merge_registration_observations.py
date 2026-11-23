@@ -47,6 +47,7 @@ def main() -> int:
         "apply only triaged true-drift entries while deferring "
         "environment-gap failures",
     )
+    parser.add_argument("--apply", action="store_true", help="write changes")
     args = parser.parse_args()
 
     manifest_path = args.manifest
@@ -62,12 +63,6 @@ def main() -> int:
         record = json.loads(line)
         observations[record["id"]] = record  # last wins
 
-    changed = 0
-    for ext_id, observed in sorted(observations.items()):
-        entry = by_id.get(ext_id)
-        if entry is None:
-            print(f"SKIP (not in manifest): {ext_id}")
-            continue
     if args.ids_from:
         allowed = {
             line.strip()
@@ -79,7 +74,14 @@ def main() -> int:
             for ext_id, record in observations.items()
             if ext_id in allowed
         }
+
     changed = 0
+    for ext_id, observed in sorted(observations.items()):
+        entry = by_id.get(ext_id)
+        if entry is None:
+            print(f"SKIP (not in manifest): {ext_id}")
+            continue
+        registrations = entry.setdefault("registrations", {})
         capabilities = entry.setdefault("capabilities", {})
         diffs: list[str] = []
         for field in SET_FIELDS:
