@@ -441,6 +441,56 @@ fn large_predecessor_output_reaches_the_next_chain_child_without_argv_limits() {
 }
 
 #[test]
+fn chain_children_receive_literal_predecessor_evidence_without_recursive_expansion() {
+    for (repetitions, payload) in [(1, "selected value".to_string()), (1024, "雪".repeat(1500))] {
+        let predecessor = json!({
+            "literal": "{{previous.data.payload}} {previous} ".repeat(repetitions),
+            "payload": payload,
+            "nested": {"example": "{{previous.data.payload}}"}
+        });
+        let evidence = predecessor.to_string();
+        let script = format!(
+            "cat > instructions-used\n\
+             if [ -f first-completed ]; then\n{}\
+             else\ntouch first-completed\ncat predecessor.jsonl\nfi\n",
+            emit(&[ended("reviewed", "stop")])
+        );
+        let (root, tool) = fixture(&script);
+        std::fs::write(
+            root.path().join("predecessor.jsonl"),
+            format!("{}\n", ended(&evidence, "stop")),
+        )
+        .unwrap();
+        let output = run(
+            &tool,
+            json!({"chain":[
+                {"agent":"worker", "task":"produce evidence",
+                 "outputSchema":{"type":"object"}, "schemaMode":"strict"},
+                {"agent":"worker", "task":"Evidence:\n{previous}\nSelected: {{previous.data.payload}}\nLiteral: {{previous.data.literal}}\nNested: {{previous.data.nested}}"}
+            ]}),
+        );
+        assert!(!output.is_error, "{output:?}");
+        let records = output.details.as_ref().unwrap()["results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["output"], evidence);
+        assert_eq!(records[0]["data"], predecessor);
+        assert_eq!(records[1]["output"], "reviewed");
+        // The larger case used to amplify valid bounded evidence beyond
+        // 4 MiB and refuse the second child; the smaller case corrupted it.
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("instructions-used")).unwrap(),
+            format!(
+                "Task: Evidence:\n{evidence}\nSelected: {payload}\nLiteral: {}\nNested: {}",
+                predecessor["literal"].as_str().unwrap(),
+                predecessor["nested"]
+            )
+        );
+    }
+}
+
+#[test]
 fn oversized_inline_chain_expansion_preserves_prior_results_without_a_second_launch() {
     let predecessor = json!({"value":"x".repeat(16 * 1024)}).to_string();
     for marker in ["{previous}", "{{previous.data.value}}"] {

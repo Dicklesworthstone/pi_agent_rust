@@ -13978,14 +13978,14 @@ const __pi_vfs = (() => {
     const rawPaths = [absolute];
     let normalized = mapExtensionTempPath(raw, normalizePath(absolute));
     const authorizationPaths = [normalized];
-    if (!followSymlinks) {
-      return { resolved: normalized, authorizationPaths, rawPaths };
-    }
 
     const seen = new Set();
     for (;;) {
       const component = firstSymlinkComponent(normalized);
       if (!component) break;
+      // lstat/unlink/rename act on the final directory entry, but parent
+      // links must still resolve and cross admission before it is accessed.
+      if (!followSymlinks && component.remaining.length === 0) break;
       if (seen.has(component.linkPath) || seen.size >= 40) {
         throw new Error(`ELOOP: too many symbolic links encountered, stat '${String(path ?? "")}'`);
       }
@@ -14291,6 +14291,99 @@ const __pi_vfs = (() => {
     }
   }
 
+  function renameDirectory(src, dst) {
+    const fail = (code, message) => {
+      const error = new Error(`${code}: ${message}, rename '${src}' -> '${dst}'`);
+      error.code = code;
+      error.syscall = "rename";
+      error.path = src;
+      error.dest = dst;
+      throw error;
+    };
+    if (src === splitRoot(src).root || dst === splitRoot(dst).root) {
+      fail("EBUSY", "cannot rename a filesystem root");
+    }
+    if (src === dst) return;
+    const sourcePrefix = childPrefix(src);
+    const destinationPrefix = childPrefix(dst);
+    if (dst.startsWith(sourcePrefix)) fail("EINVAL", "destination is inside the source directory");
+    if (state.files.has(dst) || state.symlinks.has(dst)) {
+      fail("ENOTDIR", "directory destination is not a directory");
+    }
+    // The overlay can contain only part of a native directory. Moving that
+    // cached subset would falsely report a successful native tree rename.
+    if (readHostStat(src, false) || readHostStat(dst, false)) {
+      fail("ERR_PI_SHIM_UNSUPPORTED_OPERATION", "native directory renames require persistent storage");
+    }
+    const parent = dirname(dst);
+    const parentRoot = splitRoot(parent);
+    let ancestor = parentRoot.root;
+    for (const part of parentRoot.tail.split("/").filter(Boolean)) {
+      ancestor = `${childPrefix(ancestor)}${part}`;
+      if (state.files.has(ancestor) || state.symlinks.has(ancestor)) {
+        fail("ENOTDIR", "destination parent is not a directory");
+      }
+    }
+    let parentMetadata = null;
+    if (!state.dirs.has(parent)) {
+      const hostParent = readHostStat(parent, true);
+      if (!hostParent) fail("ENOENT", "destination parent does not exist");
+      if (hostParent.kind !== "dir") fail("ENOTDIR", "destination parent is not a directory");
+      parentMetadata = hostParent;
+    }
+
+    const entries = [];
+    const collect = (path, kind, value) => {
+      if (path.startsWith(destinationPrefix)) fail("ENOTEMPTY", "destination directory is not empty");
+      if (path === src || path.startsWith(sourcePrefix)) {
+        entries.push({ path, moved: dst + path.slice(src.length), kind, value });
+      }
+    };
+    for (const path of state.dirs) collect(path, "dir", null);
+    for (const [path, file] of state.files) collect(path, "file", file);
+    for (const [path, target] of state.symlinks) collect(path, "symlink", target);
+
+    // Authorize every existing and future name before changing any map or
+    // metadata. A permitted parent must not smuggle a nested foreign root
+    // out of its scope, or move ordinary files into protected storage.
+    for (const entry of entries) {
+      authorizeWriteResolution(resolvePathDetails(entry.path, false));
+      authorizeWriteResolution(resolvePathDetails(entry.moved, false));
+      if (isPersistentPath(entry.path) || isPersistentPath(entry.moved)) {
+        fail("ERR_PI_SHIM_UNSUPPORTED_OPERATION", "cannot rename across persistent and virtual filesystems");
+      }
+    }
+
+    // Materialize a native parent's overlay only after admission succeeds so
+    // directory listing merges the moved entry with its native siblings.
+    if (parentMetadata) {
+      state.dirs.add(parent);
+      ensureMetadata(parent, "dir", parentMetadata);
+    }
+    state.dirs.delete(dst);
+    state.metadata.delete(dst);
+    for (const entry of entries) {
+      const metadata = ensureMetadata(entry.path, entry.kind);
+      state.metadata.delete(entry.path);
+      state.metadata.set(entry.moved, metadata);
+      if (entry.kind === "dir") {
+        state.dirs.delete(entry.path);
+        state.dirs.add(entry.moved);
+      } else if (entry.kind === "file") {
+        state.files.delete(entry.path);
+        state.files.set(entry.moved, entry.value);
+        // Open descriptors retain this object and recheck its moved path.
+        entry.value.path = entry.moved;
+      } else {
+        state.symlinks.delete(entry.path);
+        state.symlinks.set(entry.moved, entry.value);
+      }
+      if (entry.path === src) metadata.ctimeMs = metadataTime();
+    }
+    touchParentMetadata(src);
+    touchParentMetadata(dst);
+  }
+
   function resetState(secret) {
     __pi_reset_file_watchers(secret);
     const clearMap = globalThis.__pi_map_clear_primordial;
@@ -14358,6 +14451,7 @@ const __pi_vfs = (() => {
   state.authorizeFdWrite = authorizeFdWrite;
   state.toWritableView = toWritableView;
   state.authorizeTreeWrite = authorizeTreeWrite;
+  state.renameDirectory = renameDirectory;
   state.reset = resetState;
   const safeApi = { normalizePath, listVisiblePaths };
   Object.defineProperty(safeApi, "reset", {
@@ -14699,6 +14793,10 @@ export function renameSync(oldPath, newPath) {
       throw new Error("PiJS cannot rename across persistent and virtual filesystems");
     }
     __pi_vfs.persistentMutation("rename", src, { target: __pi_vfs.toHostPath(dst) });
+    return;
+  }
+  if (__pi_vfs.dirs.has(src)) {
+    __pi_vfs.renameDirectory(src, dst);
     return;
   }
   const linkTarget = __pi_vfs.symlinks.get(src);
@@ -31120,6 +31218,8 @@ mod tests {
     /// forwards that authority without weakening public timer owner checks.
     /// Session veto aggregation adds 364 bridge bytes. The strict boolean
     /// forms stop later handlers before they can erase an earlier veto.
+    /// Atomic virtual directory rename and parent-link resolution add 4_342
+    /// filesystem bytes, covered by identity, admission, and watcher tests.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
@@ -31128,8 +31228,8 @@ mod tests {
         ),
         (
             "node:fs",
-            82_976,
-            "716025605d6ebf012817f9da6e54ec4d8236162a715af71c9e164ba41e0bcdbb",
+            87_318,
+            "cb0143953b7cee99b4bd41f3cfe60bd7047716c28d5f0d3dcb1784745c8b4004",
         ),
         (
             "@mariozechner/pi-ai",
