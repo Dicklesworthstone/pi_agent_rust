@@ -669,16 +669,21 @@ impl AgentSessionHandle {
 
     async fn await_retry_backoff(delay_ms: u32, abort_signal: &AbortSignal) -> bool {
         const POLL: Duration = Duration::from_millis(25);
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        let time = owner.time();
         let deadline = Instant::now() + Duration::from_millis(u64::from(delay_ms));
         loop {
-            if abort_signal.is_aborted() {
+            // Every public entrypoint supplies a signal, including plain
+            // prompt(). That signal must not replace the request owner's
+            // cancellation or budget while recovery waits to retry.
+            if owner.checkpoint().is_err() || abort_signal.is_aborted() {
                 return false;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return true;
             }
-            asupersync::time::sleep(asupersync::time::wall_now(), POLL.min(remaining)).await;
+            time.sleep(POLL.min(remaining)).await;
         }
     }
 

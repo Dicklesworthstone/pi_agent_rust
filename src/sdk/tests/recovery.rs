@@ -1520,6 +1520,101 @@ fn aborting_at_retry_start_returns_abort_not_the_original_capacity_error() {
 }
 
 #[test]
+fn cancelling_retry_backoff_observes_owner_and_explicit_abort_without_replay() {
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().expect("create reactor"))
+        .build()
+        .expect("build runtime");
+    runtime.block_on(Box::pin(async {
+        for (explicit_abort, cancel_owner) in [(false, true), (true, true), (true, false)] {
+            let (handle, calls) = flaky_handle(1);
+            let mut handle = handle.with_retry(Some(crate::failover::RetryPolicy {
+                base_delay_ms: 60_000,
+                max_delay_ms: 60_000,
+                ..fast_retry_policy(1)
+            }));
+            let owner = crate::agent_cx::AgentCx::from_cx(
+                runtime.request_cx_with_budget(asupersync::Budget::new()),
+            );
+            let (abort, signal) = AbortHandle::new();
+            let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = Arc::clone(&started);
+            let (events, callback) = event_log();
+            let on_event = move |event| {
+                if matches!(&event, AgentEvent::AutoRetryStart { .. }) {
+                    observed.store(true, Ordering::SeqCst);
+                }
+                callback(event);
+            };
+            let store = handle.session_store();
+            let gate = handle.session.provider_admission_gate();
+            let mut turn = Box::pin(owner.with_current(async {
+                if explicit_abort {
+                    handle
+                        .prompt_with_abort("keep this input", signal, on_event)
+                        .await
+                } else {
+                    handle.prompt("keep this input", on_event).await
+                }
+            }));
+            futures::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
+                if started.load(Ordering::SeqCst) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            let before = serde_json::to_value(&store.try_lock().unwrap().entries).unwrap();
+            // Cancel after the timer has actually become pending, not from
+            // the retry-start callback before backoff begins.
+            if cancel_owner {
+                owner.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancel owner during retry backoff"),
+                );
+            } else {
+                abort.abort();
+            }
+            let result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                turn.as_mut(),
+            )
+            .await
+            .expect("cancellation must settle without waiting through the sixty-second backoff");
+            assert!(matches!(result, Err(Error::Aborted)));
+            drop(turn);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "no request after cancellation"
+            );
+            assert_eq!(
+                serde_json::to_value(&store.try_lock().unwrap().entries).unwrap(),
+                before,
+                "backoff cancellation must not rewind the failed response or accepted input"
+            );
+            assert_eq!(
+                lifecycle_names(&events.lock().unwrap()),
+                [
+                    "agent_start",
+                    "retry_start:1",
+                    "retry_end:1:false",
+                    "agent_end",
+                ]
+            );
+            gate.ensure_allowed()
+                .expect("cooperative cancellation is fully observed");
+            let resumed = handle.prompt("fresh request owner", |_| {}).await.unwrap();
+            assert_eq!(resumed.stop_reason, StopReason::Stop);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }));
+}
+
+#[test]
 fn a_public_continuation_restores_the_primary_before_provider_reentry() {
     let mut handle = handle_after_one_failover(0);
     let (abort, signal) = AbortHandle::new();
