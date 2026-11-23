@@ -3081,19 +3081,16 @@ impl AgentSessionHandle {
         if self.session.save_enabled() {
             let budget = self.session.agent.cost_budget();
             let admission = self.session.provider_admission_gate();
-            let persisted = if let Some(budget) = budget {
-                crate::agent::flush_turn_autosave(
-                    &mut session,
-                    &admission,
-                    crate::session::AutosaveFlushTrigger::Shutdown,
-                    Some((budget, cx.cx())),
-                )
-                .await
-            } else {
-                session
-                    .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
-                    .await
-            };
+            // A cancelled preflight can leave its blocking writer running
+            // after the handle becomes available again. Fence that unknown
+            // outcome even when the session has no model cost account.
+            let persisted = crate::agent::flush_turn_autosave(
+                &mut session,
+                &admission,
+                crate::session::AutosaveFlushTrigger::Shutdown,
+                budget.map(|budget| (budget, cx.cx())),
+            )
+            .await;
             if let Err(err) = persisted {
                 if budget.is_some() {
                     admission.block(err.to_string());
@@ -3126,15 +3123,16 @@ impl AgentSessionHandle {
         // Fresh sessions acquire their source path at the first save. Record
         // that acknowledged source before any descendant can be published.
         if let Some(budget) = &cost_budget {
-            if let Err(error) = budget.checkpoint(&mut session) {
-                let mut report = SessionResourceShutdown::default();
-                report.fail(format!("failed to checkpoint model cost ancestry: {error}"));
-                return Err(report);
-            }
-            if let Err(error) = session
-                .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
-                .await
+            let admission = self.session.provider_admission_gate();
+            if let Err(error) = crate::agent::flush_turn_autosave(
+                &mut session,
+                &admission,
+                crate::session::AutosaveFlushTrigger::Shutdown,
+                Some((budget, cx.cx())),
+            )
+            .await
             {
+                admission.block(error.to_string());
                 let mut report = SessionResourceShutdown::default();
                 report.fail(format!("failed to save model cost ancestry: {error}"));
                 return Err(report);
@@ -11938,6 +11936,113 @@ printf sdk-owned-command-key
             );
             assert!(handle.shutdown_owned_resources().await.completed_cleanly());
         });
+    }
+
+    #[test]
+    fn replacement_preflight_fences_provider_after_interrupted_save() {
+        let reactor = create_reactor().expect("create reactor");
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .blocking_threads(1, 1)
+            .build()
+            .expect("build runtime");
+        runtime.block_on(Box::pin(async {
+            for with_budget in [false, true] {
+                let tmp = tempdir().expect("tempdir");
+                let mut handle = saving_handle(tmp.path());
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                handle
+                    .session
+                    .agent
+                    .set_provider(Arc::new(FlakyThenOkProvider {
+                        failures: 0,
+                        calls: Arc::clone(&calls),
+                        name: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        input_tokens: 0,
+                    }));
+                handle
+                    .prompt("saved before replacement", |_| {})
+                    .await
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                let budget = with_budget
+                    .then(|| crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap());
+                handle.session.agent.set_cost_budget(budget.clone());
+                let store = handle.session_store();
+                let actions = handle.session.session_action_admission_gate();
+                let origin = actions.capture_origin();
+                let admission = handle.session.provider_admission_gate();
+                let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+                let path = {
+                    let mut session = store.try_lock().unwrap();
+                    session.set_autosave_durability_mode(
+                        crate::session::AutosaveDurabilityMode::Balanced,
+                    );
+                    session.append_session_info(Some("pending during replacement".to_string()));
+                    session.path.clone().unwrap()
+                };
+                let before_disk = std::fs::read(&path).unwrap();
+                // A real worker is now unable to complete the write. Dropping
+                // its future cannot prove whether that write will reach disk.
+                let disk_lock = crate::session::lock_session_persistence(&path).unwrap();
+                let mut preflight = Box::pin(handle.preflight_replacement());
+                assert!(futures::poll!(preflight.as_mut()).is_pending());
+                assert!(store.try_lock().is_err(), "preflight entered persistence");
+                drop(preflight);
+                assert!(
+                    admission
+                        .ensure_allowed()
+                        .is_err_and(|error| error.is_session_persistence()),
+                    "with_budget={with_budget}: an unobserved write must fence provider admission"
+                );
+                if let Some(budget) = &budget {
+                    assert!(
+                        budget.admit().is_err(),
+                        "retained provider handles must share the interrupted-save fence"
+                    );
+                }
+                assert!(actions.origin_source().accepts(&origin));
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut action = Box::pin(actions.acquire(cx.cx()));
+                let std::task::Poll::Ready(Ok(permit)) = futures::poll!(action.as_mut()) else {
+                    panic!("an interrupted save must release Session-action admission");
+                };
+                drop(permit);
+                {
+                    let session = store
+                        .try_lock()
+                        .expect("interrupted preflight releases store");
+                    assert_eq!(
+                        session.get_name().as_deref(),
+                        Some("pending during replacement")
+                    );
+                    assert!(session.autosave_metrics().pending_mutations > 0);
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), before_disk);
+                assert!(
+                    handle
+                        .prompt("must not dispatch after interrupted persistence", |_| {})
+                        .await
+                        .is_err_and(|error| error.is_session_persistence())
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                    before_agent
+                );
+                drop(disk_lock);
+                // Drain the single worker before the temporary store goes
+                // away; the abandoned write may still finish successfully.
+                asupersync::runtime::spawn_blocking(|| {}).await;
+                assert!(
+                    admission
+                        .ensure_allowed()
+                        .is_err_and(|error| error.is_session_persistence()),
+                    "background completion is not an acknowledged durable result"
+                );
+            }
+        }));
     }
 
     #[test]
