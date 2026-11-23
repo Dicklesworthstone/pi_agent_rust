@@ -77,7 +77,28 @@ fn registry() -> &'static Mutex<VecDeque<Pool>> {
     POOLS.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-fn register(pool: Pool) -> Result<()> {
+/// A pool becomes retained history only after its complete initial admission.
+/// Cancellation before that boundary must not consume a retained pool slot.
+struct Registration(Option<Pool>);
+
+impl Registration {
+    fn commit(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if let Some(pool) = self.0.take() {
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|candidate| !Arc::ptr_eq(candidate, &pool));
+        }
+    }
+}
+
+fn register(pool: Pool) -> Result<Registration> {
     let mut pools = registry().lock().map_err(|_| stopped())?;
     if pools.len() == MAX_POOLS {
         let retired = pools
@@ -93,9 +114,9 @@ fn register(pool: Pool) -> Result<()> {
         // may be evicted; 16 retained pools therefore bound result storage.
         pools.remove(retired);
     }
-    pools.push_back(pool);
+    pools.push_back(Arc::clone(&pool));
     drop(pools);
-    Ok(())
+    Ok(Registration(Some(pool)))
 }
 
 fn lookup(owner: &str, id: &str) -> Result<Pool> {
@@ -258,8 +279,9 @@ async fn start(
         return Err(invalid("maximum nested subagent depth reached"));
     }
     let deadline = Deadline::for_request(tool.timeout, timeout)?;
+    let job_deadline = Instant::now() + deadline.remaining();
     let owner_id = background::resolve_session(&tool.job_session_scope, &owner, deadline).await?;
-    let admission = crate::jobs::admit_owned_task(&owner_id)?;
+    let admission = crate::jobs::admit_owned_task(&owner_id)?.with_deadline(job_deadline);
     let parent_model = tool.capture_parent_model();
     let cost_budget = tool.cost_scope.current();
     let workspace_roots = workspace::CapturedRoots::capture(&tool.workspace, privacy.clone())?;
@@ -323,7 +345,7 @@ async fn start(
         dependencies: crate::agent_hub::ResultDependencies::new(Vec::new()),
         privacy: Vec::new(),
     }));
-    register(Arc::clone(&pool))?;
+    let registration = register(Arc::clone(&pool))?;
     let children = (0..concurrency)
         .map(|_| {
             (
@@ -349,7 +371,7 @@ async fn start(
     // jobs list remains available after a guest reset or lost initial ACK.
     // Its owner-scoped label carries the recoverable native pool identity.
     let label = format!("reusable subagent pool {id}");
-    let job = crate::jobs::spawn_owned_task(
+    let launch = crate::jobs::spawn_owned_task_async(
         admission,
         &label,
         owner.clone(),
@@ -357,17 +379,9 @@ async fn start(
         Some(&artifacts),
         privacy.clone(),
         run(Arc::clone(&pool), children, privacy.clone()),
-    );
-    let job = match job {
-        Ok(job) => job,
-        Err(error) => {
-            registry()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain(|candidate| !Arc::ptr_eq(candidate, &pool));
-            return Err(error);
-        }
-    };
+    )
+    .await?;
+    let job = launch.snapshot()?;
     {
         let mut state = pool.lock().map_err(|_| stopped())?;
         state.job_id.clone_from(&job.id);
@@ -381,7 +395,7 @@ async fn start(
     }
     // The controller cannot even start its RPC children until this complete
     // identity acknowledgment is screened and initial admission is committed.
-    match admit(
+    let output = admit(
         tool,
         &pool,
         &assignments,
@@ -391,14 +405,10 @@ async fn start(
         deadline,
         true,
     )
-    .await
-    {
-        Ok(output) => Ok(output),
-        Err(error) => {
-            close(&pool).await?;
-            Err(error)
-        }
-    }
+    .await?;
+    launch.publish()?;
+    registration.commit();
+    Ok(output)
 }
 
 async fn recheck_owner(
@@ -2458,6 +2468,145 @@ done
                 .await;
             assert_eq!(next["nextCursor"]["itemIds"], json!([1, 2, 3, 4, 5, 6, 7, 8]));
         });
+    }
+
+    #[test]
+    fn dropping_worker_or_pool_start_during_final_ack_retires_unpublished_state() {
+        let _guard = crate::jobs::process_test_guard();
+        for pooled in [false, true] {
+            let mut fixture = Fixture::new("touch launches\nexec sleep 30");
+            let session = fixture.owner.clone();
+            let (entered, ready) = futures::channel::oneshot::channel();
+            let entered = Arc::new(Mutex::new(Some(entered)));
+            let scope = crate::jobs::JobSessionScope::fixed(&session);
+            scope.bind(Arc::new(move || {
+                let pending_ack = if pooled {
+                    registry()
+                        .lock()
+                        .expect("pool registry")
+                        .iter()
+                        .any(|pool| {
+                            let state = pool.lock().expect("pending pool state");
+                            state.owner == session && !state.job_id.is_empty()
+                        })
+                } else {
+                    super::super::registry()
+                        .lock()
+                        .expect("worker registry")
+                        .iter()
+                        .any(|worker| {
+                            let state = worker.lock().expect("pending worker state");
+                            state.owner == session && !state.job_id.is_empty()
+                        })
+                };
+                let entered = Arc::clone(&entered);
+                let session = session.clone();
+                Box::pin(async move {
+                    if pending_ack {
+                        if let Some(entered) = entered.lock().expect("ack gate").take() {
+                            let _ = entered.send(());
+                        }
+                        futures::future::pending::<Option<String>>().await
+                    } else {
+                        Some(session)
+                    }
+                })
+            }));
+            fixture.tool.bind_job_session_scope(scope);
+            runtime().block_on(async {
+                let owner = AgentCx::for_request();
+                let request = if pooled {
+                    json!({"operation":"pool_start", "agent":"worker", "concurrency":2,
+                        "tasks":["must not execute"]})
+                } else {
+                    json!({"operation":"worker_start", "agent":"worker",
+                        "task":"must not execute"})
+                };
+                let launch = Box::pin(owner.with_current(
+                    fixture.tool.execute("abandoned-start", request, None),
+                ));
+                let time = owner.time();
+                let gate = Box::pin(futures::future::select(
+                    Box::pin(ready),
+                    Box::pin(time.sleep(Duration::from_secs(5))),
+                ));
+                let pending = match futures::future::select(launch, gate).await {
+                    futures::future::Either::Right((
+                        futures::future::Either::Left((Ok(()), _)),
+                        pending,
+                    )) => pending,
+                    _ => panic!("native start did not reach its final ownership check"),
+                };
+                let pool = pooled.then(|| {
+                    registry()
+                        .lock()
+                        .expect("pool registry")
+                        .iter()
+                        .find(|pool| pool.lock().expect("pool state").owner == fixture.owner)
+                        .cloned()
+                        .expect("pending pool registration")
+                });
+                let workers = if let Some(pool) = &pool {
+                    pool.lock().expect("pending pool").workers.clone()
+                } else {
+                    vec![
+                        super::super::registry()
+                            .lock()
+                            .expect("worker registry")
+                            .iter()
+                            .find(|worker| {
+                                worker.lock().expect("worker state").owner == fixture.owner
+                            })
+                            .cloned()
+                            .expect("pending worker registration"),
+                    ]
+                };
+                assert!(workers.iter().all(|worker| {
+                    let worker = worker.lock().expect("pending worker");
+                    !worker.acknowledged && !worker.started
+                }));
+                drop(pending);
+                let retained = if pooled {
+                    registry()
+                        .lock()
+                        .expect("pool registry")
+                        .iter()
+                        .any(|pool| pool.lock().expect("pool state").owner == fixture.owner)
+                } else {
+                    super::super::registry()
+                        .lock()
+                        .expect("worker registry")
+                        .iter()
+                        .any(|worker| {
+                            worker.lock().expect("worker state").owner == fixture.owner
+                        })
+                };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let retired = loop {
+                    if workers
+                        .iter()
+                        .all(|worker| worker.lock().expect("worker cleanup").closed)
+                        && pool
+                            .as_ref()
+                            .is_none_or(|pool| pool.lock().expect("pool cleanup").closed)
+                    {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    time.sleep(POLL_INTERVAL).await;
+                };
+                crate::jobs::kill_session(&fixture.owner)
+                    .await
+                    .expect("retire test session");
+                assert!(!retained, "abandoned admission consumed a retained handle");
+                assert!(retired, "abandoned carrier did not retire its owned work");
+                assert!(!fixture.root.path().join("launches").exists());
+                assert!(crate::jobs::list(&fixture.owner).expect("owned jobs").is_empty());
+                assert!(crate::jobs::take_completion_notices(&fixture.owner).is_empty());
+            });
+        }
     }
 
     #[test]

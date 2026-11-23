@@ -266,21 +266,29 @@ pub(super) async fn start(
     let artifacts = tool.global_dir.join("tool-output-artifacts");
     let progress_privacy = (mode == "workflow").then(|| privacy.clone());
     let (publish, progress) = futures::channel::oneshot::channel();
-    let job = crate::jobs::spawn_owned_task(
+    let launch = crate::jobs::spawn_owned_task_async(
         admission,
         &format!("subagent {mode}"),
-        owner,
+        owner.clone(),
         timeout,
         Some(&artifacts),
         privacy,
         prepared.run(structured_results, progress),
-    )?;
+    )
+    .await?;
+    if resolve_session(&tool.job_session_scope, &owner, deadline).await? != session_id {
+        return Err(Error::tool(
+            "subagent",
+            "PI_SUBAGENT_SESSION_CHANGED: owner changed before background acknowledgment",
+        ));
+    }
+    let job = launch.snapshot()?;
     if let Some(privacy) = progress_privacy {
-        // No await after job publication. If cancellation already retired the
-        // receiver, the existing job ID still identifies its terminal outcome;
-        // never submit the graph again to obtain another acknowledgment.
+        // Install progress before native execution is released. There is no
+        // await between this handoff, job publication and acknowledgment.
         let _ = publish.send(workflow::Progress::new(session_id, job.id.clone(), privacy));
     }
+    let job = launch.publish()?;
     let progress_notice = if mode == "workflow" {
         " Settled-wave progress is in job.result.details.partialResult; cancellation or timeout preserves the last screened checkpoint. Pending nodes there have unresolved outcomes, not guaranteed absence of side effects."
     } else {
@@ -612,6 +620,38 @@ mod tests {
             assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2); // ubs:ignore[rust.panic.assert-macros] -- Ownership must be checked both before and after preparation.
             assert!(crate::jobs::list(&owner).unwrap().is_empty()); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Session replacement must not publish a ghost job.
             assert!(!root.path().join("launched").exists()); // ubs:ignore[rust.panic.assert-macros] -- Rejected ownership must prevent real child launch.
+        }
+
+        #[test]
+        fn session_switch_after_native_admission_starts_no_background_child() {
+            let _guard = crate::jobs::process_test_guard();
+            let (root, mut tool, owner) = fixture("touch launched");
+            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = count.clone();
+            let original = owner.clone();
+            let scope = crate::jobs::JobSessionScope::fixed(&owner);
+            scope.bind(std::sync::Arc::new(move || {
+                let id = if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    original.clone()
+                } else {
+                    "replacement-owner".to_string()
+                };
+                Box::pin(async move { Some(id) })
+            }));
+            tool.bind_job_session_scope(scope);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("background admission runtime");
+            let result = runtime.block_on(tool.execute("switch-after-admission", request(), None));
+            runtime
+                .block_on(crate::jobs::kill_session(&owner))
+                .expect("retire test session");
+            let error = result.expect_err("replacement owner cannot acknowledge native admission");
+            assert!(error.to_string().contains("PI_SUBAGENT_SESSION_CHANGED"));
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+            assert!(crate::jobs::list(&owner).expect("original owner jobs").is_empty());
+            assert!(crate::jobs::take_completion_notices(&owner).is_empty());
+            assert!(!root.path().join("launched").exists());
         }
 
         #[test]

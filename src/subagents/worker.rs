@@ -195,7 +195,28 @@ fn check_owner(owner: &AgentCx) -> Result<()> {
     Ok(())
 }
 
-fn register(state: Shared) -> Result<()> {
+/// Keep an unpublished worker out of retained history if its caller is dropped
+/// while native admission or the final ownership check is pending.
+struct Registration(Option<Shared>);
+
+impl Registration {
+    fn commit(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if let Some(state) = self.0.take() {
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|worker| !Arc::ptr_eq(worker, &state));
+        }
+    }
+}
+
+fn register(state: Shared) -> Result<Registration> {
     let mut workers = registry().lock().map_err(|_| stopped())?;
     if workers.len() == MAX_WORKERS {
         // Never evict a live process. Closed handles expire oldest-first;
@@ -211,9 +232,9 @@ fn register(state: Shared) -> Result<()> {
             })?;
         workers.remove(oldest_closed);
     }
-    workers.push_back(state);
+    workers.push_back(Arc::clone(&state));
     drop(workers);
-    Ok(())
+    Ok(Registration(Some(state)))
 }
 
 fn lookup(owner: &str, id: &str) -> Result<Shared> {
@@ -350,8 +371,9 @@ async fn start(
         return Err(invalid("maximum nested subagent depth reached"));
     }
     let deadline = Deadline::for_request(tool.timeout, timeout)?;
+    let job_deadline = Instant::now() + deadline.remaining();
     let owner_id = background::resolve_session(&tool.job_session_scope, &owner, deadline).await?;
-    let admission = crate::jobs::admit_owned_task(&owner_id)?;
+    let admission = crate::jobs::admit_owned_task(&owner_id)?.with_deadline(job_deadline);
     let parent_model = tool.capture_parent_model();
     let cost_budget = tool.cost_scope.current();
     let workspace_roots = workspace::CapturedRoots::capture(&tool.workspace, privacy.clone())?;
@@ -433,7 +455,7 @@ async fn start(
         workspace: None,
         workspace_roots: None,
     }));
-    register(Arc::clone(&state))?;
+    let registration = register(Arc::clone(&state))?;
     let runner = ChildRunner::new(
         cwd,
         tool.global_dir.clone(),
@@ -451,7 +473,7 @@ async fn start(
     let cleanup = FinishGuard(Arc::clone(&state));
     let actor_state = Arc::clone(&state);
     let artifacts = tool.global_dir.join("tool-output-artifacts");
-    let job = crate::jobs::spawn_owned_task(
+    let launch = crate::jobs::spawn_owned_task_async(
         admission,
         "reusable subagent worker",
         owner.clone(),
@@ -462,54 +484,34 @@ async fn start(
             let _cleanup = cleanup;
             execution::worker::run(runner, agent, actor_state).await
         },
-    );
-    match job {
-        Ok(job) => {
-            state.lock().map_err(|_| stopped())?.job_id = job.id;
-            // A privacy refusal must not admit an invisible task. The actor
-            // may establish RPC readiness, but cannot dequeue until this
-            // complete acknowledgment has passed projection and identity checks.
-            let acknowledgment = async {
-                let output = snapshot(&state, Some(1), &privacy)?;
-                if background::resolve_session(&tool.job_session_scope, &owner, deadline).await?
-                    != owner_id
-                {
-                    return Err(Error::tool(
-                        "subagent",
-                        "PI_SUBAGENT_SESSION_CHANGED: worker owner changed before acknowledgment",
-                    ));
-                }
-                check_owner(&owner)?;
-                let (_, job_id) = identity(&state)?;
-                crate::jobs::with_owned_task_progress(&owner_id, &job_id, || {
-                    let mut state = state.lock().map_err(|_| stopped())?;
-                    if state.closed || state.closing || state.deadline.check().is_err() {
-                        return Err(stopped());
-                    }
-                    state.acknowledged = true;
-                    drop(state);
-                    Ok(((), None))
-                })?;
-                Ok(output)
-            }
-            .await;
-            match acknowledgment {
-                Ok(output) => Ok(output),
-                Err(error) => {
-                    close(&state).await?;
-                    Err(error)
-                }
-            }
-        }
-        Err(error) => {
-            // The rejected task has already dropped its owned cleanup guard.
-            registry()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain(|worker| !Arc::ptr_eq(worker, &state));
-            Err(error)
-        }
+    )
+    .await?;
+    let job = launch.snapshot()?;
+    state.lock().map_err(|_| stopped())?.job_id = job.id;
+    // Native work remains unpolled until the complete acknowledgment passes
+    // projection and identity checks. Dropping this future also drops the
+    // armed launch and registration, without starting an invisible RPC child.
+    let output = snapshot(&state, Some(1), &privacy)?;
+    if background::resolve_session(&tool.job_session_scope, &owner, deadline).await? != owner_id {
+        return Err(Error::tool(
+            "subagent",
+            "PI_SUBAGENT_SESSION_CHANGED: worker owner changed before acknowledgment",
+        ));
     }
+    check_owner(&owner)?;
+    let (_, job_id) = identity(&state)?;
+    crate::jobs::with_owned_task_progress(&owner_id, &job_id, || {
+        let mut state = state.lock().map_err(|_| stopped())?;
+        if state.closed || state.closing || state.deadline.check().is_err() {
+            return Err(stopped());
+        }
+        state.acknowledged = true;
+        drop(state);
+        Ok(((), None))
+    })?;
+    launch.publish()?;
+    registration.commit();
+    Ok(output)
 }
 
 #[allow(clippy::too_many_lines)] // One dispatcher: send admission, close and the wait loop.

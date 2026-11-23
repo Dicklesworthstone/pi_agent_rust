@@ -693,6 +693,89 @@ mod legacy {
     }
 
     #[test]
+    fn dropping_final_ack_removes_native_admission_without_provider_work_or_notice() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = fixture(vec![ready("must not be requested")]);
+        let scope = fixture.tool.session_scope.clone();
+        let session = fixture.host.session.clone();
+        let (entered, ready) = oneshot::channel();
+        let entered = Arc::new(Mutex::new(Some(entered)));
+        let snapshot = || {
+            let checks = AtomicUsize::new(0);
+            let session = session.clone();
+            let entered = Arc::clone(&entered);
+            scope.bind(Arc::new(move || {
+                // Preparation captures privacy before the last pre-launch
+                // session check; the following lookup is the final ACK fence.
+                let pending_ack = checks.fetch_add(1, Ordering::SeqCst) > 0;
+                let session = session.clone();
+                let entered = Arc::clone(&entered);
+                Box::pin(async move {
+                    if pending_ack {
+                        if let Some(entered) = entered.lock().expect("ack gate").take() {
+                            let _ = entered.send(());
+                        }
+                        futures::future::pending::<Option<String>>().await
+                    } else {
+                        Some(session)
+                    }
+                })
+            }));
+            privacy()
+        };
+        runtime().block_on(async {
+            let mut call = invocation(&fixture, &snapshot);
+            let owner = AgentCx::for_request();
+            let launch = Box::pin(owner.with_current(call.dispatch(
+                &fixture.tool,
+                "__pi_complete_start",
+                json!({"prompt":"abandoned before acknowledgment"}),
+            )));
+            let time = owner.time();
+            let gate = Box::pin(futures::future::select(
+                Box::pin(ready),
+                Box::pin(time.sleep(Duration::from_secs(5))),
+            ));
+            let pending = match futures::future::select(launch, gate).await {
+                futures::future::Either::Right((
+                    futures::future::Either::Left((Ok(()), _)),
+                    pending,
+                )) => pending,
+                _ => panic!("model admission did not reach its final session check"),
+            };
+            drop(pending);
+            let id = call
+                .receipts
+                .first()
+                .and_then(|receipt| receipt.get("jobId"))
+                .and_then(Value::as_str)
+                .expect("native admission reached its final acknowledgment");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let retired = loop {
+                if let Err(error) =
+                    crate::jobs::wait_async(&fixture.host.session, id, Duration::ZERO).await
+                {
+                    assert!(error.to_string().contains("PI_JOBS_UNKNOWN_ID"));
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                time.sleep(Duration::from_millis(10)).await;
+            };
+            crate::jobs::kill_session(&fixture.host.session)
+                .await
+                .expect("retire test session");
+            assert!(retired, "abandoned model admission left a ghost job");
+            assert!(fixture.provider.prompts.lock().expect("provider calls").is_empty());
+            assert_eq!(fixture.provider.active.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.provider.dropped.load(Ordering::SeqCst), 0);
+            assert!(crate::jobs::list(&fixture.host.session).expect("owned jobs").is_empty());
+            assert!(crate::jobs::take_completion_notices(&fixture.host.session).is_empty());
+        });
+    }
+
+    #[test]
     fn original_admission_deadline_cannot_be_restarted_when_owned_work_is_polled() {
         let fixture = fixture(vec![]);
         let request = CompletionRequest::parse(json!({"prompt":"x"})).unwrap();
