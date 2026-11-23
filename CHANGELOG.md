@@ -14,6 +14,36 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+### Added
+
+- **Persistent `defaultTools` setting across session hosts.**
+  `tools.defaultTools` persists default built-in tool selection across CLI, TUI, RPC, and SDK hosts.
+- **Bounded `tool.batch` and grouped/keyed workpools in `eval` and `subagent`.**
+  Exposed bounded native `tool.batch` with mutation barriers in Python and JavaScript `eval` cells, added keyed batches and streaming grouped item yields for reusable subagent workpools, and inherited revocable workspace roots across native delegation.
+- **Python `eval` JPEG, GIF, and WebP image returns.**
+  Python `eval` cells now return JPEG, GIF, and WebP images alongside PNG.
+- **Durable RPC plan review and FrankenTUI manual compaction modes.**
+  Added exact-proposal RPC plan review approval and honored manual compaction mode selection through queued recovery in FrankenTUI.
+- **Dedicated `pi_agent_rust_soak` DSR lane and Linux-hosted Windows cross-compile check.**
+  Added the opt-in session-duration and sustained tool-concurrency soak lane (`pi_agent_rust_soak`, GH #213) and a 12th DSR quality check verifying `x86_64-pc-windows-gnu` compilation on Linux workers.
+
+### Changed
+
+- **Package-qualified extension IDs (`npm:` and `package:`, `#288`).**
+  Extensions declared in `pi.extensions` now receive `npm:<package>:<filename>` (when installed under matching `node_modules`) or `package:<package>:<filename>` (for local/Git packages) IDs so unrelated packages declaring `./src/index.ts` load side by side while preserving legacy denies and lower quotas.
+- **Hostcall dispatch and superinstruction fast paths.**
+  Activated Tier-2 trace-JIT compilation on live support counts, eliminated redundant superinstruction recompilations with exact snapshot guards and a unified FNV-1a motif table, wired the calibrated e-graph cost model, and skipped reactor mesh overhead when no mesh is active.
+- **Workspace MSRV raised to Rust 1.97** alongside updated `fsqlite` and `asupersync` floors.
+
+### Fixed
+
+- **Shared TypeScript Pi settings warnings (`#287`).**
+  Stopped reporting settings belonging to Pi's TypeScript implementation (`cacheWarming`, `defaultProjectTrust`, `enableInstallTelemetry`, `extensionChangelogVersions`, `showCacheMissNotices`, `terminal.showTerminalProgress`, `warnings`, etc.) as unrecognised settings while still warning on typos.
+- **Cancellation, admission, and durability hardening.**
+  Revalidated tool effects for top-level parallel tool batches after secret restoration and approval callbacks (`TOOL_BATCH_EFFECTS_CHANGED`), made native job/subagent/worker/pool/model-job admission asynchronous and owned across final session checks, fenced interrupted session replacement saves, honored owner cancellation and explicit aborts across provider waits and SDK retry backoff, and rejected blocking FIFO/special-file host reads in the QuickJS filesystem shim.
+- **Extension isolation, MCP SSE recovery, and interactive fixes.**
+  Isolated extension model catalogs and timer controls across activation lifetimes, preserved the first session-operation veto, supported atomic virtual directory renames, honored runtime `HOME`/`USERPROFILE` in `node:os` `homedir()`, retired expired TUI extension dialogs, kept interactive RPC session hooks responsive to control replies, and hardened MCP SSE reconnection and framing checks.
+
 ## [v0.9.0] — 2026-11-21 — Release
 
 A major feature and hardening wave on top of `v0.8.0` (~887 commits). Adds native `/goal` workflows across both terminal stacks and RPC/SDK, the `pi web` browser companion (`--terminal` mirror + TLS 1.3 + scannable QR), project memory learning (`/memory sync`), `--wait-async` background print loops, shared session-tree cost caps (`--warn-cost`/`--max-cost`), ACP session forks/live steering/editor-buffered file tools/native audio-video prompts, native MCP OAuth/SSE/form & URL elicitation, live model discovery v2 (`models.fetched.json`, `/fast ultrafast`), live `/rules` stream rules, `grep` exclusions and URL search, `SnapCompact`, real `better-sqlite3`/`axios`/`zod`/`node:readline` extension shims, `wasmtime 48.0.10` (0 RUSTSEC advisories), Minisign signature verification in `install.sh`/`pi update`, and fixes the live `openai-codex` default model (`gpt-5.6-sol`) and DSR `VERGEN_GIT_SHA` provenance.

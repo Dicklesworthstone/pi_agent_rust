@@ -114,27 +114,27 @@ fix.
 
 ### Conformance Tests
 
-Conformance tests validate that Pi behaves identically to the legacy TypeScript implementation for tools, extensions, and core logic. Tests are organized in tiers:
+Conformance suites validate built-in tool fixtures, extension policy enforcement, and historical compatibility diagnostics. Per `AGENTS.md`, legacy TypeScript Pi parity is historical context rather than a release gate, and **DSR (`dsr quality --tool pi_agent_rust`) is the exclusive quality authority**; use `rch exec --` only for targeted remote diagnostic runs, never bare local `cargo` builds on shared hosts.
 
-#### Quick: Policy + Tool Conformance (no external deps)
+#### Quick: Policy + Tool Conformance (targeted remote diagnostic runs via RCH)
 
 ```bash
 # Tool conformance fixtures
-cargo test conformance
+rch exec -- cargo test conformance
 
 # Extension policy negative tests (51 tests: deny/allow across modes)
-cargo test --test extensions_policy_negative
+rch exec -- cargo test --test extensions_policy_negative
 
 # Fixture schema validation
-cargo test --test ext_conformance_fixture_schema
+rch exec -- cargo test --test ext_conformance_fixture_schema
 
 # Artifact checksum validation
-cargo test --test ext_conformance_artifacts
+rch exec -- cargo test --test ext_conformance_artifacts
 ```
 
-#### Full: Differential TS-Rust Oracle (requires Bun + pi-mono)
+#### Full: Differential TS-Rust Oracle (historical diagnostic; requires Bun + pi-mono)
 
-These tests run the same unmodified extension in both the legacy TypeScript runtime and the Rust QuickJS runtime, then compare registration snapshots.
+These diagnostic tests run an extension in both the legacy TypeScript runtime and the Rust QuickJS runtime and compare registration snapshots.
 
 **Prerequisites:**
 - Bun 1.3.8 at `/home/ubuntu/.bun/bin/bun` (or on PATH)
@@ -142,19 +142,19 @@ These tests run the same unmodified extension in both the legacy TypeScript runt
 
 ```bash
 # Official extensions (60) - differential conformance
-cargo test --test ext_conformance_diff --features ext-conformance -- --nocapture
+rch exec -- cargo test --test ext_conformance_diff --features ext-conformance -- --nocapture
 
 # Limit to first N official extensions (faster iteration)
-PI_OFFICIAL_MAX=5 cargo test --test ext_conformance_diff --features ext-conformance -- --nocapture
+rch exec -- env PI_OFFICIAL_MAX=5 cargo test --test ext_conformance_diff --features ext-conformance -- --nocapture
 
 # Scenario execution (tool calls, commands, events)
-cargo test --test ext_conformance_scenarios --features ext-conformance -- --nocapture
+rch exec -- cargo test --test ext_conformance_scenarios --features ext-conformance -- --nocapture
 
 # Auto-generated per-extension tests
-cargo test --test ext_conformance_generated --features ext-conformance -- --nocapture
+rch exec -- cargo test --test ext_conformance_generated --features ext-conformance -- --nocapture
 
-# Community + npm + third-party (weekly in CI, use --ignored)
-cargo test --test ext_conformance_diff --features ext-conformance -- --ignored --nocapture
+# Community + npm + third-party (opt-in ignored lane)
+rch exec -- cargo test --test ext_conformance_diff --features ext-conformance -- --ignored --nocapture
 
 # Npm-registry differential lane (ignored opt-in, bounded to 5 by default)
 rch exec -- env PI_NPM_FILTER=aliou-pi-extension-dev PI_NPM_MAX=1 \
@@ -177,10 +177,10 @@ rch exec -- env PI_NPM_FILTER=aliou-pi-extension-dev PI_NPM_MAX=1 \
 
 #### Generating the Conformance Report
 
-After running conformance tests, generate a combined per-extension report:
+After running conformance tests, generate a combined per-extension report remotely:
 
 ```bash
-cargo test --test conformance_report generate_conformance_report -- --nocapture
+rch exec -- cargo test --test conformance_report generate_conformance_report -- --nocapture
 ```
 
 This produces three output files in `tests/ext_conformance/reports/`:

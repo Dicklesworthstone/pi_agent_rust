@@ -110,6 +110,7 @@ class LoopbackStubProvider:
     def __init__(self) -> None:
         self.mode = "ok"
         self.turn = 0
+        self.requests: list[dict[str, Any]] = []
         self.lock = threading.Lock()
         stub = self
 
@@ -121,11 +122,20 @@ class LoopbackStubProvider:
 
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length", "0"))
-                _ = self.rfile.read(length) if length > 0 else b""
+                raw_body = self.rfile.read(length) if length > 0 else b""
+                parsed_body: dict[str, Any] = {}
+                if raw_body:
+                    try:
+                        decoded = json.loads(raw_body.decode("utf-8"))
+                        if isinstance(decoded, dict):
+                            parsed_body = decoded
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        parsed_body = {}
                 with stub.lock:
                     mode = stub.mode
                     stub.turn += 1
                     idx = stub.turn
+                    stub.requests.append(parsed_body)
 
                 if mode == "http_401":
                     err_body = json.dumps({
@@ -227,6 +237,14 @@ class LoopbackStubProvider:
         with self.lock:
             self.mode = mode
             self.turn = 0
+            self.requests.clear()
+
+    def last_request_messages(self) -> list[Any]:
+        with self.lock:
+            if not self.requests:
+                return []
+            msgs = self.requests[-1].get("messages")
+            return msgs if isinstance(msgs, list) else []
 
     def close(self) -> None:
         self.server.shutdown()
@@ -386,6 +404,15 @@ def run_rpc_smoke(
         return False, {}
 
     try:
+        def is_plain_int(val: Any) -> bool:
+            return isinstance(val, int) and not isinstance(val, bool)
+
+        def fetch_stats(tag: str) -> tuple[bool, dict[str, Any]]:
+            ok_st, st_resp = send_and_wait({"id": f"stats-{tag}", "type": "get_session_stats"})
+            if not ok_st or st_resp is None:
+                return False, {}
+            return True, st_resp.get("data") or {}
+
         ok_state, _ = send_and_wait({"id": "st-1", "type": "get_state"})
         if not ok_state:
             return 1, int((time.monotonic() - t0) * 1000), "RPC get_state failed"
@@ -395,9 +422,11 @@ def run_rpc_smoke(
             wait_event="agent_end",
         )
         idle_p1, state_p1 = wait_idle("p1")
-        if not ok_p1 or not idle_p1:
+        ok_stats_p1, stats_p1 = fetch_stats("p1")
+        if not ok_p1 or not idle_p1 or not ok_stats_p1:
             return 1, int((time.monotonic() - t0) * 1000), "RPC prompt 1 failed"
         count_at_cp = state_p1.get("messageCount")
+        active_at_cp = stats_p1.get("totalMessages")
 
         ok_cp, cp_resp = send_and_wait({"id": "cp-1", "type": "checkpoint", "name": "alpha"})
         if not ok_cp:
@@ -408,16 +437,23 @@ def run_rpc_smoke(
             wait_event="agent_end",
         )
         idle_p2, state_p2 = wait_idle("p2")
-        if not ok_p2 or not idle_p2:
+        ok_stats_p2, stats_p2 = fetch_stats("p2")
+        if not ok_p2 or not idle_p2 or not ok_stats_p2:
             return 1, int((time.monotonic() - t0) * 1000), "RPC prompt 2 failed"
         count_after_p2 = state_p2.get("messageCount")
+        active_after_p2 = stats_p2.get("totalMessages")
 
         ok_rw, rw_resp = send_and_wait({"id": "rw-1", "type": "rewind", "name": "alpha"})
         if not ok_rw or rw_resp is None:
             return 1, int((time.monotonic() - t0) * 1000), f"RPC rewind failed: {rw_resp}"
         rw_data = rw_resp.get("data") or {}
         collapsed = rw_data.get("collapsedMessages")
-        if rw_data.get("checkpoint") != "alpha" or not isinstance(collapsed, int) or collapsed < 2:
+        if (
+            rw_data.get("checkpoint") != "alpha"
+            or not is_plain_int(collapsed)
+            or collapsed < 2
+            or rw_data.get("treePreserved") is not True
+        ):
             return (
                 1,
                 int((time.monotonic() - t0) * 1000),
@@ -425,26 +461,60 @@ def run_rpc_smoke(
             )
 
         idle_rw, state_rw = wait_idle("rw")
-        if not idle_rw:
-            return 1, int((time.monotonic() - t0) * 1000), "RPC post-rewind get_state failed"
-        def is_plain_int(val: Any) -> bool:
-            return isinstance(val, int) and not isinstance(val, bool)
+        ok_stats_rw, stats_rw = fetch_stats("rw")
+        if not idle_rw or not ok_stats_rw:
+            return 1, int((time.monotonic() - t0) * 1000), "RPC post-rewind state/stats failed"
 
         count_after_rw = state_rw.get("messageCount")
-        if not (is_plain_int(count_at_cp) and is_plain_int(count_after_p2) and is_plain_int(count_after_rw)):
-            return (
-                1,
-                int((time.monotonic() - t0) * 1000),
-                f"RPC get_state missing integer messageCount (at_cp={count_at_cp!r}, after_p2={count_after_p2!r}, after_rw={count_after_rw!r})",
+        active_after_rw = stats_rw.get("totalMessages")
+        if not all(
+            is_plain_int(v)
+            for v in (
+                count_at_cp,
+                count_after_p2,
+                count_after_rw,
+                active_at_cp,
+                active_after_p2,
+                active_after_rw,
             )
-        # Rewind collapses the post-checkpoint span and appends at most one
-        # rewind summary message, so messageCount must strictly decrease
-        # below count_after_p2 and land at count_at_cp or count_at_cp + 1.
-        if not (count_after_p2 > count_at_cp and count_at_cp <= count_after_rw < count_after_p2):
+        ):
             return (
                 1,
                 int((time.monotonic() - t0) * 1000),
-                f"RPC rewind did not shrink active context (at_cp={count_at_cp}, after_p2={count_after_p2}, after_rw={count_after_rw}, collapsed={collapsed})",
+                f"RPC state/stats missing integer counts (tree={count_at_cp!r}->{count_after_p2!r}->{count_after_rw!r}, active={active_at_cp!r}->{active_after_p2!r}->{active_after_rw!r})",
+            )
+        # Rewind preserves raw JSONL tree entries (treePreserved=true, so
+        # get_state.messageCount stays >= count_after_p2) while collapsing the
+        # projected active model context reported by get_session_stats.totalMessages.
+        if count_after_rw < count_after_p2:
+            return (
+                1,
+                int((time.monotonic() - t0) * 1000),
+                f"RPC rewind lost preserved tree entries (tree={count_at_cp}->{count_after_p2}->{count_after_rw})",
+            )
+        if not (active_after_p2 > active_at_cp and active_at_cp <= active_after_rw < active_after_p2):
+            return (
+                1,
+                int((time.monotonic() - t0) * 1000),
+                f"RPC rewind did not shrink projected active context (active={active_at_cp}->{active_after_p2}->{active_after_rw}, collapsed={collapsed})",
+            )
+
+        # Prompt 3 proves on the wire that the abandoned turn is gone from the
+        # active provider request and replaced by the checkpoint rewind report.
+        ok_p3, _ = send_and_wait(
+            {"id": "p-3", "type": "prompt", "message": "Third turn after rewind"},
+            wait_event="agent_end",
+        )
+        idle_p3, _ = wait_idle("p3")
+        if not ok_p3 or not idle_p3:
+            return 1, int((time.monotonic() - t0) * 1000), "RPC post-rewind prompt 3 failed"
+        wire_msgs = stub.last_request_messages()
+        wire_blob = json.dumps(wire_msgs)
+        if "Second turn to rewind" in wire_blob or "REWIND REPORT" not in wire_blob:
+            return (
+                1,
+                int((time.monotonic() - t0) * 1000),
+                f"RPC post-rewind wire context did not collapse abandoned turn (messages={len(wire_msgs)})",
             )
 
         proc.stdin.close()
@@ -457,7 +527,7 @@ def run_rpc_smoke(
         return (
             0,
             elapsed,
-            f"RPC get_state + prompt + checkpoint + rewind (messageCount {count_at_cp}->{count_after_p2}->{count_after_rw}) + graceful shutdown succeeded",
+            f"RPC get_state + prompt + checkpoint + rewind (active {active_at_cp}->{active_after_p2}->{active_after_rw}, tree preserved={count_after_rw}, wire verified) + graceful shutdown succeeded",
         )
     finally:
         if proc.poll() is None:

@@ -14,11 +14,11 @@ and `docs/evidence/` are retired records, not active release gates.
 
 ```toml
 [dependencies]
-pi = { package = "pi_agent_rust", version = "0.8.0" }
+pi = { package = "pi_agent_rust", version = "0.9.0" }
 futures = "0.3"
 ```
 
-When developing against a local checkout, replace `version = "0.8.0"` with
+When developing against a local checkout, replace `version = "0.9.0"` with
 `path = "/path/to/pi_agent_rust"` while retaining `package = "pi_agent_rust"`.
 
 ### `recursion_limit` notes (post-type-erasure)
