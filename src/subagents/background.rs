@@ -286,7 +286,7 @@ pub(super) async fn start(
     if let Some(privacy) = progress_privacy {
         // Install progress before native execution is released. There is no
         // await between this handoff, job publication and acknowledgment.
-        let _ = publish.send(workflow::Progress::new(session_id, job.id.clone(), privacy));
+        let _ = publish.send(workflow::Progress::new(session_id, job.id, privacy));
     }
     let job = launch.publish()?;
     let progress_notice = if mode == "workflow" {
