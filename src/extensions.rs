@@ -21395,11 +21395,7 @@ async fn dispatch_shared_allowed(
             #[allow(clippy::collection_is_never_read)]
             let mut _reactor_completion = None;
             if let Some(ref manager) = ctx.manager {
-                match manager.reactor_submit(
-                    call.call_id.clone(),
-                    opcode,
-                    params_without_key(&call.params, "op"),
-                ) {
+                match manager.reactor_submit_lazy(&call.call_id, opcode, &call.params) {
                     Some(Ok(reactor_req)) => {
                         tracing::trace!(
                             event = "host_call.reactor_routed",

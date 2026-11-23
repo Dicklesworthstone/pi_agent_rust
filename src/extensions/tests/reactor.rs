@@ -412,6 +412,76 @@ fn extension_manager_zero_capacity_reactor_config_disables_mesh() {
 }
 
 #[test]
+fn reactor_mesh_raii_active_counter_and_lazy_submit_behavior() {
+    let disabled = ExtensionManager::new();
+    let raw_params = json!({"op": "get_state", "includeEntries": true});
+    assert!(
+        disabled
+            .reactor_submit_lazy(
+                "lazy-disabled",
+                CommonHostcallOpcode::SessionGetState,
+                &raw_params
+            )
+            .is_none(),
+        "disabled manager must bypass reactor submission cleanly"
+    );
+
+    let enabled = ExtensionManager::new();
+    enabled.enable_hostcall_reactor(HostcallReactorConfig {
+        shard_count: 2,
+        lane_capacity: 4,
+        core_ids: None,
+    });
+    assert!(HostcallReactorMesh::any_active());
+    assert!(enabled.hostcall_reactor_enabled());
+
+    // Even while a sibling manager has an active reactor, the disabled manager
+    // must still return None from reactor_submit_lazy.
+    assert!(
+        disabled
+            .reactor_submit_lazy(
+                "lazy-disabled-with-sibling",
+                CommonHostcallOpcode::SessionGetState,
+                &raw_params
+            )
+            .is_none()
+    );
+
+    // Enabled manager strips "op" lazily and preserves remaining parameters.
+    let submitted = enabled
+        .reactor_submit_lazy(
+            "lazy-enabled",
+            CommonHostcallOpcode::SessionGetState,
+            &raw_params,
+        )
+        .expect("enabled manager must accept lazy submission")
+        .expect("fresh lane must not report backpressure");
+    assert_eq!(submitted.call_id, "lazy-enabled");
+    assert_eq!(submitted.params, json!({"includeEntries": true}));
+
+    let drained = enabled.reactor_drain_global(4);
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].params, json!({"includeEntries": true}));
+
+    // Replacing with an invalid config drops the previous mesh cleanly via RAII.
+    enabled.enable_hostcall_reactor(HostcallReactorConfig {
+        shard_count: 0,
+        lane_capacity: 4,
+        core_ids: None,
+    });
+    assert!(!enabled.hostcall_reactor_enabled());
+    assert!(
+        enabled
+            .reactor_submit_lazy(
+                "lazy-after-invalid",
+                CommonHostcallOpcode::SessionGetState,
+                &raw_params
+            )
+            .is_none()
+    );
+}
+
+#[test]
 fn reactor_mesh_zero_shards_fail_closed() {
     let mut mesh = HostcallReactorMesh::new(HostcallReactorConfig {
         shard_count: 0,

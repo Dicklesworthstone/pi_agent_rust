@@ -1603,6 +1603,14 @@ const HOSTCALL_REACTOR_PRESSURE_NUMERATOR: usize = 3;
 const HOSTCALL_REACTOR_PRESSURE_DENOMINATOR: usize = 4;
 const HOSTCALL_REACTOR_LATENCY_WINDOW: usize = 128;
 
+/// Process-wide count of live, non-empty [`HostcallReactorMesh`] instances.
+///
+/// Maintained via RAII (`HostcallReactorMesh::new` / `Drop`) so default
+/// production fast-lane hostcall dispatch can skip both mutex acquisition and
+/// `call_id`/`params` cloning with a single atomic load when no reactor is active.
+static ACTIVE_HOSTCALL_REACTOR_MESHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn hostcall_reactor_now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1833,6 +1841,8 @@ impl HostcallReactorMesh {
             (None, Vec::new())
         };
 
+        ACTIVE_HOSTCALL_REACTOR_MESHES.fetch_add(1, StdOrdering::Release);
+
         Self {
             config: HostcallReactorConfig {
                 shard_count,
@@ -1848,6 +1858,12 @@ impl HostcallReactorMesh {
             numa_pool,
             affinity_advice,
         }
+    }
+
+    /// Lock-free fast check for whether any non-empty reactor mesh exists.
+    #[inline]
+    pub(super) fn any_active() -> bool {
+        ACTIVE_HOSTCALL_REACTOR_MESHES.load(StdOrdering::Acquire) > 0
     }
 
     /// Number of shard lanes.
@@ -2088,6 +2104,14 @@ impl HostcallReactorMesh {
             self.total_dispatched = self.total_dispatched.saturating_add(1);
         }
         completed
+    }
+}
+
+impl Drop for HostcallReactorMesh {
+    fn drop(&mut self) {
+        if !self.lanes.is_empty() {
+            ACTIVE_HOSTCALL_REACTOR_MESHES.fetch_sub(1, StdOrdering::Release);
+        }
     }
 }
 

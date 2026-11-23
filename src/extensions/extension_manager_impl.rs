@@ -2468,6 +2468,9 @@ impl ExtensionManager {
     /// Check if the reactor mesh is enabled.
     #[must_use]
     pub fn hostcall_reactor_enabled(&self) -> bool {
+        if !HostcallReactorMesh::any_active() {
+            return false;
+        }
         self.inner
             .lock()
             .is_ok_and(|guard| guard.hostcall_reactor.is_some())
@@ -2484,6 +2487,9 @@ impl ExtensionManager {
         opcode: CommonHostcallOpcode,
         params: Value,
     ) -> Option<std::result::Result<HostcallReactorRequest, HostcallReactorBackpressure>> {
+        if !HostcallReactorMesh::any_active() {
+            return None;
+        }
         let mut guard = self.inner.lock().ok()?;
         let reactor = guard.hostcall_reactor.as_mut()?;
         let result = reactor.submit(call_id, opcode, params);
@@ -2491,8 +2497,36 @@ impl ExtensionManager {
         Some(result)
     }
 
+    /// Submit a fast-lane hostcall without allocating or locking when no reactor is active.
+    ///
+    /// Checks the process-wide RAII active counter first, and even when another
+    /// manager has a reactor enabled, confirms `self.inner.hostcall_reactor.is_some()`
+    /// before cloning `call_id` or stripping `"op"` from `params`.
+    pub(crate) fn reactor_submit_lazy(
+        &self,
+        call_id: &str,
+        opcode: CommonHostcallOpcode,
+        params: &Value,
+    ) -> Option<std::result::Result<HostcallReactorRequest, HostcallReactorBackpressure>> {
+        if !HostcallReactorMesh::any_active() {
+            return None;
+        }
+        let mut guard = self.inner.lock().ok()?;
+        let reactor = guard.hostcall_reactor.as_mut()?;
+        let result = reactor.submit(
+            call_id.to_string(),
+            opcode,
+            params_without_key(params, "op"),
+        );
+        drop(guard);
+        Some(result)
+    }
+
     /// Record completion for a fast-lane hostcall that was dispatched directly.
     pub(crate) fn reactor_record_completion(&self, shard_id: usize, global_seq: u64) -> bool {
+        if !HostcallReactorMesh::any_active() {
+            return false;
+        }
         self.inner
             .lock()
             .ok()
@@ -2525,6 +2559,9 @@ impl ExtensionManager {
         shard_id: usize,
         budget: usize,
     ) -> Vec<HostcallReactorRequest> {
+        if !HostcallReactorMesh::any_active() {
+            return Vec::new();
+        }
         self.inner
             .lock()
             .ok()
@@ -2539,6 +2576,9 @@ impl ExtensionManager {
 
     /// Drain pending requests in deterministic global sequence order.
     pub fn reactor_drain_global(&self, budget: usize) -> Vec<HostcallReactorRequest> {
+        if !HostcallReactorMesh::any_active() {
+            return Vec::new();
+        }
         self.inner
             .lock()
             .ok()
@@ -2554,6 +2594,9 @@ impl ExtensionManager {
     /// Get reactor mesh telemetry snapshot.
     #[must_use]
     pub fn reactor_telemetry(&self) -> Option<HostcallReactorTelemetry> {
+        if !HostcallReactorMesh::any_active() {
+            return None;
+        }
         self.inner.lock().ok().and_then(|guard| {
             guard
                 .hostcall_reactor
