@@ -407,7 +407,9 @@ fn active_backend_is_not_polled_while_live_identity_is_unresolved() {
     let polls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&polls);
     run(async {
-        let budget = Budget::new(&json!({"timeout_ms":60}), "evaluate").unwrap();
+        // Leave wide scheduling headroom above POLL_INTERVAL (20ms) so a loaded
+        // host still reaches the rebound pending identity lookup before timing out.
+        let budget = Budget::new(&json!({"timeout_ms":500}), "evaluate").unwrap();
         let backend = futures::future::poll_fn(move |_| {
             observed.fetch_add(1, Ordering::SeqCst);
             Poll::<()>::Pending

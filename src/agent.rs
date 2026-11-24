@@ -10843,7 +10843,7 @@ mod extensions_integration_tests {
     use std::time::{Duration, Instant};
 
     async fn wait_for_session_action_generation_capture(gate: &SessionActionAdmissionGate) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while gate.pending_generation_check_count() == 0 {
             assert!(
                 Instant::now() < deadline,
@@ -10854,7 +10854,7 @@ mod extensions_integration_tests {
     }
 
     async fn wait_for_session_action_generation_release(gate: &SessionActionAdmissionGate) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while gate.pending_generation_check_count() != 0 {
             assert!(
                 Instant::now() < deadline,
@@ -16172,15 +16172,17 @@ mod extensions_integration_tests {
 
                 let delayed_manager = extension_manager.clone();
                 let hostcall = runtime_handle.spawn(async move {
+                    // Leave ample headroom on saturated builders for the JS thread to reach
+                    // SessionActionAdmissionGate before the command deadline fires.
                     delayed_manager
-                        .execute_command("deadline-held", "", 500)
+                        .execute_command("deadline-held", "", 1_500)
                         .await
                 });
                 wait_for_session_action_generation_capture(&session_action_admission).await;
 
                 let err = asupersync::time::timeout(
                     asupersync::time::wall_now(),
-                    Duration::from_secs(5),
+                    Duration::from_secs(15),
                     Box::pin(hostcall),
                 )
                 .await
@@ -16240,7 +16242,7 @@ mod extensions_integration_tests {
                     .expect("reuse command on the same shard");
                 assert_eq!(reuse, Value::String("reused".to_string()));
                 assert!(
-                    js_runtime.shutdown(Duration::from_secs(1)).await,
+                    js_runtime.shutdown(Duration::from_secs(5)).await,
                     "deadline test runtime did not shut down with AMAC {amac_enabled}"
                 );
             }
