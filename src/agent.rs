@@ -2881,7 +2881,8 @@ impl Agent {
         self.authored_queue_delivery_indices
             .retain(|index| *index >= end);
         if end == self.messages.len() {
-            self.unpersisted_tool_effects.store(false, Ordering::Release);
+            self.unpersisted_tool_effects
+                .store(false, Ordering::Release);
         }
     }
 

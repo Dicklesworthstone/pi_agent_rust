@@ -945,9 +945,9 @@ fn fs_directory_rename_preflights_nested_source_and_destination_admission() {
                 .await
                 .unwrap();
             runtime.drain_microtasks().await.unwrap();
-            runtime.add_extension_root_with_id(
-                workspace.path().join(protected_side).join("private"),
-                Some("rename.other"),
+            runtime.register_foreign_extension_root_boundary(
+                &workspace.path().join(protected_side).join("private"),
+                "rename.other",
             );
             runtime
                 .eval(&format!(

@@ -22677,11 +22677,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// mistaken for an ordinary workspace path. This method deliberately
     /// does not update `allowed_read_roots`, resolver roots, source tiers, or
     /// package scopes.
-    pub(crate) fn register_foreign_extension_root_boundary(
-        &self,
-        root: &Path,
-        owner_extension_id: &str,
-    ) {
+    pub fn register_foreign_extension_root_boundary(&self, root: &Path, owner_extension_id: &str) {
         let owner_extension_id = owner_extension_id.trim();
         if owner_extension_id.is_empty() {
             tracing::warn!(
@@ -47078,7 +47074,10 @@ globalThis.__spawn_abort_result = result;
             drain_until_idle(&runtime, &clock).await;
             let result = get_global_json(&runtime, "fsReadDemand").await;
             assert_eq!(result["done"], json!(true), "{result}");
-            assert_eq!(result["before"], json!({ "bytes": 0, "length": 0, "fd": null }));
+            assert_eq!(
+                result["before"],
+                json!({ "bytes": 0, "length": 0, "fd": null })
+            );
             assert_eq!(result["buffered"], json!({ "bytes": 16, "length": 16 }));
             assert_eq!(result["stillBuffered"], json!(true));
             assert_eq!(result["copied"], json!(true));

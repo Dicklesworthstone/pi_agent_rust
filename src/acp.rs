@@ -4289,9 +4289,9 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(&line).unwrap())
             .collect::<Vec<_>>();
         assert!(
-            frames.iter().any(|frame| {
-                frame["id"] == 2 && frame["result"]["sessionId"].is_string()
-            }),
+            frames
+                .iter()
+                .any(|frame| { frame["id"] == 2 && frame["result"]["sessionId"].is_string() }),
             "the real dispatcher must create the requested session: {frames:?}"
         );
         frames
@@ -4336,9 +4336,7 @@ mod tests {
                 true
             );
         }
-        assert!(
-            frames.iter().find(|frame| frame["id"] == 5).unwrap()["error"].is_object()
-        );
+        assert!(frames.iter().find(|frame| frame["id"] == 5).unwrap()["error"].is_object());
         assert_eq!(
             frames.iter().find(|frame| frame["id"] == 6).unwrap()["result"]["contents"],
             "short\n"
@@ -4384,7 +4382,10 @@ mod tests {
         let frames = run_acp_file_requests(root.path(), &cwd, requests);
         for rejected_id in 3..id {
             assert_eq!(
-                frames.iter().find(|frame| frame["id"] == rejected_id).unwrap()["error"]["code"],
+                frames
+                    .iter()
+                    .find(|frame| frame["id"] == rejected_id)
+                    .unwrap()["error"]["code"],
                 INVALID_PARAMS,
                 "request {rejected_id}: explicit invalid scope must fail closed"
             );
@@ -4520,11 +4521,9 @@ mod tests {
         std::fs::create_dir(&left).unwrap();
         std::fs::create_dir(&right).unwrap();
         let (left_id, left_state) =
-            handle_session_new(&json!({"cwd": left, "mcpServers": []}), &options, None)
-                .unwrap();
+            handle_session_new(&json!({"cwd": left, "mcpServers": []}), &options, None).unwrap();
         let (right_id, right_state) =
-            handle_session_new(&json!({"cwd": right, "mcpServers": []}), &options, None)
-                .unwrap();
+            handle_session_new(&json!({"cwd": right, "mcpServers": []}), &options, None).unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::from([
             (left_id.clone(), Arc::new(Mutex::new(left_state))),
             (right_id, Arc::new(Mutex::new(right_state))),
