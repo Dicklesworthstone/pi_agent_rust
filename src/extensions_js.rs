@@ -14173,28 +14173,40 @@ const __pi_vfs = (() => {
     };
   }
 
-  function listChildren(path, withFileTypes) {
+  function listChildren(path, withFileTypes, limit) {
     const normalized = normalizePath(path);
     const prefix = childPrefix(normalized);
     const children = new Map();
+    function addChild(name, kind) {
+      if (limit !== undefined) {
+        try { resolvePathForRead(prefix + name, false); }
+        catch (_) { return; }
+      }
+      children.set(name, kind);
+      if (limit !== undefined && children.size > limit) {
+        const error = new Error("fs.watch directory entry limit is " + limit);
+        error.code = "ERR_FS_WATCHER_LIMIT";
+        throw error;
+      }
+    }
 
     for (const dir of state.dirs) {
       if (!dir.startsWith(prefix) || dir === normalized) continue;
       const rest = dir.slice(prefix.length);
       if (!rest || rest.includes("/")) continue;
-      children.set(rest, "dir");
+      addChild(rest, "dir");
     }
     for (const file of state.files.keys()) {
       if (!file.startsWith(prefix)) continue;
       const rest = file.slice(prefix.length);
       if (!rest || rest.includes("/")) continue;
-      if (!children.has(rest)) children.set(rest, "file");
+      if (!children.has(rest)) addChild(rest, "file");
     }
     for (const link of state.symlinks.keys()) {
       if (!link.startsWith(prefix)) continue;
       const rest = link.slice(prefix.length);
       if (!rest || rest.includes("/")) continue;
-      if (!children.has(rest)) children.set(rest, "symlink");
+      if (!children.has(rest)) addChild(rest, "symlink");
     }
 
     const names = Array.from(children.keys()).filter((name) => {
@@ -14661,14 +14673,14 @@ export function writeFileSync(path, data, opts) {
   writePathFile(path, data, opts, "w");
 }
 
-export function readdirSync(path, opts) {
+function readDirectory(path, opts, limit) {
   const resolved = __pi_vfs.resolvePathForRead(path, true);
   const withFileTypes = !!(opts && typeof opts === "object" && opts.withFileTypes);
   const children = new Map();
   let foundDir = __pi_vfs.dirs.has(resolved);
 
   if (foundDir) {
-    for (const entry of __pi_vfs.listChildren(resolved, true)) {
+    for (const entry of __pi_vfs.listChildren(resolved, true, limit)) {
       const kind = entry.isDirectory()
         ? "dir"
         : entry.isFile()
@@ -14683,7 +14695,7 @@ export function readdirSync(path, opts) {
   let hostError;
   if (!__pi_vfs.isCurrentExtensionTempPath(resolved) && typeof globalThis.__pi_host_read_dir_sync === "function") {
     try {
-      const hostEntries = JSON.parse(globalThis.__pi_host_read_dir_sync(__pi_vfs.toHostPath(resolved)));
+      const hostEntries = JSON.parse(globalThis.__pi_host_read_dir_sync(__pi_vfs.toHostPath(resolved), limit));
       foundDir = true;
       for (const entry of hostEntries) {
         if (!entry || typeof entry.name !== "string") continue;
@@ -14694,8 +14706,15 @@ export function readdirSync(path, opts) {
         } catch (_) {
           // Nested roots owned by another extension are invisible.
         }
+        if (limit !== undefined && children.size > limit) {
+          const error = new Error("fs.watch directory entry limit is " + limit);
+          error.code = "ERR_FS_WATCHER_LIMIT";
+          throw error;
+        }
       }
     } catch (e) {
+      // A failed scan must not fabricate deletions from an empty snapshot.
+      if (limit !== undefined && !(foundDir && e && e.code === "ENOENT")) throw e;
       const message = String((e && e.message) ? e.message : e);
       hostError = message;
     }
@@ -14712,6 +14731,7 @@ export function readdirSync(path, opts) {
   }
   return names;
 }
+export function readdirSync(path, opts) { return readDirectory(path, opts); }
 
 const __fakeStat = {
   isFile() { return false; },
@@ -15207,18 +15227,15 @@ export function futimesSync(fd, atime, mtime) {
   __pi_vfs.authorizeFdWrite(entry);
   __pi_vfs.applyMetadataTimes(entry.file.metadata, atime, mtime);
 }
-export function watch(_path, _optsOrListener, _listener) {
-  const error = new Error("fs.watch native notifications are unavailable; use fs.watchFile for stat polling");
-  error.code = "ERR_FEATURE_UNAVAILABLE";
-  throw error;
-}
 const __pi_file_watchers = (() => {
   const bridge = globalThis.__pi_fs_watch_runtime;
+  const signalPrototype = globalThis.AbortSignal?.prototype;
+  const signalAborted = signalPrototype && Object.getOwnPropertyDescriptor(signalPrototype, "aborted")?.get;
   const fields = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeMs", "mtimeMs", "ctimeMs", "birthtimeMs"];
   // Match libuv's fs-poll comparison: reading a changed settings file inside
   // its listener must not retrigger the watcher through atime alone.
   const changeFields = ["dev", "ino", "mode", "uid", "gid", "size", "mtimeMs", "ctimeMs", "birthtimeMs"];
-  let first = null, count = 0;
+  let first = null, count = 0, snapshotEntries = 0;
   function requireOwner(entry) {
     if (entry.owner !== bridge.owner()) {
       const error = new Error("host read denied: file watcher belongs to another extension");
@@ -15251,6 +15268,78 @@ const __pi_file_watchers = (() => {
     }
     return false;
   }
+
+  function watcherLimit(message) {
+    const error = new Error(message);
+    error.code = "ERR_FS_WATCHER_LIMIT";
+    return error;
+  }
+  function snapshot(input) {
+    const root = readStat(input);
+    if (root === null) return null;
+    const children = new Map();
+    if (root.isDirectory()) {
+      for (const name of readDirectory(input, undefined, 4096)) {
+        try { children.set(name, lstatSync(input.replace(/\/$/, "") + "/" + name)); }
+        catch (error) { if (!error || error.code !== "ENOENT") throw error; }
+      }
+    }
+    return { root, children, size: children.size + 1 };
+  }
+  function replaced(current, previous) {
+    return current.dev !== previous.dev || current.ino !== previous.ino ||
+      current.isFile() !== previous.isFile() || current.isDirectory() !== previous.isDirectory() ||
+      current.isSymbolicLink() !== previous.isSymbolicLink();
+  }
+  function filename(entry, name) {
+    return entry.encoding === "buffer" ? Buffer.from(name, "utf8")
+      : __pi_vfs.decodeBytes(new TextEncoder().encode(name), entry.encoding);
+  }
+  function pollEvents(entry) {
+    if (entry.signal && bridge.apply(signalAborted, entry.signal, [])) { close(entry); return; }
+    let current;
+    try { current = snapshot(entry.input); }
+    catch (error) { close(entry, error); return; }
+    const previous = entry.previous;
+    if (current === null || replaced(current.root, previous.root)) {
+      try { emit(entry, "change", "rename", filename(entry, entry.basename)); }
+      finally { close(entry); }
+      return;
+    }
+    if (snapshotEntries - previous.size + current.size > 8192) {
+      close(entry, watcherLimit("fs.watch total snapshot entry limit is 8192"));
+      return;
+    }
+    snapshotEntries += current.size - previous.size;
+    entry.previous = current;
+    if (!current.root.isDirectory()) {
+      if (changed(current.root, previous.root)) emit(entry, "change", "change", filename(entry, entry.basename));
+      return;
+    }
+    let notified = false;
+    for (const [name, before] of previous.children) {
+      if (!entry.active) return;
+      const after = current.children.get(name);
+      if (!after || replaced(after, before)) {
+        notified = true;
+        emit(entry, "change", "rename", filename(entry, name));
+      } else if (changed(after, before)) {
+        notified = true;
+        emit(entry, "change", "change", filename(entry, name));
+      }
+    }
+    for (const name of current.children.keys()) {
+      if (!entry.active) return;
+      if (!previous.children.has(name)) {
+        notified = true;
+        emit(entry, "change", "rename", filename(entry, name));
+      }
+    }
+    if (entry.active && !notified && changed(current.root, previous.root)) {
+      emit(entry, "change", "change", filename(entry, entry.basename));
+    }
+  }
+
   function remove(entry, node) {
     if (!node.active) return;
     node.active = false;
@@ -15274,7 +15363,8 @@ const __pi_file_watchers = (() => {
         handled = true;
         if (node.once) remove(entry, node);
         bridge.apply(node.callback, entry.handle, event === "change"
-          ? [copyStat(current), copyStat(previous)] : event === "error" ? [current] : []);
+          ? entry.kind === "events" ? [current, previous] : [copyStat(current), copyStat(previous)]
+          : event === "error" ? [current] : []);
       }
       node = next;
     }
@@ -15287,6 +15377,8 @@ const __pi_file_watchers = (() => {
     if (entry.next) entry.next.before = entry.before;
     entry.before = entry.next = null;
     count--;
+    if (entry.kind === "events") snapshotEntries -= entry.previous?.size || 0;
+    entry.signal = null;
     if (resetSecret === undefined) bridge.clear(entry.timer);
     else bridge.clearForReset(entry.timer, resetSecret);
     entry.timer = null;
@@ -15306,6 +15398,7 @@ const __pi_file_watchers = (() => {
     if (!entry.active) return;
     // Even an accidentally leaked callback cannot run under a foreign owner.
     if (entry.owner !== bridge.owner()) { close(entry, null, false); return; }
+    if (entry.kind === "events") { pollEvents(entry); return; }
     let current;
     try { current = readStat(entry.input); }
     catch (error) { close(entry, error); return; }
@@ -15344,7 +15437,7 @@ const __pi_file_watchers = (() => {
     for (let node = entry.lastListener; node; node = node.before) {
       if (node.event === event && node.callback === callback) { remove(entry, node); break; }
     }
-    if (entry.changes === 0) close(entry);
+    if (entry.kind !== "events" && entry.changes === 0) close(entry);
     return entry.handle;
   }
   function removeAll(entry, event) {
@@ -15352,7 +15445,7 @@ const __pi_file_watchers = (() => {
     for (let node = entry.listeners; node; node = node.next) {
       if (event === undefined || node.event === event) remove(entry, node);
     }
-    if (entry.changes === 0) close(entry);
+    if (entry.kind !== "events" && entry.changes === 0) close(entry);
     return entry.handle;
   }
   function reference(entry, value) {
@@ -15363,13 +15456,74 @@ const __pi_file_watchers = (() => {
   }
   function find(path, owner) {
     for (let entry = first; entry; entry = entry.next) {
-      if (entry.path === path && entry.owner === owner) return entry;
+      if (entry.kind !== "events" && entry.path === path && entry.owner === owner) return entry;
     }
     return null;
   }
   __pi_file_watcher_count = () => count;
   __pi_reset_file_watchers = (secret) => { while (first) close(first, null, false, secret); };
   return {
+    watch(path, options, listener) {
+      if (typeof options === "function") { listener = options; options = {}; }
+      if (typeof options === "string") options = { encoding: options };
+      if (options === undefined) options = {};
+      if (!options || typeof options !== "object") throw new TypeError("watch options must be an object or encoding");
+      if (listener !== undefined && typeof listener !== "function") throw new TypeError("watch listener must be a function");
+      const persistent = options.persistent === undefined ? true : options.persistent;
+      const interval = options.interval === undefined ? 250 : options.interval;
+      const encoding = options.encoding === undefined ? "utf8" : options.encoding;
+      if (typeof persistent !== "boolean") throw new TypeError("watch persistent must be a boolean");
+      if (!Number.isInteger(interval) || interval < 50 || interval > 2147483647) throw new RangeError("watch polling interval must be an integer from 50 to 2147483647");
+      if (options.recursive !== undefined && typeof options.recursive !== "boolean") throw new TypeError("watch recursive must be a boolean");
+      if (options.recursive) {
+        const error = new Error("fs.watch uses shallow directory polling; recursive watching is unavailable");
+        error.code = "ERR_FEATURE_UNAVAILABLE";
+        throw error;
+      }
+      if (!["utf8", "utf-8", "buffer", "hex", "base64", "latin1", "binary", "ascii"].includes(encoding)) throw new TypeError("watch encoding is unsupported");
+      const signal = options.signal;
+      if (signal !== undefined) {
+        try { bridge.apply(signalAborted, signal, []); }
+        catch (_) { throw new TypeError("watch signal must be an AbortSignal"); }
+      }
+      const input = __pi_vfs.absoluteInputPath(String(path ?? "").replace(/\\/g, "/"));
+      const normalized = __pi_vfs.normalizePath(input);
+      const initial = snapshot(input);
+      if (initial === null) {
+        const error = new Error("ENOENT: no such file or directory, watch '" + String(path ?? "") + "'");
+        error.code = "ENOENT";
+        throw error;
+      }
+      if (count >= 128) throw new RangeError("active file watcher limit is 128");
+      if (snapshotEntries + initial.size > 8192) throw watcherLimit("fs.watch total snapshot entry limit is 8192");
+      const entry = { __proto__: null, kind: "events", owner: bridge.owner(), path: normalized, input,
+        basename: normalized.slice(normalized.lastIndexOf("/") + 1), encoding, signal,
+        previous: initial, active: true, listeners: null, lastListener: null,
+        listenerCount: 0, listenerSerial: 0, changes: 0, before: null, next: first,
+        timer: null, handle: null, referenced: persistent,
+      };
+      entry.handle = bridge.freeze({ __proto__: null,
+        on(event, callback) { return add(entry, event, callback); },
+        addListener(event, callback) { return add(entry, event, callback); },
+        once(event, callback) { return add(entry, event, callback, true); },
+        removeListener(event, callback) { return removeListener(entry, event, callback); },
+        off(event, callback) { return removeListener(entry, event, callback); },
+        removeAllListeners(event) { return removeAll(entry, event); },
+        close() { requireOwner(entry); close(entry); return entry.handle; },
+        ref() { return reference(entry, true); }, unref() { return reference(entry, false); },
+        hasRef() { requireOwner(entry); return entry.active && entry.referenced; },
+      });
+      if (first) first.before = entry;
+      first = entry; count++; snapshotEntries += initial.size;
+      try {
+        if (listener) add(entry, "change", listener);
+        entry.timer = bridge.interval(() => poll(entry), interval);
+        bridge.reference(entry.timer, persistent);
+        // Cancellation is observed by the owner's next poll. Registering no
+        // guest abort callback keeps privileged reset free of extension code.
+      } catch (error) { close(entry, null, false); throw error; }
+      return entry.handle;
+    },
     watchFile(path, options, listener) {
       if (typeof options === "function") { listener = options; options = {}; }
       if (options === undefined) options = {};
@@ -15427,6 +15581,9 @@ const __pi_file_watchers = (() => {
     },
   };
 })();
+// This sandbox exposes bounded metadata polling, not native kernel watches.
+// Changes that appear and disappear between polls may be coalesced or missed.
+export function watch(path, options, listener) { return __pi_file_watchers.watch(path, options, listener); }
 export function watchFile(path, options, listener) { return __pi_file_watchers.watchFile(path, options, listener); }
 export function unwatchFile(path, listener) { __pi_file_watchers.unwatchFile(path, listener); }
 function __queueMicrotaskPolyfill(fn) {
@@ -24248,7 +24405,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
-                // __pi_host_read_dir_sync(path) -> JSON string (throws on error)
+                // __pi_host_read_dir_sync(path, limit?) -> JSON string (throws on error)
                 // Synchronous real-filesystem directory listing fallback for
                 // node:fs readdirSync. Confined to the workspace root and
                 // registered extension roots, matching stat/read fallbacks.
@@ -24258,7 +24415,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
                         let module_state = Rc::clone(&module_state);
-                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
+                        move |ctx: Ctx<'_>,
+                              path: String,
+                              limit: Opt<usize>|
+                              -> rquickjs::Result<String> {
                             let extension_id = current_extension_id(&ctx);
                             let workspace_root =
                                 crate::extensions::safe_canonicalize(Path::new(&process_cwd));
@@ -24296,16 +24456,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                             let mut entries = Vec::new();
                             for entry in std::fs::read_dir(&checked_path).map_err(|err| {
-                                rquickjs::Error::new_loading_message(
-                                    &path,
-                                    format!("host readdir: {err}"),
-                                )
+                                storage::filesystem_error(&ctx, &path, "scandir", &err)
                             })? {
                                 let entry = entry.map_err(|err| {
-                                    rquickjs::Error::new_loading_message(
-                                        &path,
-                                        format!("host readdir entry: {err}"),
-                                    )
+                                    storage::filesystem_error(&ctx, &path, "scandir", &err)
                                 })?;
                                 let child_path =
                                     crate::extensions::safe_canonicalize(&entry.path());
@@ -24318,11 +24472,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 ) {
                                     continue;
                                 }
+                                if limit.0.is_some_and(|limit| entries.len() >= limit) {
+                                    let error = rquickjs::Exception::from_message(
+                                        ctx.clone(),
+                                        "fs.watch directory entry limit exceeded",
+                                    )?;
+                                    error.as_object().set("code", "ERR_FS_WATCHER_LIMIT")?;
+                                    return Err(error.throw());
+                                }
                                 let file_type = entry.file_type().map_err(|err| {
-                                    rquickjs::Error::new_loading_message(
-                                        &path,
-                                        format!("host readdir file type: {err}"),
-                                    )
+                                    storage::filesystem_error(&ctx, &path, "scandir", &err)
                                 })?;
                                 let kind = if file_type.is_symlink() {
                                     "symlink"
@@ -31702,8 +31861,8 @@ mod tests {
         // The existing bounded whole-file host snapshot is unchanged.
         (
             "node:fs",
-            98_380,
-            "99cd6b0eb69fe8ab07d30178775293cca06d3bbd4fe4fe1636c0dd4c7a30fb1c",
+            106_666,
+            "0e2e0de4e5b6b51a66b32a0236ff2b20507da330901981bd413a72f510c0a715",
         ),
         (
             "@mariozechner/pi-ai",
@@ -39748,6 +39907,173 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
             assert_eq!(final_snapshot.get("vfsWatchers"), Some(&json!(0)));
             assert_eq!(final_snapshot.get("timerHandles"), Some(&json!(0)));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_watch_observes_host_result_files_and_stops_after_close() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let results = temp_dir.path().join("results");
+            std::fs::create_dir(&results).expect("results directory");
+            let existing = results.join("existing.json");
+            std::fs::write(&existing, "{}").expect("initial result");
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                Arc::clone(&clock),
+                PiJsRuntimeConfig {
+                    cwd: temp_dir.path().display().to_string(),
+                    ..PiJsRuntimeConfig::default()
+                },
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime
+                .eval(&format!(
+                    r"
+                    globalThis.nativeWatch = {{ events: [], closes: 0, errors: [] }};
+                    import('node:fs').then(fs => {{
+                        globalThis.nativeWatcher = fs.watch({results:?}, {{ interval: 50 }},
+                            (event, name) => nativeWatch.events.push([event, name]));
+                        nativeWatcher.on('close', () => nativeWatch.closes++);
+                        nativeWatcher.on('error', error => nativeWatch.errors.push(error.code));
+                        nativeWatcher.unref();
+                        nativeWatch.unreferenced = !nativeWatcher.hasRef();
+                    }});
+                    "
+                ))
+                .await
+                .expect("watch real result directory");
+            clock.advance(50);
+            runtime.tick().await.expect("unchanged directory poll");
+            assert_eq!(
+                get_global_json(&runtime, "nativeWatch").await["events"],
+                json!([])
+            );
+
+            let added = results.join("completed.json");
+            std::fs::write(&added, "{\"result\":\"done\"}").expect("publish result");
+            clock.advance(50);
+            runtime.tick().await.expect("new result poll");
+            assert_eq!(
+                get_global_json(&runtime, "nativeWatch").await["events"],
+                json!([["rename", "completed.json"]])
+            );
+            std::fs::write(&existing, "{\"updated\":true}").expect("update existing result");
+            clock.advance(50);
+            runtime.tick().await.expect("changed result poll");
+            assert_eq!(
+                get_global_json(&runtime, "nativeWatch").await["events"],
+                json!([["rename", "completed.json"], ["change", "existing.json"]])
+            );
+            let moved = results.join("renamed.json");
+            std::fs::rename(&added, &moved).expect("rename completed result");
+            clock.advance(50);
+            runtime.tick().await.expect("renamed result poll");
+            assert_eq!(
+                get_global_json(&runtime, "nativeWatch").await["events"],
+                json!([
+                    ["rename", "completed.json"], ["change", "existing.json"],
+                    ["rename", "completed.json"], ["rename", "renamed.json"],
+                ])
+            );
+            runtime
+                .eval("nativeWatcher.close(); nativeWatcher.close();")
+                .await
+                .expect("idempotent watcher close");
+            std::fs::write(&moved, "later").expect("write after close");
+            clock.advance(500);
+            runtime.tick().await.expect("closed watcher remains silent");
+            let result = get_global_json(&runtime, "nativeWatch").await;
+            assert_eq!(result["events"].as_array().expect("events").len(), 4);
+            assert_eq!(result["closes"], json!(1));
+            assert_eq!(result["errors"], json!([]));
+            assert_eq!(result["unreferenced"], json!(true));
+            assert_eq!(runtime.scheduler.borrow().next_timer_deadline(), None);
+            let counts = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(counts["vfsWatchers"], json!(0));
+            assert_eq!(counts["timerHandles"], json!(0));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_watch_keeps_owner_admission_and_reset_cleanup() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            for path in [&workspace, &ext_a, &ext_b] {
+                std::fs::create_dir_all(path).expect("mkdir");
+            }
+            let watched = workspace.join("results");
+            std::fs::create_dir(&watched).expect("results directory");
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                Arc::clone(&clock),
+                PiJsRuntimeConfig {
+                    cwd: workspace.display().to_string(),
+                    ..PiJsRuntimeConfig::default()
+                },
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
+            let script = format!(
+                r"
+                globalThis.eventWatchOwner = {{ denials: [], calls: [], closes: 0 }};
+                import('node:fs').then(fs =>
+                    __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {{
+                        globalThis.eventWatchFs = fs;
+                        globalThis.eventWatchHandle = fs.watch({watched:?}, {{ interval: 50 }},
+                            (event, name) => eventWatchOwner.calls.push([
+                                __pi_get_current_extension_id(), event, name
+                            ]));
+                        eventWatchHandle.on('close', () => eventWatchOwner.closes++);
+                        const statHandle = fs.watchFile({watched:?}, {{ interval: 50 }}, () => {{}});
+                        eventWatchOwner.distinct = statHandle !== eventWatchHandle;
+                        fs.unwatchFile({watched:?});
+                        eventWatchOwner.watchers = globalThis.__pi_vfs_api.counts().watchers;
+                    }}).then(() => __pi_with_extension_async(__pi_test_secret, 'ext.b', async () => {{
+                        for (const operation of [
+                            () => eventWatchHandle.close(),
+                            () => eventWatchHandle.unref(),
+                            () => eventWatchHandle.on('change', () => eventWatchOwner.calls.push('foreign')),
+                            () => eventWatchHandle.removeAllListeners(),
+                        ]) {{
+                            try {{ operation(); eventWatchOwner.denials.push('allowed'); }}
+                            catch (error) {{ eventWatchOwner.denials.push(error.code); }}
+                        }}
+                        fs.unwatchFile({watched:?});
+                    }}))
+                );
+                "
+            );
+            runtime
+                .eval(&privileged_test_script(&runtime, &script))
+                .await
+                .expect("attempt foreign watcher mutations");
+            std::fs::write(watched.join("done.json"), "{}").expect("publish result");
+            clock.advance(50);
+            runtime.tick().await.expect("owner poll");
+            let before = get_global_json(&runtime, "eventWatchOwner").await;
+            assert_eq!(before["denials"], json!(["EACCES", "EACCES", "EACCES", "EACCES"]));
+            assert_eq!(before["calls"], json!([["ext.a", "rename", "done.json"]]));
+            assert_eq!(before["closes"], json!(0));
+            assert_eq!(before["distinct"], json!(true));
+            assert_eq!(before["watchers"], json!(1));
+
+            let reset = call_global_fn_json(&runtime, "__pi_reset_extension_runtime_state").await;
+            assert_eq!(reset["after"]["vfsWatchers"], json!(0));
+            assert_eq!(reset["after"]["timerHandles"], json!(0));
+            std::fs::write(watched.join("after-reset.json"), "{}").expect("write after reset");
+            clock.advance(500);
+            runtime.tick().await.expect("reset poll remains silent");
+            assert_eq!(get_global_json(&runtime, "eventWatchOwner").await, before);
+            assert_eq!(runtime.scheduler.borrow().next_timer_deadline(), None);
         });
     }
 
