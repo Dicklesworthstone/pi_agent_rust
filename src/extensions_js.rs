@@ -45146,7 +45146,7 @@ globalThis.__spawn_abort_result = result;
             assert_eq!(result["accepts"], json!([true, false]));
             assert_eq!(result["byteLength"], json!(4));
             assert_eq!(result["decodedLength"], json!(2));
-            assert_eq!(result["zeroRead"], Value::Null);
+            assert_eq!(result["zeroRead"], serde_json::Value::Null);
             assert_eq!(result["afterZero"], json!(2));
             assert_eq!(result["read"], json!("é"));
             assert_eq!(result["afterRead"], json!(1));
@@ -47083,7 +47083,7 @@ globalThis.__spawn_abort_result = result;
             assert_eq!(result["copied"], json!(true));
             assert_eq!(result["bytesRead"], json!(4096));
             assert_eq!(result["closed"], json!(true));
-            assert_eq!(result["fd"], Value::Null);
+            assert_eq!(result["fd"], serde_json::Value::Null);
             assert_eq!(result["rangeText"], json!("é中😀"));
             assert_eq!(result["rangeBytes"], json!(9));
             assert_eq!(result["single"], json!("Z"));
@@ -47188,17 +47188,17 @@ globalThis.__spawn_abort_result = result;
             let result = get_global_json(&runtime, "fsReadCleanup").await;
             assert_eq!(result["done"], json!(true), "{result}");
             assert_eq!(result["unopenedEvents"], json!(["close"]));
-            assert_eq!(result["unopenedFd"], Value::Null);
+            assert_eq!(result["unopenedFd"], serde_json::Value::Null);
             assert_eq!(result["unopenedBytes"], json!(0));
             assert_eq!(result["first"], json!("abc"));
             assert_eq!(result["cancelledBytes"], json!(3));
             assert_eq!(result["cancelledClosed"], json!(true));
-            assert_eq!(result["cancelledFd"], Value::Null);
+            assert_eq!(result["cancelledFd"], serde_json::Value::Null);
             assert_eq!(result["cancelledReleased"], json!(true));
             assert_eq!(result["missingEvents"], json!(["error", "close"]));
             assert_eq!(result["missingError"], json!(true));
             assert_eq!(result["missingClosed"], json!(true));
-            assert_eq!(result["missingFd"], Value::Null);
+            assert_eq!(result["missingFd"], serde_json::Value::Null);
             assert_eq!(
                 result["protectedFields"],
                 json!([
@@ -47271,7 +47271,7 @@ globalThis.__spawn_abort_result = result;
             assert_eq!(result["unopenedClosed"], json!(true));
             assert_eq!(result["activeBytes"], json!(3));
             assert_eq!(result["activeClosed"], json!(true));
-            assert_eq!(result["activeFd"], Value::Null);
+            assert_eq!(result["activeFd"], serde_json::Value::Null);
         });
     }
 
