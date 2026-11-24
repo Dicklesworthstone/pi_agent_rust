@@ -17191,7 +17191,17 @@ class Stream extends EventEmitter {
 class Readable extends Stream {
   constructor(opts = {}) {
     super(opts);
-    this._readableState = { flowing: null, ended: false, endEmitted: false, encoding: null };
+    const objectMode = !!(opts.readableObjectMode ?? opts.objectMode);
+    const highWaterMark = opts.readableHighWaterMark ?? opts.highWaterMark ?? (objectMode ? 16 : 16384);
+    if (!Number.isSafeInteger(highWaterMark) || highWaterMark < 0) {
+      throw new RangeError("readable highWaterMark must be a nonnegative safe integer");
+    }
+    this._readableState = {
+      flowing: null, ended: false, endEmitted: false, encoding: null,
+      objectMode, highWaterMark, length: 0, reading: false,
+    };
+    this._readImpl = typeof opts.read === "function" ? opts.read.bind(this) : null;
+    this._readScheduled = false;
     this._decoder = null;
     this.readable = true;
     this._queue = [];
@@ -17208,7 +17218,53 @@ class Readable extends Stream {
   get readableEnded() { return this._readableState.endEmitted; }
   get readableFlowing() { return this._readableState.flowing; }
   get readableEncoding() { return this._readableState.encoding; }
+  get readableLength() { return this._readableState.length; }
+  get readableHighWaterMark() { return this._readableState.highWaterMark; }
+  get readableObjectMode() { return this._readableState.objectMode; }
   isPaused() { return this._readableState.flowing === false; }
+
+  _chunkLength(chunk) {
+    if (this._readableState.objectMode) return 1;
+    if (typeof chunk !== "string") return (chunk && chunk.byteLength) || 0;
+    if (this._readableState.encoding) return chunk.length;
+    return typeof Buffer !== "undefined" && typeof Buffer.byteLength === "function"
+      ? Buffer.byteLength(chunk) : new TextEncoder().encode(chunk).byteLength;
+  }
+
+  _shiftChunk() {
+    const chunk = this._queue.shift();
+    this._readableState.length -= this._chunkLength(chunk);
+    return chunk;
+  }
+
+  _read(size) {
+    if (this._readImpl) this._readImpl(size);
+  }
+
+  _canRead() {
+    const state = this._readableState;
+    return !this.destroyed && !state.ended && !state.reading &&
+      (state.flowing === true || this._readRequested) &&
+      (state.length < state.highWaterMark || state.length === 0);
+  }
+
+  _scheduleRead() {
+    // Push-only streams remain valid. Pull sources must supply read() or
+    // override _read(); adapters using _waitForRead own their own pump.
+    if ((!this._readImpl && this._read === Readable.prototype._read) ||
+        this._readScheduled || !this._canRead()) return;
+    this._readScheduled = true;
+    __streamQueueMicrotask(() => {
+      this._readScheduled = false;
+      if (!this._canRead()) return;
+      this._readRequested = false;
+      this._readableState.reading = true;
+      try { this._read(this._readableState.highWaterMark); }
+      catch (error) { this.destroy(__streamToError(error)); }
+      // push() ends this pull. A source that produces asynchronously keeps
+      // ownership until then; a hook that supplies nothing is not busy-polled.
+    });
+  }
 
   setEncoding(encoding) {
     // Construct first so an invalid encoding cannot discard queued bytes or
@@ -17227,6 +17283,7 @@ class Readable extends Stream {
     this._queue = decoded;
     this._decoder = decoder;
     this._readableState.encoding = decoder.encoding;
+    this._readableState.length = decoded.reduce((length, chunk) => length + this._chunkLength(chunk), 0);
     if (this._queue.length === 0 && !this._readableState.ended &&
         this.listenerCount("readable") > 0) this._readRequested = true;
     this._wakeRead();
@@ -17266,6 +17323,7 @@ class Readable extends Stream {
     const wake = this._readWaiter;
     this._readWaiter = null;
     if (wake) wake();
+    this._scheduleRead();
   }
 
   // Only the source adapter waits here. A paused iterator or pipe must not
@@ -17303,7 +17361,7 @@ class Readable extends Stream {
       while (!this.destroyed && this._readableState.flowing === true && this._queue.length > 0) {
         // Relinquish the queued copy before invoking consumers. Flowing
         // streams must not retain every byte of a long-lived response.
-        this.emit("data", this._queue.shift());
+        this.emit("data", this._shiftChunk());
       }
     } finally {
       this._flowing = false;
@@ -17315,8 +17373,12 @@ class Readable extends Stream {
   push(chunk) {
     if (this.destroyed || this._readableState.ended) return false;
     if (chunk === null) {
+      this._readableState.reading = false;
       const tail = this._decoder ? this._decoder.end() : "";
-      if (tail.length) this._queue.push(tail);
+      if (tail.length) {
+        this._queue.push(tail);
+        this._readableState.length += this._chunkLength(tail);
+      }
       this._readableState.ended = true;
       if (tail.length) {
         if (this._readableState.flowing === true) this._flow();
@@ -17327,6 +17389,21 @@ class Readable extends Stream {
       return false;
     }
     const bytes = __normalizeChunk(chunk, null);
+    if (!this._readableState.objectMode) {
+      if (bytes === undefined || ((typeof bytes === "string" || bytes instanceof Uint8Array) && bytes.length === 0)) {
+        // Empty bytes do not complete an outstanding _read(). Re-entering
+        // its hook here would spin forever on a temporarily empty source.
+        // Adapter pumps still retain the consumer's unsatisfied demand.
+        this._readRequested = true;
+        this._wakeRead();
+        return this._readableState.length < this._readableState.highWaterMark;
+      }
+      if (typeof bytes !== "string" && !(bytes instanceof Uint8Array)) {
+        this.destroy(__streamError("ERR_INVALID_ARG_TYPE", "readable chunk must be a string or byte buffer"));
+        return false;
+      }
+    }
+    this._readableState.reading = false;
     const normalized = this._decoder && typeof bytes !== "string"
       ? this._decoder.write(bytes) : bytes;
     if (this._decoder && normalized.length === 0) {
@@ -17337,24 +17414,29 @@ class Readable extends Stream {
       return this._queue.length === 0;
     }
     this._queue.push(normalized);
+    this._readableState.length += this._chunkLength(normalized);
     if (this._readableState.flowing === true) this._flow();
     else this.emit("readable");
-    return this._queue.length === 0;
+    this._wakeRead();
+    return !this.destroyed && !this._readableState.ended &&
+      this._readableState.length < this._readableState.highWaterMark;
   }
 
-  read(_size) {
-    const value = this._queue.length > 0 ? this._queue.shift() : null;
-    if (this._queue.length === 0) {
+  read(size) {
+    const value = size !== 0 && this._queue.length > 0 ? this._shiftChunk() : null;
+    if (this._readableState.length < this._readableState.highWaterMark || this._queue.length === 0) {
       this._readRequested = true;
       this._wakeRead();
-      this._maybeEnd();
     }
+    this._maybeEnd();
     return value;
   }
 
   destroy(error) {
     if (this.destroyed) return this;
     this._queue.length = 0;
+    this._readableState.length = 0;
+    this._readableState.reading = false;
     this._decoder = null;
     this._readRequested = false;
     this.readable = false;
@@ -17537,7 +17619,7 @@ class Readable extends Stream {
     if (!iterator || typeof iterator.next !== "function") {
       throw new TypeError("Readable.from expects an iterable");
     }
-    const readable = new Readable(opts);
+    const readable = new Readable({ objectMode: true, ...opts });
     let complete = false;
     let returned = false;
     const closeIterator = () => {
@@ -18056,6 +18138,7 @@ class Transform extends Duplex {
     super(opts);
     this._transformImpl = typeof opts.transform === "function" ? opts.transform.bind(this) : null;
     this._flushImpl = typeof opts.flush === "function" ? opts.flush.bind(this) : null;
+    this._transformCallback = null;
   }
 
   _transform(chunk, encoding, callback) {
@@ -18072,8 +18155,29 @@ class Transform extends Duplex {
       if (completed) return;
       completed = true;
       if (!error && data !== undefined && data !== null) this.push(data);
-      callback(error);
+      // Writable pressure alone cannot bound a transform: acknowledging
+      // input while its output is paused drains the upstream source into an
+      // unbounded readable queue. Hold this write until output has capacity.
+      const state = this._readableState;
+      if (error || this.destroyed || state.length < state.highWaterMark || state.length === 0) {
+        callback(error);
+      } else {
+        this._transformCallback = callback;
+      }
     });
+  }
+
+  _read() {
+    const callback = this._transformCallback;
+    this._transformCallback = null;
+    if (callback) callback(null);
+  }
+
+  destroy(error) {
+    // Stream.destroy settles the active writable entry exactly once. Do not
+    // retain or revive its completion closure after cancellation.
+    this._transformCallback = null;
+    return super.destroy(error);
   }
 
   _flush(callback) {
@@ -31278,12 +31382,12 @@ mod tests {
             39_043,
             "c496331afa268ea323d999aae67693ce6900c3975d89cffb1557de1f8e77ee06",
         ),
-        // Completion observers and owned reader teardown add 9_516 bytes.
+        // Read hooks, readable capacity, and transform backpressure are intentional.
         // Only this deliberately changed module is re-pinned.
         (
             "node:stream",
-            43_523,
-            "f41171290d44be8bfbff1116ee5e0c249e6b6a146effb692b885cc3b6363bb54",
+            48_141,
+            "8863165a8c62c2be5beddbce72dbb1398aff74e23df99c3807d6017d8727cf8e",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -44834,6 +44938,286 @@ globalThis.__spawn_abort_result = result;
                     "afterEach"
                 ])
             );
+        });
+    }
+
+    #[test]
+    fn pijs_readable_pull_hooks_follow_demand_and_settle_errors() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.readablePull = { done: false };
+                    (async () => {
+                        const { Readable } = await import('node:stream');
+                        const settle = async () => {
+                            for (let i = 0; i < 30; i++) await Promise.resolve();
+                        };
+                        const collect = async stream => {
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(chunk);
+                            return chunks;
+                        };
+                        let index = 0;
+                        const sizes = [];
+                        const source = new Readable({ highWaterMark: 2, read(size) {
+                            sizes.push(size);
+                            this.push(index < 3 ? Buffer.from([65 + index++]) : null);
+                        } });
+                        await settle();
+                        const beforeConsumer = sizes.length;
+                        const text = (await collect(source)).map(String).join('');
+                        await settle();
+
+                        class ObjectSource extends Readable {
+                            constructor() { super({ objectMode: true, highWaterMark: 2 }); this.index = 0; }
+                            _read() { this.push(this.index < 3 ? { index: this.index++ } : null); }
+                        }
+                        const objects = await collect(new ObjectSource());
+
+                        let pendingCalls = 0;
+                        let deliver;
+                        const pending = new Readable({ read() {
+                            pendingCalls++;
+                            deliver = () => this.push('one');
+                        } });
+                        const iterator = pending[Symbol.asyncIterator]();
+                        const next = iterator.next();
+                        await settle();
+                        for (let i = 0; i < 5; i++) pending.resume();
+                        await settle();
+                        const inFlight = pendingCalls;
+                        deliver();
+                        const first = String((await next).value);
+                        await settle();
+                        const pausedCalls = pendingCalls;
+                        await iterator.return();
+                        const latePush = deliver();
+                        pending.read(0);
+                        pending.resume();
+                        await settle();
+
+                        const failure = new Readable({ read() { throw new Error('source failed'); } });
+                        let failureText = '';
+                        try { await failure[Symbol.asyncIterator]().next(); }
+                        catch (error) { failureText = error.message; }
+                        await settle();
+                        globalThis.readablePull = {
+                            done: true, beforeConsumer, text, sizes, objects,
+                            inFlight, first, pausedCalls, pendingCalls, latePush,
+                            pendingClosed: pending.closed, failureText, failureClosed: failure.closed,
+                        };
+                    })().catch(error => { globalThis.readablePull.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate readable pull hooks");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "readablePull").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["beforeConsumer"], json!(0));
+            assert_eq!(result["text"], json!("ABC"));
+            assert_eq!(result["sizes"], json!([2, 2, 2, 2]));
+            assert_eq!(
+                result["objects"],
+                json!([{ "index": 0 }, { "index": 1 }, { "index": 2 }])
+            );
+            assert_eq!(result["inFlight"], json!(1));
+            assert_eq!(result["first"], json!("one"));
+            assert_eq!(result["pausedCalls"], json!(1));
+            assert_eq!(result["pendingCalls"], json!(1));
+            assert_eq!(result["latePush"], json!(false));
+            assert_eq!(result["pendingClosed"], json!(true));
+            assert_eq!(result["failureText"], json!("source failed"));
+            assert_eq!(result["failureClosed"], json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_readable_capacity_validates_chunks_and_suppresses_empty_pull_spins() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.readableCapacity = { done: false };
+                    (async () => {
+                        const { Readable } = await import('node:stream');
+                        const bytes = new Readable({ highWaterMark: 4 });
+                        const accepts = [bytes.push('é'), bytes.push('é')];
+                        const byteLength = bytes.readableLength;
+                        bytes.setEncoding('utf8');
+                        const decodedLength = bytes.readableLength;
+                        const zeroRead = bytes.read(0);
+                        const afterZero = bytes.readableLength;
+                        const read = bytes.read();
+                        const afterRead = bytes.readableLength;
+                        bytes.destroy();
+
+                        let invalidOptions = 0;
+                        for (const highWaterMark of [-1, 1.5, Infinity, NaN]) {
+                            try { new Readable({ highWaterMark }); }
+                            catch (error) { if (error instanceof RangeError) invalidOptions++; }
+                        }
+                        const invalid = new Readable();
+                        let invalidCode = '';
+                        invalid.on('error', error => { invalidCode = error.code; });
+                        const invalidAccepted = invalid.push({ unexpected: true });
+
+                        let emptyCalls = 0;
+                        const empty = new Readable({ read() {
+                            emptyCalls++;
+                            this.push(Buffer.alloc(0));
+                            this.push('');
+                            this.push(undefined);
+                        } });
+                        empty.resume();
+                        for (let i = 0; i < 100; i++) await Promise.resolve();
+                        const emptyLength = empty.readableLength;
+                        empty.destroy();
+
+                        const iterable = Readable.from([{ value: 1 }, false, undefined]);
+                        const objects = [];
+                        for await (const chunk of iterable) objects.push(chunk);
+                        let zeroCalls = 0;
+                        const zero = new Readable({ highWaterMark: 0, read(size) {
+                            if (size !== 0) throw new Error('zero high water mark lost');
+                            this.push(zeroCalls++ === 0 ? 'z' : null);
+                        } });
+                        let zeroText = '';
+                        for await (const chunk of zero) zeroText += chunk;
+                        globalThis.readableCapacity = {
+                            done: true, accepts, byteLength, decodedLength, zeroRead, afterZero,
+                            read, afterRead, invalidOptions, invalidCode, invalidAccepted,
+                            invalidClosed: invalid.closed, emptyCalls, emptyLength,
+                            objects, objectMode: iterable.readableObjectMode, zeroText, zeroCalls,
+                        };
+                    })().catch(error => { globalThis.readableCapacity.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate readable capacity and empty pulls");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "readableCapacity").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["accepts"], json!([true, false]));
+            assert_eq!(result["byteLength"], json!(4));
+            assert_eq!(result["decodedLength"], json!(2));
+            assert_eq!(result["zeroRead"], Value::Null);
+            assert_eq!(result["afterZero"], json!(2));
+            assert_eq!(result["read"], json!("é"));
+            assert_eq!(result["afterRead"], json!(1));
+            assert_eq!(result["invalidOptions"], json!(4));
+            assert_eq!(result["invalidCode"], json!("ERR_INVALID_ARG_TYPE"));
+            assert_eq!(result["invalidAccepted"], json!(false));
+            assert_eq!(result["invalidClosed"], json!(true));
+            assert_eq!(result["emptyCalls"], json!(1));
+            assert_eq!(result["emptyLength"], json!(0));
+            assert_eq!(result["objects"], json!([{ "value": 1 }, false, null]));
+            assert_eq!(result["objectMode"], json!(true));
+            assert_eq!(result["zeroText"], json!("z"));
+            assert_eq!(result["zeroCalls"], json!(2));
+        });
+    }
+
+    #[test]
+    fn pijs_transform_readable_pressure_bounds_upstream_and_cancels_held_writes() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.transformPressure = { done: false };
+                    (async () => {
+                        const { Readable, PassThrough } = await import('node:stream');
+                        const settle = async () => {
+                            for (let i = 0; i < 100; i++) await Promise.resolve();
+                        };
+                        let pulls = 0;
+                        let returned = 0;
+                        const source = Readable.from((function* () {
+                            try {
+                                for (let index = 0; index < 256; index++) {
+                                    pulls++;
+                                    yield { index };
+                                }
+                            } finally { returned++; }
+                        })());
+                        const transform = new PassThrough({ objectMode: true, highWaterMark: 4 });
+                        source.pipe(transform);
+                        await settle();
+                        const blockedPulls = pulls;
+                        const blockedLength = transform.readableLength;
+                        await settle();
+                        const stillBlocked = pulls === blockedPulls;
+                        let received = 0;
+                        let ordered = true;
+                        for await (const chunk of transform) {
+                            ordered = ordered && chunk.index === received++;
+                        }
+                        await settle();
+
+                        const held = new PassThrough({ objectMode: true, highWaterMark: 1 });
+                        const callbacks = [];
+                        const errors = [];
+                        let finished = 0;
+                        held.on('error', error => errors.push(error.message));
+                        held.on('finish', () => finished++);
+                        held.write({ value: 1 }, error => callbacks.push(error ? error.message : 'ok'));
+                        held.end({ value: 2 }, error => callbacks.push(error ? error.message : 'ok'));
+                        await settle();
+                        const beforeCancel = callbacks.length;
+                        held.destroy(new Error('cancelled while paused'));
+                        held.read(0);
+                        held.resume();
+                        await settle();
+                        globalThis.transformPressure = {
+                            done: true, blockedPulls, blockedLength, stillBlocked,
+                            received, ordered, returned, finalLength: transform.readableLength,
+                            finalFinished: transform.writableFinished,
+                            beforeCancel, callbacks, errors, finished,
+                            cancelledLength: held.readableLength, cancelledClosed: held.closed,
+                        };
+                    })().catch(error => { globalThis.transformPressure.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate transform readable pressure");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "transformPressure").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert!(
+                result["blockedPulls"]
+                    .as_u64()
+                    .is_some_and(|count| (4..=8).contains(&count)),
+                "upstream must stop at the two bounded buffers: {result}"
+            );
+            assert_eq!(result["blockedLength"], json!(4));
+            assert_eq!(result["stillBlocked"], json!(true));
+            assert_eq!(result["received"], json!(256));
+            assert_eq!(result["ordered"], json!(true));
+            assert_eq!(result["returned"], json!(1));
+            assert_eq!(result["finalLength"], json!(0));
+            assert_eq!(result["finalFinished"], json!(true));
+            assert_eq!(result["beforeCancel"], json!(0));
+            assert_eq!(
+                result["callbacks"],
+                json!(["cancelled while paused", "cancelled while paused"])
+            );
+            assert_eq!(result["errors"], json!(["cancelled while paused"]));
+            assert_eq!(result["finished"], json!(0));
+            assert_eq!(result["cancelledLength"], json!(0));
+            assert_eq!(result["cancelledClosed"], json!(true));
         });
     }
 
