@@ -1891,11 +1891,35 @@ impl AbortSignal {
     }
 }
 
-/// Keep both cancellation sources live while a provider is silent. Receiving
+/// The lifetime of an admitted turn. UI abort supplements the original owner;
+/// it must never replace that owner's cancellation or deadline.
+#[derive(Clone, Copy)]
+struct TurnCancellation<'a> {
+    owner: &'a crate::agent_cx::AgentCx,
+    abort: Option<&'a AbortSignal>,
+}
+
+impl TurnCancellation<'_> {
+    fn reason(self) -> Option<&'static str> {
+        if self.abort.is_some_and(AbortSignal::is_aborted) {
+            Some("abort_signal")
+        } else if self.owner.checkpoint().is_err() {
+            Some("owner_cancellation")
+        } else {
+            None
+        }
+    }
+
+    async fn wait(self) {
+        wait_for_agent_cancellation(self.owner, self.abort).await;
+    }
+}
+
+/// Keep both cancellation sources live while a provider or tool is silent. Receiving
 /// on an unsent channel subscribes to owner cancellation without spawning a
 /// task; the timer also observes budgets that expire without a notification.
 /// An optional UI abort signal never replaces the invoking owner's lifetime.
-async fn wait_for_provider_cancellation(
+async fn wait_for_agent_cancellation(
     owner: &crate::agent_cx::AgentCx,
     abort: Option<&AbortSignal>,
 ) {
@@ -4291,6 +4315,10 @@ impl Agent {
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
         let loop_cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let cancellation = TurnCancellation {
+            owner: &loop_cx,
+            abort: abort.as_ref(),
+        };
         let session_id: Arc<str> = self
             .config
             .stream_options
@@ -4402,7 +4430,13 @@ impl Agent {
             let mut steering_after_tools: Option<Vec<QueuedAgentMessage>> = None;
 
             while has_more_tool_calls || !pending_messages.is_empty() {
-                if let Some(cap) = max_time
+                let cancelled_at_boundary = cancellation.reason().is_some();
+                if cancelled_at_boundary {
+                    self.message_queue
+                        .restore_steering_front_lossless(std::mem::take(&mut pending_messages));
+                }
+                if !cancelled_at_boundary
+                    && let Some(cap) = max_time
                     && run_started.elapsed() >= cap
                 {
                     // The owning surface already acknowledged these messages.
@@ -4436,9 +4470,12 @@ impl Agent {
                     break 'agent;
                 }
 
-                let delivering_follow_up = follow_up_staged;
+                let delivering_follow_up = follow_up_staged && !cancelled_at_boundary;
                 if delivering_follow_up {
                     self.refresh_follow_up_session_ownership().await;
+                    if cancellation.reason().is_some() {
+                        continue;
+                    }
                     let authored_follow_up =
                         self.message_queue.follow_up_batch_has_authored_input();
                     if authored_follow_up && let Err(err) = self.refresh_stream_rules() {
@@ -4508,7 +4545,7 @@ impl Agent {
                     new_messages.push(message);
                 }
 
-                if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                if cancelled_at_boundary || cancellation.reason().is_some() {
                     let abort_message = self.build_abort_message(None);
                     let message = Message::assistant(abort_message.clone());
 
@@ -4823,7 +4860,7 @@ impl Agent {
                             &tool_calls,
                             Arc::clone(&on_event),
                             &mut new_messages,
-                            abort.clone(),
+                            cancellation,
                             Arc::clone(&turn_latency),
                             compatible_tool_parallelism_limit(),
                         )
@@ -4895,6 +4932,18 @@ impl Agent {
                     budget.turn_index = turn_index;
                     budget.warned = warned_at_handoff_threshold;
                 }
+                if cancellation.reason().is_some() {
+                    // Completed tool results are already published. Finish
+                    // through the normal aborted-turn lifecycle before a time
+                    // cap, prewalk handoff, or follow-up can report success.
+                    // Input fetched by the executor remains available to resume.
+                    self.message_queue.restore_steering_front_lossless(
+                        steering_after_tools.take().unwrap_or_default(),
+                    );
+                    self.take_prewalk_evidence();
+                    has_more_tool_calls = true;
+                    continue;
+                }
                 let prewalk_evidence = self.take_prewalk_evidence();
                 let handoff = if self.run_budget.is_some()
                     && let Some(prewalk) = &mut self.prewalk
@@ -4931,6 +4980,13 @@ impl Agent {
                 } else {
                     // Delivery boundary: after assistant completion (no tool calls).
                     pending_messages = self.drain_steering_messages().await;
+                }
+                if cancellation.reason().is_some() {
+                    // A source can cancel the turn while handing over input.
+                    // Restore that input at the next boundary before recovery
+                    // or idle follow-up dispatch can consume another turn.
+                    has_more_tool_calls = true;
+                    continue;
                 }
 
                 // Turn recovery (bd-cv653.3.15): with nothing queued and no
@@ -4986,6 +5042,9 @@ impl Agent {
                 break;
             }
             follow_up_staged = self.stage_follow_up_messages().await;
+            if cancellation.reason().is_some() {
+                continue;
+            }
             if !follow_up_staged {
                 break;
             }
@@ -5581,7 +5640,7 @@ impl Agent {
         }
 
         let request_started_at = Instant::now();
-        let cancelled = wait_for_provider_cancellation(checkpoint_cx, abort.as_ref()).fuse();
+        let cancelled = wait_for_agent_cancellation(checkpoint_cx, abort.as_ref()).fuse();
         let stream_fut = provider.stream(&context, &stream_options).fuse();
         futures::pin_mut!(cancelled, stream_fut);
         let mut stream = match futures::future::select(cancelled.as_mut(), stream_fut).await {
@@ -6453,7 +6512,7 @@ impl Agent {
         &self,
         batch: Vec<(usize, ToolCall)>,
         on_event: AgentEventHandler,
-        abort: Option<AbortSignal>,
+        cancellation: TurnCancellation<'_>,
         latency: SharedTurnLatencyAccumulator,
         parallelism: usize,
     ) -> Vec<(usize, (ToolOutput, bool))> {
@@ -6465,41 +6524,45 @@ impl Agent {
             let on_event = Arc::clone(&on_event);
             let latency = Arc::clone(&latency);
             async move {
-                (
+                // buffer_unordered can poll several peers in one call. A
+                // sibling that cancels its owner must stop the next admission.
+                if cancellation.reason().is_some() {
+                    return None;
+                }
+                Some((
                     idx,
-                    self.execute_tool_in_session(tc, on_event, latency, None, parallel_only)
-                        .await,
-                )
+                    self.execute_tool_in_session(
+                        tc,
+                        on_event,
+                        latency,
+                        None,
+                        parallel_only,
+                        Some(cancellation),
+                    )
+                    .await,
+                ))
             }
         });
 
-        if let Some(signal) = abort.as_ref() {
-            use futures::future::{Either, select};
-            let pending = stream::iter(futures).buffer_unordered(parallelism);
-            let abort_fut = signal.wait().fuse();
-            futures::pin_mut!(pending, abort_fut);
-            // Completed work belongs to the transcript even when a sibling
-            // remains blocked. Racing cancellation against collect() drops
-            // its already-collected outputs and later misreports those calls
-            // as aborted. Keep each observed completion outside the future
-            // that cancellation drops; only unfinished calls receive the
-            // synthetic cancellation results in execute_tool_calls.
-            let mut completed = Vec::new();
-            while !signal.is_aborted() {
-                let next = pending.next().fuse();
-                futures::pin_mut!(next);
-                match select(next, abort_fut.as_mut()).await {
-                    Either::Left((Some(result), _)) => completed.push(result),
-                    Either::Left((None, _)) | Either::Right(_) => break,
-                }
+        use futures::future::{Either, select};
+        let pending = stream::iter(futures).buffer_unordered(parallelism);
+        let cancelled = cancellation.wait().fuse();
+        futures::pin_mut!(pending, cancelled);
+        // Completed work belongs to the transcript even when a sibling
+        // remains blocked. Keep each observed completion outside the future
+        // that cancellation drops, with or without an explicit UI signal.
+        let mut completed = Vec::new();
+        while cancellation.reason().is_none() {
+            let next = pending.next().fuse();
+            futures::pin_mut!(next);
+            // Poll the output first: a tool that completes in the same poll
+            // as cancellation retains its real outcome, never a false rollback.
+            match select(next, cancelled.as_mut()).await {
+                Either::Left((Some(Some(result)), _)) => completed.push(result),
+                Either::Left((_, _)) | Either::Right(_) => break,
             }
-            completed
-        } else {
-            stream::iter(futures)
-                .buffer_unordered(parallelism)
-                .collect::<Vec<_>>()
-                .await
         }
+        completed
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6508,7 +6571,7 @@ impl Agent {
         tool_calls: &[ToolCall],
         on_event: AgentEventHandler,
         new_messages: &mut Vec<Message>,
-        abort: Option<AbortSignal>,
+        cancellation: TurnCancellation<'_>,
         latency: SharedTurnLatencyAccumulator,
         parallelism: usize,
     ) -> Result<ToolExecutionOutcome> {
@@ -6550,11 +6613,15 @@ impl Agent {
             vec![None; tool_calls.len()];
 
         for effect_batch in effect_batches {
-            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+            if cancellation.reason().is_some() {
                 break;
             }
 
             let steering = self.drain_steering_messages().await;
+            if cancellation.reason().is_some() {
+                self.message_queue.restore_steering_front_lossless(steering);
+                break;
+            }
             if !steering.is_empty() {
                 steering_messages = Some(steering);
                 break;
@@ -6572,7 +6639,7 @@ impl Agent {
                 .execute_tool_batch(
                     batch,
                     Arc::clone(&on_event),
-                    abort.clone(),
+                    cancellation,
                     Arc::clone(&latency),
                     parallelism,
                 )
@@ -6604,9 +6671,11 @@ impl Agent {
         for (index, tool_call) in tool_calls.iter().enumerate() {
             // Check for new steering if we haven't already found some.
             // This catches steering messages that arrived during the *last* tool's execution.
-            if steering_messages.is_none() && !abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+            if steering_messages.is_none() && cancellation.reason().is_none() {
                 let steering = self.drain_steering_messages().await;
-                if !steering.is_empty() {
+                if cancellation.reason().is_some() {
+                    self.message_queue.restore_steering_front_lossless(steering);
+                } else if !steering.is_empty() {
                     steering_messages = Some(steering);
                 }
             }
@@ -6620,16 +6689,10 @@ impl Agent {
                 results.push(self.skip_tool_call(tool_call, &on_event, new_messages));
             } else {
                 // Aborted or otherwise failed to run (e.g. abort signal).
-                let output = ToolOutput {
-                    content: vec![ContentBlock::Text(TextContent::new(
-                        "Tool execution aborted",
-                    ))],
-                    details: Some(Self::tool_cancellation_details(
-                        &tool_call.name,
-                        "abort_signal",
-                    )),
-                    is_error: true,
-                };
+                let output = Self::tool_cancellation_output(
+                    &tool_call.name,
+                    cancellation.reason().unwrap_or("abort_signal"),
+                );
 
                 on_event(AgentEvent::ToolExecutionUpdate {
                     tool_call_id: tool_call.id.clone(),
@@ -6737,7 +6800,7 @@ impl Agent {
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
     ) -> (ToolOutput, bool) {
-        self.execute_tool_in_session(tool_call, on_event, latency, None, false)
+        self.execute_tool_in_session(tool_call, on_event, latency, None, false, None)
             .await
     }
 
@@ -6773,7 +6836,14 @@ impl Agent {
         latency: SharedTurnLatencyAccumulator,
         expected_session: Option<&str>,
         parallel_only: bool,
+        cancellation: Option<TurnCancellation<'_>>,
     ) -> (ToolOutput, bool) {
+        if let Some(reason) = cancellation.and_then(TurnCancellation::reason) {
+            return (
+                Self::tool_cancellation_output(&tool_call.name, reason),
+                true,
+            );
+        }
         if let Err(error) = self.check_invocation_session(expected_session).await {
             return (Self::xdev_text_output(&error.to_string(), true), true);
         }
@@ -6843,6 +6913,12 @@ impl Agent {
             if let Err(error) = self.check_invocation_session(expected_session).await {
                 return (Self::xdev_text_output(&error.to_string(), true), true);
             }
+            if let Some(reason) = cancellation.and_then(TurnCancellation::reason) {
+                return (
+                    Self::tool_cancellation_output(&tool_call.name, reason),
+                    true,
+                );
+            }
             if let Some(output) = approval_denied_output {
                 blocked_output = Some(output);
                 break;
@@ -6859,6 +6935,12 @@ impl Agent {
                 record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
                 if let Err(error) = self.check_invocation_session(expected_session).await {
                     return (Self::xdev_text_output(&error.to_string(), true), true);
+                }
+                if let Some(reason) = cancellation.and_then(TurnCancellation::reason) {
+                    return (
+                        Self::tool_cancellation_output(&tool_call.name, reason),
+                        true,
+                    );
                 }
                 if let Some(output) = hook_outcome {
                     blocked_output = Some(output);
@@ -7594,6 +7676,16 @@ impl Agent {
         )
     }
 
+    fn tool_cancellation_output(tool_name: &str, reason: &str) -> ToolOutput {
+        ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Tool execution aborted",
+            ))],
+            details: Some(Self::tool_cancellation_details(tool_name, reason)),
+            is_error: true,
+        }
+    }
+
     fn tool_cancellation_details(tool_name: &str, reason: &str) -> Value {
         json!({
             "schema": TOOL_CANCELLATION_SCHEMA_V1,
@@ -7920,6 +8012,7 @@ impl AgentToolInvocationHost<'_> {
                 latency,
                 Some(expected_session),
                 parallel_only,
+                None,
             )
             .await;
         owner
@@ -11417,11 +11510,15 @@ mod extensions_integration_tests {
                         _ => {}
                     });
                     let mut new_messages = Vec::new();
+                    let owner = crate::agent_cx::AgentCx::for_current_or_request();
                     let mut execution = Box::pin(agent.execute_tool_calls(
                         &tool_calls,
                         on_event,
                         &mut new_messages,
-                        None,
+                        TurnCancellation {
+                            owner: &owner,
+                            abort: None,
+                        },
                         test_turn_latency(),
                         parallelism,
                     ));
@@ -11551,12 +11648,16 @@ mod extensions_integration_tests {
                     .expect("restore configured resource");
                 assert!(agent.effects_for_call(&restored).processes());
                 let mut new_messages = Vec::new();
+                let owner = crate::agent_cx::AgentCx::for_current_or_request();
                 let outcome = agent
                     .execute_tool_calls(
                         &tool_calls,
                         Arc::new(|_| {}),
                         &mut new_messages,
-                        None,
+                        TurnCancellation {
+                            owner: &owner,
+                            abort: None,
+                        },
                         test_turn_latency(),
                         2,
                     )
@@ -16946,8 +17047,10 @@ mod extensions_integration_tests {
                 }
             });
             let mut new_messages = Vec::new();
+            let owner = crate::agent_cx::AgentCx::for_current_or_request();
             let mut execution = Box::pin(agent.execute_tool_calls(
-                &calls, on_event, &mut new_messages, None, test_turn_latency(),
+                &calls, on_event, &mut new_messages,
+                TurnCancellation { owner: &owner, abort: None }, test_turn_latency(),
                 compatible_tool_parallelism_limit(),
             ));
             assert!(futures::poll!(execution.as_mut()).is_pending());
@@ -18608,6 +18711,7 @@ mod abort_tests {
         completed: Arc<AtomicUsize>,
         ready: Arc<Notify>,
         abort: AbortHandle,
+        owner: Option<crate::agent_cx::AgentCx>,
         dropped: Arc<AtomicBool>,
     }
 
@@ -18647,8 +18751,65 @@ mod abort_tests {
                 }
                 ready.await;
             }
-            self.abort.abort();
+            if let Some(owner) = &self.owner {
+                owner.set_cancel_requested(true);
+            } else {
+                self.abort.abort();
+            }
             futures::future::pending().await
+        }
+    }
+
+    struct OwnerCancellingTool {
+        owner: crate::agent_cx::AgentCx,
+        return_output: bool,
+        calls: Arc<StdMutex<Vec<String>>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for OwnerCancellingTool {
+        fn name(&self) -> &'static str {
+            "owner_cancel_tool"
+        }
+
+        fn label(&self) -> &'static str {
+            "Owner cancellation fixture"
+        }
+
+        fn description(&self) -> &'static str {
+            "Cancels the owner before another ready peer can be admitted"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::read()
+        }
+
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            _input: serde_json::Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> crate::error::Result<ToolOutput> {
+            let _drop_guard = BlockedToolDropGuard(Arc::clone(&self.dropped));
+            self.calls.lock().unwrap().push(tool_call_id.to_string());
+            if tool_call_id == "cancel" {
+                self.owner.set_cancel_requested(true);
+                if !self.return_output {
+                    return futures::future::pending().await;
+                }
+            }
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "completed before cancel",
+                ))],
+                details: None,
+                is_error: false,
+            })
         }
     }
 
@@ -19944,8 +20105,405 @@ mod abort_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     fn abort_preserves_completed_batch_results_in_persisted_history() {
+        assert_cancellation_preserves_completed_batch_results(false, true);
+    }
+
+    #[test]
+    fn owner_cancellation_stops_ready_peer_admission_and_keeps_completed_output() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for with_abort_signal in [false, true] {
+                for return_output in [false, true] {
+                    let root = tempfile::tempdir().unwrap();
+                    let owner = crate::agent_cx::AgentCx::for_testing();
+                    let (_handle, signal) = AbortHandle::new();
+                    let calls = Arc::new(StdMutex::new(Vec::new()));
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let tools = ToolRegistry::from_tools(vec![
+                        Box::new(OwnerCancellingTool {
+                            owner: owner.clone(),
+                            return_output,
+                            calls: Arc::clone(&calls),
+                            dropped: Arc::clone(&dropped),
+                        }),
+                        Box::new(crate::tools::WriteTool::new(root.path())),
+                    ]);
+                    let mut agent = Agent::new(
+                        Arc::new(PhasedProvider::new(0)),
+                        tools,
+                        AgentConfig::default(),
+                    );
+                    let tool_calls = [
+                        ("cancel", "owner_cancel_tool", json!({})),
+                        ("peer", "owner_cancel_tool", json!({})),
+                        (
+                            "later",
+                            "write",
+                            json!({"path": "later", "content": "not admitted"}),
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(id, name, arguments)| ToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments,
+                        thought_signature: None,
+                    })
+                    .collect::<Vec<_>>();
+                    let mut messages = Vec::new();
+                    let outcome = asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_secs(5),
+                        owner.with_current(agent.execute_tool_calls(
+                            &tool_calls,
+                            Arc::new(|_| {}),
+                            &mut messages,
+                            TurnCancellation {
+                                owner: &owner,
+                                abort: with_abort_signal.then_some(&signal),
+                            },
+                            Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                            2,
+                        )),
+                    )
+                    .await
+                    .expect("owner cancellation must interrupt a silent tool")
+                    .expect("cancelled batch");
+                    assert_eq!(*calls.lock().unwrap(), ["cancel"]);
+                    assert!(dropped.load(Ordering::SeqCst));
+                    assert!(!signal.is_aborted());
+                    assert!(!root.path().join("later").exists());
+                    assert_eq!(outcome.tool_results.len(), 3);
+                    assert_eq!(messages.len(), 3);
+                    assert_eq!(outcome.tool_results[0].is_error, !return_output);
+                    if return_output {
+                        assert!(outcome.tool_results[0].content.iter().any(|block| {
+                            matches!(block, ContentBlock::Text(text) if text.text == "completed before cancel")
+                        }));
+                        assert!(outcome.tool_results[0].details.is_none());
+                    }
+                    for result in &outcome.tool_results[usize::from(return_output)..] {
+                        assert!(result.is_error);
+                        assert_eq!(
+                            result.details.as_ref().unwrap()["reason"],
+                            "owner_cancellation",
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum OwnerToolCancelPhase {
+        Start,
+        ApprovalReady,
+        ApprovalPending,
+    }
+
+    #[test]
+    fn owner_cancellation_during_tool_start_or_approval_never_admits_native_writes() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for phase in [
+                OwnerToolCancelPhase::Start,
+                OwnerToolCancelPhase::ApprovalReady,
+                OwnerToolCancelPhase::ApprovalPending,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let owner = crate::agent_cx::AgentCx::for_testing();
+                let approval_owner = owner.clone();
+                let event_owner = owner.clone();
+                let approvals = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&approvals);
+                let tools = ToolRegistry::from_tools(vec![Box::new(crate::tools::WriteTool::new(
+                    root.path(),
+                ))]);
+                let mut agent = Agent::new(
+                    Arc::new(PhasedProvider::new(0)),
+                    tools,
+                    AgentConfig::default(),
+                );
+                agent.set_tool_approval(Some(Arc::new(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let owner = approval_owner.clone();
+                    Box::pin(async move {
+                        owner.set_cancel_requested(true);
+                        if phase == OwnerToolCancelPhase::ApprovalPending {
+                            return futures::future::pending().await;
+                        }
+                        ToolApprovalDecision::Allow
+                    })
+                })));
+                let tool_calls = ["first", "later"]
+                    .into_iter()
+                    .map(|id| ToolCall {
+                        id: id.to_string(),
+                        name: "write".to_string(),
+                        arguments: json!({"path": id, "content": "not admitted"}),
+                        thought_signature: None,
+                    })
+                    .collect::<Vec<_>>();
+                let on_event: AgentEventHandler = Arc::new(move |event| {
+                    if phase == OwnerToolCancelPhase::Start
+                        && matches!(event, AgentEvent::ToolExecutionStart { .. })
+                    {
+                        event_owner.set_cancel_requested(true);
+                    }
+                });
+                let mut messages = Vec::new();
+                let outcome = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    owner.with_current(agent.execute_tool_calls(
+                        &tool_calls,
+                        on_event,
+                        &mut messages,
+                        TurnCancellation {
+                            owner: &owner,
+                            abort: None,
+                        },
+                        Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                        2,
+                    )),
+                )
+                .await
+                .expect("owner cancellation must interrupt approval")
+                .expect("cancelled batch");
+                assert_eq!(
+                    approvals.load(Ordering::SeqCst),
+                    usize::from(phase != OwnerToolCancelPhase::Start),
+                );
+                assert!(!root.path().join("first").exists());
+                assert!(!root.path().join("later").exists());
+                assert_eq!(outcome.tool_results.len(), 2);
+                for result in outcome.tool_results {
+                    assert!(result.is_error);
+                    assert_eq!(
+                        result.details.as_ref().unwrap()["reason"],
+                        "owner_cancellation",
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn owner_cancellation_precedes_time_cap_and_preserves_queued_input() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut agent = Agent::new(
+                Arc::new(CountingProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    max_time: Some(Duration::ZERO),
+                    ..AgentConfig::default()
+                },
+            );
+            for (follow_up, text) in [(false, "steering"), (true, "follow-up")] {
+                let message = Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: 0,
+                });
+                if follow_up {
+                    agent.queue_follow_up(message);
+                } else {
+                    agent.queue_steering(message);
+                }
+            }
+            let fetches = Arc::new(AtomicUsize::new(0));
+            let observed_fetches = Arc::clone(&fetches);
+            agent.register_message_fetchers(
+                None,
+                Some(Arc::new(move || {
+                    observed_fetches.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Vec::new() })
+                })),
+            );
+            let owner = crate::agent_cx::AgentCx::for_testing();
+            owner.set_cancel_requested(true);
+            let message = owner
+                .with_current(agent.run_loop_inner(Vec::new(), false, None, Arc::new(|_| {}), None))
+                .await
+                .expect("aborted turn");
+            assert_eq!(message.stop_reason, StopReason::Aborted);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fetches.load(Ordering::SeqCst), 0);
+            assert_eq!(agent.queued_message_count(), 2);
+            let steering = agent.take_queued_steering_batch();
+            assert_eq!(steering.len(), 1);
+            assert!(matches!(
+                steering.into_iter().next().unwrap().into_message(),
+                Message::User(user)
+                    if matches!(&user.content, UserContent::Text(text) if text == "steering")
+            ));
+            let follow_up = agent.take_queued_follow_up_batch().await;
+            assert_eq!(follow_up.len(), 1);
+            assert!(matches!(
+                follow_up.into_iter().next().unwrap().into_message(),
+                Message::User(user)
+                    if matches!(&user.content, UserContent::Text(text) if text == "follow-up")
+            ));
+        });
+    }
+
+    #[test]
+    fn owner_cancellation_during_tail_fetch_preserves_input_and_skips_follow_ups() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for include_steering in [false, true] {
+                let provider = Arc::new(PhasedProvider::new(0));
+                let mut agent = Agent::new(
+                    Arc::clone(&provider) as Arc<dyn Provider>,
+                    ToolRegistry::from_tools(Vec::new()),
+                    AgentConfig::default(),
+                );
+                agent.queue_follow_up(Message::User(UserMessage {
+                    content: UserContent::Text("follow-up".to_string()),
+                    timestamp: 0,
+                }));
+                let owner = crate::agent_cx::AgentCx::for_testing();
+                let fetch_owner = owner.clone();
+                let steering_fetches = Arc::new(AtomicUsize::new(0));
+                let observed_steering = Arc::clone(&steering_fetches);
+                let follow_up_fetches = Arc::new(AtomicUsize::new(0));
+                let observed_follow_up = Arc::clone(&follow_up_fetches);
+                agent.register_message_fetchers(
+                    Some(Arc::new(move || {
+                        let fetch = observed_steering.fetch_add(1, Ordering::SeqCst);
+                        let owner = fetch_owner.clone();
+                        Box::pin(async move {
+                            if fetch == 1 {
+                                owner.set_cancel_requested(true);
+                                if include_steering {
+                                    return vec![QueuedAgentMessage::from_authored_message(
+                                        Message::User(UserMessage {
+                                            content: UserContent::Text("steering".to_string()),
+                                            timestamp: 0,
+                                        }),
+                                    )];
+                                }
+                            }
+                            Vec::new()
+                        })
+                    })),
+                    Some(Arc::new(move || {
+                        observed_follow_up.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Vec::new() })
+                    })),
+                );
+                let message = owner
+                    .with_current(agent.run_loop_inner(
+                        Vec::new(),
+                        false,
+                        None,
+                        Arc::new(|_| {}),
+                        None,
+                    ))
+                    .await
+                    .expect("aborted turn");
+                assert_eq!(message.stop_reason, StopReason::Aborted);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(steering_fetches.load(Ordering::SeqCst), 2);
+                assert_eq!(follow_up_fetches.load(Ordering::SeqCst), 0);
+                assert_eq!(agent.queued_message_count(), 1 + usize::from(include_steering));
+                let steering = agent.take_queued_steering_batch();
+                assert_eq!(steering.len(), usize::from(include_steering));
+                if include_steering {
+                    assert!(matches!(
+                        steering.into_iter().next().unwrap().into_message(),
+                        Message::User(user)
+                            if matches!(&user.content, UserContent::Text(text) if text == "steering")
+                    ));
+                }
+                let follow_up = agent.take_queued_follow_up_batch().await;
+                assert_eq!(follow_up.len(), 1);
+                assert!(matches!(
+                    follow_up.into_iter().next().unwrap().into_message(),
+                    Message::User(user)
+                        if matches!(&user.content, UserContent::Text(text) if text == "follow-up")
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn owner_cancellation_during_follow_up_fetch_preserves_accepted_input() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for include_follow_up in [false, true] {
+                let provider = Arc::new(PhasedProvider::new(0));
+                let mut agent = Agent::new(
+                    Arc::clone(&provider) as Arc<dyn Provider>,
+                    ToolRegistry::from_tools(Vec::new()),
+                    AgentConfig::default(),
+                );
+                let owner = crate::agent_cx::AgentCx::for_testing();
+                let fetch_owner = owner.clone();
+                let fetches = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&fetches);
+                agent.register_message_fetchers(
+                    None,
+                    Some(Arc::new(move || {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        let owner = fetch_owner.clone();
+                        Box::pin(async move {
+                            owner.set_cancel_requested(true);
+                            if include_follow_up {
+                                let message = Message::User(UserMessage {
+                                    content: UserContent::Text("follow-up".to_string()),
+                                    timestamp: 0,
+                                });
+                                vec![QueuedAgentMessage::from_authored_message(message)]
+                            } else {
+                                Vec::new()
+                            }
+                        })
+                    })),
+                );
+                let message = owner
+                    .with_current(agent.run_loop_inner(
+                        Vec::new(),
+                        false,
+                        None,
+                        Arc::new(|_| {}),
+                        None,
+                    ))
+                    .await
+                    .expect("aborted turn");
+                assert_eq!(message.stop_reason, StopReason::Aborted);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(fetches.load(Ordering::SeqCst), 1);
+                assert_eq!(agent.queued_message_count(), usize::from(include_follow_up));
+                let follow_up = agent.take_queued_follow_up_batch().await;
+                assert_eq!(follow_up.len(), usize::from(include_follow_up));
+                if include_follow_up {
+                    assert!(matches!(
+                        follow_up.into_iter().next().unwrap().into_message(),
+                        Message::User(user)
+                            if matches!(&user.content, UserContent::Text(text) if text == "follow-up")
+                    ));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn owner_cancellation_preserves_completed_batch_results_with_optional_abort() {
+        for with_abort_signal in [false, true] {
+            assert_cancellation_preserves_completed_batch_results(true, with_abort_signal);
+        }
+    }
+
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+    fn assert_cancellation_preserves_completed_batch_results(
+        cancel_owner: bool,
+        with_abort_signal: bool,
+    ) {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -19961,6 +20519,7 @@ mod abort_tests {
             let ready = Arc::new(Notify::new());
             let dropped = Arc::new(AtomicBool::new(false));
             let (abort_handle, abort_signal) = AbortHandle::new();
+            let owner = crate::agent_cx::AgentCx::for_testing_with_io();
             let tools = ToolRegistry::from_tools(vec![
                 Box::new(NotifyingReadTool {
                     inner: crate::tools::ReadTool::new(temp.path()),
@@ -19971,6 +20530,7 @@ mod abort_tests {
                     completed: Arc::clone(&completed),
                     ready,
                     abort: abort_handle,
+                    owner: cancel_owner.then(|| owner.clone()),
                     dropped: Arc::clone(&dropped),
                 }),
                 Box::new(crate::tools::WriteTool::new(temp.path())),
@@ -20019,11 +20579,11 @@ mod abort_tests {
             let result = asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 Duration::from_secs(30),
-                agent_session.run_text_with_abort(
+                owner.with_current(agent_session.run_text_with_abort(
                     "read the file twice, then write".to_string(),
-                    Some(abort_signal),
+                    with_abort_signal.then(|| abort_signal.clone()),
                     move |event| observed.lock().unwrap().push(event),
-                ),
+                )),
             )
             .await
             .expect("cancelling a blocked sibling must finish the turn")
@@ -20032,6 +20592,8 @@ mod abort_tests {
             assert_eq!(completed.load(Ordering::SeqCst), 2);
             assert!(dropped.load(Ordering::SeqCst));
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(owner.is_cancel_requested(), cancel_owner);
+            assert_eq!(abort_signal.is_aborted(), !cancel_owner);
             assert!(!temp.path().join("must-not-exist.txt").exists());
 
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -20084,7 +20646,14 @@ mod abort_tests {
                 assert!(result.is_error);
                 let details = result.details.as_ref().expect("cancellation details");
                 assert_eq!(details["schema"], TOOL_CANCELLATION_SCHEMA_V1);
-                assert_eq!(details["reason"], "abort_signal");
+                assert_eq!(
+                    details["reason"],
+                    if cancel_owner {
+                        "owner_cancellation"
+                    } else {
+                        "abort_signal"
+                    },
+                );
             }
 
             let events = events.lock().unwrap();
