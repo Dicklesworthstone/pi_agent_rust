@@ -740,6 +740,7 @@ fn response_sets_complete_after_end() {
             res.on('end', () => {
                 resolve({ result: String(res.complete) });
             });
+            res.resume();
         });
         "#,
     );
@@ -1026,6 +1027,7 @@ fn response_defaults_to_200() {
             res.on('end', () => {
                 resolve({ result: String(res.statusCode) });
             });
+            res.resume();
         });
         "#,
     );

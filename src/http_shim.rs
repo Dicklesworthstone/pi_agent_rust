@@ -9,6 +9,7 @@
 pub const NODE_HTTP_JS: &str = r#"
 import EventEmitter from "node:events";
 import { StringDecoder } from "node:string_decoder";
+import { Readable } from "node:stream";
 
 // ─── STATUS_CODES ────────────────────────────────────────────────────────────
 
@@ -140,59 +141,81 @@ class HttpEventEmitter extends EventEmitter {
   }
 }
 
-class IncomingMessage extends HttpEventEmitter {
+class IncomingMessage extends Readable {
   constructor(statusCode, headers, body) {
-    super();
+    // HTTP owns the transport and terminal notifications. The shared readable
+    // owns buffering, decoding and consumer demand, but must not auto-destroy
+    // the request when its end listener is still running.
+    super({ autoDestroy: false });
     this.statusCode = statusCode;
     this.statusMessage = STATUS_CODES[statusCode] || 'Unknown';
     this.headers = headers || {};
     this._body = body || '';
     this._destroyed = false;
     this._closed = false;
-    this.destroyed = false;
     this._reader = null;
     this._bodyStream = null;
     this._bodyCancelled = false;
-    this._paused = false;
-    this._resumeRead = null;
     this._cancelRequest = null;
+    this._closeRequest = null;
     this.complete = false;
     this.httpVersion = '1.1';
     this.method = null;
     this.url = '';
   }
 
+  emit(event, ...args) {
+    if (event === 'close') return this._close();
+    try {
+      return HttpEventEmitter.prototype.emit.call(this, event, ...args);
+    } catch (error) {
+      if (event === 'error') throw error;
+      // Readable may deliver buffered data/end on a later microtask, outside
+      // the transport pump's try/catch. Consumer failures still own teardown.
+      this.destroy(error);
+      return false;
+    } finally {
+      if (event === 'end') this._close();
+    }
+  }
+
   _deliver() {
-    if (this._destroyed) {
-      return;
-    }
-
-    const chunk = __pi_http_decode_chunk(this._body, this._encoding);
-    if (chunk && chunk.length > 0) {
-      this.emit('data', chunk);
-    }
-
-    if (this._destroyed) {
-      return;
-    }
-
-    this._finish();
+    if (this._destroyed) return;
+    const body = this._body;
+    this._body = null;
+    const bytes = __pi_http_clone_body_chunk(body);
+    if (bytes.length > 0) this.push(bytes);
+    if (!this._destroyed) this._finish();
   }
 
   _close() {
-    if (this._closed) return;
+    if (this._closed) return false;
     this._closed = true;
+    this.closed = true;
+    this.destroyed = true;
+    this.readable = false;
+    this._body = null;
     this._bodyStream = null;
     this._cancelRequest = null;
-    this.emit('close');
+    const closeRequest = this._closeRequest;
+    this._closeRequest = null;
+    let failure = null;
+    let emitted = false;
+    try {
+      emitted = HttpEventEmitter.prototype.emit.call(this, 'close');
+    } catch (error) {
+      failure = error;
+    } finally {
+      if (closeRequest) closeRequest(failure);
+    }
+    if (failure && !closeRequest) throw failure;
+    return emitted;
   }
 
   _finish() {
     if (this._destroyed || this._closed) return;
     this.complete = true;
-    // An end listener may destroy the response or throw. Neither may skip
-    // cleanup or cause a second close notification.
-    try { this.emit('end'); } finally { this._close(); }
+    this.push(null);
   }
 
   _cancelBody(error) {
@@ -203,27 +226,17 @@ class IncomingMessage extends HttpEventEmitter {
     try { Promise.resolve(source.cancel(error)).catch(() => {}); } catch (_) {}
   }
 
-  setEncoding(encoding) {
-    this._encoding = encoding ? String(encoding) : 'utf8';
-    this._decoder = new StringDecoder(this._encoding);
-    return this;
-  }
-  resume() {
-    this._paused = false;
-    if (this._resumeRead) { const resume = this._resumeRead; this._resumeRead = null; resume(); }
-    return this;
-  }
-  pause() { this._paused = true; return this; }
   destroy(error) {
-    if (this._destroyed || this._closed) {
-      return this;
-    }
+    if (this._destroyed || this._closed) return this;
     this._destroyed = true;
-    this.destroyed = true;
     this._cancelBody(error);
-    try { if (!this.complete && this._cancelRequest) this._cancelRequest(error); } catch (_) {}
-    this.resume();
-    try { if (error) this.emit('error', error); } finally { this._close(); }
+    // Latch before invoking the request: request.destroy() may re-enter here.
+    // Even throwing error/close listeners cannot skip readable or body cleanup.
+    try {
+      if ((error || !this.complete) && this._cancelRequest) this._cancelRequest(error);
+    } finally {
+      try { super.destroy(error); } finally { this._close(); }
+    }
     return this;
   }
 
@@ -239,27 +252,17 @@ class IncomingMessage extends HttpEventEmitter {
     try {
       reader = body.getReader();
       this._reader = reader;
-      while (!this._destroyed) {
-        if (this._paused) await new Promise(resolve => { this._resumeRead = resolve; });
-        if (this._destroyed) break;
+      // Hold one owned reader, but pull only when the consumer asks. A pause
+      // during read() is safe: push() retains the returned frame in the queue.
+      while (await this._waitForRead()) {
         const { done, value } = await reader.read();
-        if (done || this._destroyed) break;
+        if (this._destroyed) break;
+        if (done) { this._finish(); break; }
         onActivity();
-        const bytes = __pi_http_clone_body_chunk(value);
-        const chunk = this._decoder ? this._decoder.write(bytes) : bytes;
-        if (chunk.length > 0) this.emit('data', chunk);
-      }
-      if (!this._destroyed) {
-        const tail = this._decoder ? this._decoder.end() : '';
-        if (tail) this.emit('data', tail);
-        if (!this._destroyed) this._finish();
+        this.push(__pi_http_clone_body_chunk(value));
       }
     } catch (error) {
-      if (!this._destroyed) {
-        // A response error listener may handle the notification, but the
-        // request must still fail and release its host transport.
-        try { this.destroy(error); } finally { throw error; }
-      }
+      if (!this._destroyed) this.destroy(error);
     } finally {
       this._reader = null;
       this._bodyStream = null;
@@ -445,14 +448,17 @@ class ClientRequest extends HttpEventEmitter {
           for (const [name, value] of response.headers.entries()) responseHeaders[name] = value;
           const incoming = new IncomingMessage(response.status, responseHeaders, '');
           incoming._bodyStream = this._responseBody;
-          incoming._cancelRequest = (reason) => this._controller.abort(reason);
+          incoming._cancelRequest = (reason) => this.destroy(reason);
+          incoming._closeRequest = (error) => {
+            if (error) this.destroy(error);
+            else if (incoming.complete) this._close();
+            else this.destroy();
+          };
           this._response = incoming;
           this._responseBody = null;
           this._armTimeout();
-          this.emit('response', incoming);
+          if (!this.emit('response', incoming)) incoming.resume();
           await incoming._deliverWeb(response.body, () => this._armTimeout());
-          if (incoming.complete) this._close();
-          else this.destroy();
         }).catch((error) => {
           if (!this._aborted) this.destroy(error instanceof Error ? error : new Error(String(error)));
         }).finally(() => this._clearTimeout());
@@ -480,7 +486,7 @@ class ClientRequest extends HttpEventEmitter {
     }
 
     if (!result || typeof result !== 'object') {
-      this.emit('error', new Error('Invalid HTTP response from hostcall'));
+      this.destroy(new Error('Invalid HTTP response from hostcall'));
       return;
     }
 
@@ -492,13 +498,20 @@ class ClientRequest extends HttpEventEmitter {
         : (result.body || result.data || '');
 
     const res = new IncomingMessage(statusCode, headers, body);
-    this.emit('response', res);
-    // Deliver body asynchronously (in next microtask)
-    Promise.resolve().then(() => {
-      if (!this._aborted) {
-        res._deliver();
-      }
-    });
+    this._response = res;
+    res._cancelRequest = (reason) => this.destroy(reason);
+    res._closeRequest = (error) => {
+      if (error) this.destroy(error);
+      else if (res.complete) this._close();
+      else this.destroy();
+    };
+    try {
+      if (!this.emit('response', res)) res.resume();
+      // The readable retains buffered bytes until a consumer is attached.
+      Promise.resolve().then(() => {
+        if (!this._aborted) res._deliver();
+      }).catch((error) => this.destroy(error));
+    } catch (error) { this.destroy(error); }
   }
 }
 

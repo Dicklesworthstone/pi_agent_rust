@@ -18,6 +18,7 @@ const CASE_TRANSPORT: &str = "globalThis.__httpLifecycleFetch";
 const LIFECYCLE_CASES_JS: &str = r"
 globalThis.__httpLifecycleCases = async function(http) {
   const savedFetch = globalThis.__httpLifecycleFetch;
+  const { Readable, Writable } = await import('node:stream');
   const results = [];
   const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
   const check = (condition, message) => { if (!condition) throw new Error(message); };
@@ -170,6 +171,7 @@ globalThis.__httpLifecycleCases = async function(http) {
       const req = http.request('https://relay.invalid/', res => {
         res.on('end', () => { throw new Error('end observer failed'); });
         res.on('close', () => closed++);
+        res.resume();
       });
       const events = observe(req);
       req.end(); await flush();
@@ -200,6 +202,7 @@ globalThis.__httpLifecycleCases = async function(http) {
       let ended = 0;
       const req = http.request('https://relay.invalid/', res => {
         res.on('error', () => {}); res.on('end', () => ended++);
+        res.resume();
       });
       const events = observe(req);
       req.end(); await flush();
@@ -217,6 +220,7 @@ globalThis.__httpLifecycleCases = async function(http) {
         const req = http.request('https://relay.invalid/', res => {
           res.on('end', () => { ended++; res.destroy(); });
           res.on('close', () => closed++);
+          res.resume();
         });
         const events = observe(req);
         req.end(); await flush();
@@ -297,7 +301,7 @@ globalThis.__httpLifecycleCases = async function(http) {
         globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
         let closed = 0, ended = 0;
         const req = http.request('https://relay.invalid/', res => {
-          if (paused) res.pause();
+          if (paused) res.pause(); else res.resume();
           res.on('close', () => closed++); res.on('end', () => ended++);
         });
         const events = observe(req);
@@ -338,6 +342,195 @@ globalThis.__httpLifecycleCases = async function(http) {
       await flush();
       check(fetches === 0 && events.closed === 1 && events.errors.length === 1, 'rejected before fetch');
       check(events.errors[0].message.includes('host networking'), 'host trust policy preserved');
+    });
+    await run('IncomingMessage implements the shared Readable contract', async () => {
+      const incoming = new http.IncomingMessage(200, {}, '');
+      try {
+        check(incoming instanceof Readable, 'response is a Readable');
+        check(typeof incoming.read === 'function' && typeof incoming.pipe === 'function' &&
+          typeof incoming[Symbol.asyncIterator] === 'function', 'read, pipe and async iteration exist');
+      } finally { incoming.destroy(); }
+    });
+    await run('late data consumers receive the complete response', async () => {
+      const body = bodyFixture([new Uint8Array([65, 66]), new Uint8Array([0, 255, 67])]);
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
+      let incoming, ended = 0;
+      const bytes = [];
+      const req = http.request('https://relay.invalid/', res => { incoming = res; });
+      const events = observe(req);
+      try {
+        req.end(); await flush();
+        check(incoming && events.closed === 0, 'response remains available before consumption');
+        incoming.on('data', chunk => bytes.push(...chunk));
+        incoming.on('end', () => ended++);
+        await flush();
+        check(JSON.stringify(bytes) === '[65,66,0,255,67]' && ended === 1, 'late consumer loses no binary bytes or EOF');
+        check(incoming.complete && events.closed === 1 && events.errors.length === 0, 'consumption completes request');
+        check(body.state.cancels === 0 && body.state.releases === 1, 'successful reader released once');
+      } finally { req.destroy(); await flush(); }
+    });
+    await run('readable consumers pull response bytes with read', async () => {
+      const body = bodyFixture([new Uint8Array([65, 66]), new Uint8Array([67])]);
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
+      const bytes = [];
+      let ended = 0;
+      const req = http.request('https://relay.invalid/', incoming => {
+        incoming.on('readable', () => {
+          let chunk;
+          while ((chunk = incoming.read()) !== null) bytes.push(...chunk);
+        });
+        incoming.on('end', () => ended++);
+      });
+      const events = observe(req);
+      try {
+        req.end(); await flush();
+        check(JSON.stringify(bytes) === '[65,66,67]' && ended === 1, 'readable/read preserves response order and EOF');
+        check(events.errors.length === 0 && events.closed === 1 && body.state.releases === 1, 'manual reads release request');
+      } finally { req.destroy(); await flush(); }
+    });
+    await run('response pipe stops pulling until a slow writer drains', async () => {
+      const body = bodyFixture([new Uint8Array([65]), new Uint8Array([66]), new Uint8Array([67])]);
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
+      const bytes = [];
+      let releaseWrite = null, finished = 0;
+      const sink = new Writable({ highWaterMark: 1, write(chunk, _encoding, callback) {
+        bytes.push(...chunk); releaseWrite = callback;
+      } });
+      sink.on('finish', () => finished++);
+      const req = http.request('https://relay.invalid/', incoming => incoming.pipe(sink));
+      const events = observe(req);
+      try {
+        req.end(); await flush();
+        check(body.state.reads === 1 && bytes.length === 1 && finished === 0, 'first blocked write stops source reads');
+        await flush();
+        check(body.state.reads === 1, 'paused source does not prefetch while sink is blocked');
+        for (let count = 1; count <= 3; count++) {
+          check(typeof releaseWrite === 'function', 'writer exposes pending completion');
+          const release = releaseWrite; releaseWrite = null; release();
+          await flush();
+          if (count < 3) check(body.state.reads === count + 1 && bytes.length === count + 1, 'each drain admits one next frame');
+        }
+        check(JSON.stringify(bytes) === '[65,66,67]' && finished === 1, 'pipe delivers each byte once and finishes sink');
+        check(events.closed === 1 && events.errors.length === 0 && body.state.cancels === 0, 'pipe EOF is normal completion');
+      } finally { req.destroy(); sink.destroy(); await flush(); }
+    });
+    await run('response async iteration consumes all bytes and EOF', async () => {
+      const body = bodyFixture([new Uint8Array([65, 0]), new Uint8Array([255, 66])]);
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
+      const bytes = [];
+      let settled = false, failure = null;
+      const req = http.request('https://relay.invalid/', incoming => {
+        (async () => { for await (const chunk of incoming) bytes.push(...chunk); })().then(
+          () => { settled = true; }, error => { failure = error; settled = true; });
+      });
+      const events = observe(req);
+      try {
+        req.end(); await flush();
+        check(settled && !failure && JSON.stringify(bytes) === '[65,0,255,66]', 'iterator receives binary response and terminates');
+        check(events.closed === 1 && events.errors.length === 0 && body.state.cancels === 0, 'iterator EOF is not cancellation');
+        check(body.state.releases === 1 && !body.state.locked, 'iterator EOF releases reader');
+      } finally { req.destroy(); await flush(); }
+    });
+    await run('response iterator break cancels live transport exactly once', async () => {
+      const body = bodyFixture([new Uint8Array([65]), new Uint8Array([66])], true);
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
+      let incoming, first = null, settled = false, failure = null, ended = 0;
+      const req = http.request('https://relay.invalid/', res => {
+        incoming = res;
+        res.on('end', () => ended++);
+        (async () => { for await (const chunk of res) { first = Array.from(chunk); break; } })().then(
+          () => { settled = true; }, error => { failure = error; settled = true; });
+      });
+      const events = observe(req);
+      try {
+        req.end(); await flush();
+        check(settled && !failure && JSON.stringify(first) === '[65]', 'iterator delivers first frame before returning');
+        check(body.state.reads === 1 && ended === 0 && incoming.destroyed && !incoming.complete, 'break does not drain or report successful EOF');
+        check(body.state.cancels === 1 && body.state.releases === 1 && !body.state.locked, 'break cancels and unlocks once');
+        check(events.closed === 1 && events.errors.length === 0, 'request closes after iterator owns cancellation');
+        incoming.destroy(); req.destroy(); await flush();
+        check(body.state.cancels === 1 && body.state.releases === 1 && events.closed === 1, 'later cleanup is idempotent');
+      } finally { req.destroy(); await flush(); }
+    });
+    await run('unconsumed response does not drain an unbounded producer', async () => {
+      const body = bodyFixture(Array.from({ length: 64 }, () => new Uint8Array(64 * 1024)));
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
+      let incoming;
+      const req = http.request('https://relay.invalid/', res => { incoming = res; });
+      const events = observe(req);
+      try {
+        req.end(); await flush(); await flush();
+        check(incoming && body.state.reads <= 1, 'no consumer permits at most one retained transport frame');
+        check(!incoming.complete && events.closed === 0 && events.errors.length === 0, 'unconsumed bytes remain available');
+        req.destroy(); await flush();
+        check(body.state.cancels === 1 && body.state.releases === 1 && !body.state.locked, 'unconsumed response remains cancellable');
+      } finally { req.destroy(); await flush(); }
+    });
+    await run('response decoder preserves split characters and flushes EOF once', async () => {
+      const body = bodyFixture([
+        new Uint8Array([0xcf]), new Uint8Array([0x80, 0xf0]), new Uint8Array([0x9f]),
+        new Uint8Array([0x99, 0x82, 0x68, 0xc3]), new Uint8Array([0xa9, 0x6c, 0x6c, 0x6f, 0xe2]),
+      ]);
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
+      const chunks = [];
+      let ended = 0;
+      const req = http.request('https://relay.invalid/', incoming => {
+        incoming.setEncoding('utf8');
+        incoming.on('data', chunk => chunks.push(chunk));
+        incoming.on('end', () => ended++);
+      });
+      const events = observe(req);
+      try {
+        req.end(); await flush();
+        check(chunks.every(chunk => typeof chunk === 'string') && chunks.join('') === 'π🙂héllo�', 'split codepoints and malformed final byte decode once');
+        check(ended === 1 && events.closed === 1 && events.errors.length === 0, 'decoded response has one EOF');
+      } finally { req.destroy(); await flush(); }
+    });
+    await run('pause during an in-flight body read retains its bytes', async () => {
+      const body = bodyFixture([new Uint8Array([65, 66, 67])]);
+      const acquire = body.getReader.bind(body);
+      let incoming, ended = 0;
+      body.getReader = () => {
+        const reader = acquire();
+        const pull = reader.read.bind(reader);
+        reader.read = () => {
+          const frame = pull();
+          if (body.state.reads === 1) incoming.pause();
+          return frame;
+        };
+        return reader;
+      };
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
+      const bytes = [];
+      const req = http.request('https://relay.invalid/', res => {
+        incoming = res;
+        res.on('data', chunk => bytes.push(...chunk));
+        res.on('end', () => ended++);
+      });
+      const events = observe(req);
+      try {
+        req.end(); await flush();
+        check(body.state.reads === 1 && bytes.length === 0 && ended === 0, 'completed in-flight frame waits while paused');
+        incoming.resume(); await flush();
+        check(JSON.stringify(bytes) === '[65,66,67]' && ended === 1, 'resume delivers retained frame without loss');
+        check(events.closed === 1 && events.errors.length === 0, 'resumed response completes');
+      } finally { req.destroy(); await flush(); }
+    });
+    await run('buffered response survives delayed listener attachment', async () => {
+      let incoming, ended = 0;
+      const bytes = [];
+      const req = http.request('https://relay.invalid/', res => { incoming = res; });
+      const events = observe(req);
+      try {
+        req._handleResponse({ status: 201, headers: {}, body_bytes: 'AP9BQg==' });
+        await flush();
+        check(incoming && incoming.statusCode === 201, 'buffered headers delivered');
+        incoming.on('data', chunk => bytes.push(...chunk));
+        incoming.on('end', () => ended++);
+        await flush();
+        check(JSON.stringify(bytes) === '[0,255,65,66]' && ended === 1 && incoming.complete, 'buffered body remains readable until consumed');
+        check(events.errors.length === 0, 'buffered consumption reports no spurious failure');
+      } finally { req.destroy(); await flush(); }
     });
   } finally {
     globalThis.__httpLifecycleFetch = savedFetch;
@@ -388,7 +581,7 @@ fn node_http_terminal_lifecycle_contract() {
                 .expect("results");
             if !result.is_null() {
                 let cases = result.as_array().expect("case array");
-                assert_eq!(cases.len(), 21, "all cases must finish: {result}");
+                assert_eq!(cases.len(), 31, "all cases must finish: {result}");
                 assert!(
                     cases.iter().all(|case| case["passed"] == true),
                     "lifecycle failure: {result}"
