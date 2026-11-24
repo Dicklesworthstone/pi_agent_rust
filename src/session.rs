@@ -5373,7 +5373,7 @@ impl Session {
             .map(|(_, path)| path))
     }
 
-    /// The most recent openable session in this directory, with its path.
+    /// The most recent session in this directory that can accept further turns, with its path.
     ///
     /// `None` means there is nothing to continue: no candidate attached to
     /// this workspace could be opened. Unreadable candidates are
@@ -5445,6 +5445,14 @@ impl Session {
 
         for entry in &candidates {
             match Self::open(entry.path.to_string_lossy().as_ref()).await {
+                Ok(session) if session.source_integrity_failed => {
+                    // Explicit open still permits inspection of recovered rows. Automatic
+                    // continuation must choose a session whose next turn can be persisted.
+                    tracing::warn!(
+                        path = %entry.path.display(),
+                        "Skipping recovered read-only session while continuing"
+                    );
+                }
                 Ok(mut session) => {
                     session.session_dir = Some(base_dir.clone());
                     return Ok(Some((session, entry.path.clone())));
@@ -16402,6 +16410,36 @@ mod tests {
             Some(&resolved),
             "the path surfaces resolve must be the one continue_recent_in_dir opens"
         );
+
+        // This row is valid metadata for the index scanner but has no message
+        // payload. Explicit open recovers the intact rows and fences future saves.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&newer_path)
+            .expect("open newer session")
+            .write_all(b"{\"type\":\"message\"}\n")
+            .expect("append incomplete entry");
+        let damaged = std::fs::read(&newer_path).expect("read damaged file");
+        let mut recovered = run_async(Session::open(newer_path.to_str().expect("fixture path")))
+            .expect("damaged session remains available for inspection");
+        assert_eq!(recovered.to_messages().len(), 1);
+        assert!(run_async(recovered.save()).is_err());
+
+        let fallback = run_async(Session::recent_session_path_in_dir(Some(temp.path())))
+            .expect("resolve after recovery");
+        assert_eq!(fallback.as_deref(), older.path.as_deref());
+        let mut continued = run_async(Session::continue_recent_in_dir(
+            Some(temp.path()),
+            &Config::default(),
+        ))
+        .expect("continue a writable history");
+        assert_eq!(continued.path, fallback);
+        continued.append_message(make_test_message("after recovery"));
+        run_async(continued.save()).expect("save next turn");
+        assert_eq!(
+            std::fs::read(&newer_path).expect("read damaged source"),
+            damaged
+        );
     }
 
     fn attached_session_discovery_reopens_original_store(extension: &str, index_unavailable: bool) {
@@ -16957,14 +16995,19 @@ mod tests {
         index.index_session(&session).expect("index session");
         let cwd_display = session.header.cwd.clone();
 
-        std::fs::write(
-            &path,
-            format!(
-                "{}\n{{\"type\":\"message\"}}\n{{\"type\":\"message\"}}\n{{\"type\":\"session_info\",\"name\":\"Refreshed\"}}\n",
-                serde_json::to_string(&session.header).expect("serialize header"),
-            ),
-        )
-        .expect("rewrite session");
+        // Change the file without refreshing its cached metadata. The history
+        // must still contain valid entries so --continue can append to it.
+        session.append_message(make_test_message("second"));
+        session.append_session_info(Some("Refreshed".to_string()));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open saved session");
+        for entry in &session.entries[1..] {
+            serde_json::to_writer(&mut file, entry).expect("write entry");
+            file.write_all(b"\n").expect("terminate entry");
+        }
+        drop(file);
 
         let resumed = run_async(async {
             Session::continue_recent_in_dir(Some(temp.path()), &Config::default()).await
