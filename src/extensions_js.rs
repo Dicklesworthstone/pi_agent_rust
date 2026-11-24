@@ -15371,22 +15371,33 @@ export function createReadStream(path, opts) {
     : opts && typeof opts === "object" ? opts : {};
   const encoding = typeof options.encoding === "string" ? options.encoding : null;
   const highWaterMark = options.highWaterMark ?? 64 * 1024;
-  const start = options.start === undefined ? 0 : options.start;
+  const suppliedFd = options.fd ?? null;
+  const autoClose = options.autoClose ?? true;
+  const flags = options.flags ?? "r";
+  const mode = options.mode;
+  const start = options.start;
   const end = options.end === undefined ? Infinity : options.end;
-  if (!Number.isSafeInteger(start) || start < 0) {
+  if (suppliedFd !== null && (!Number.isSafeInteger(suppliedFd) || suppliedFd < 0)) {
+    throw new TypeError("read stream fd must be a nonnegative integer");
+  }
+  if (typeof autoClose !== "boolean") {
+    throw new TypeError("read stream autoClose must be a boolean");
+  }
+  if (start !== undefined && (!Number.isSafeInteger(start) || start < 0)) {
     throw new RangeError("read stream start must be a nonnegative safe integer");
   }
   if ((end !== Infinity && (!Number.isSafeInteger(end) || end < 0)) || end < start) {
     throw new RangeError("read stream end must be at least start or Infinity");
   }
 
-  // Capture authority and the uncollapsed path before deferred demand. The
-  // descriptor still rechecks owner/path authority on every subsequent read.
+  // Capture authority before deferred demand. Supplied descriptors ignore path,
+  // including its coercion; each pull rechecks descriptor and path authority.
   const owner = { extensionId: __pi_vfs.currentExtensionId() };
-  const sourcePath = __pi_vfs.absoluteInputPath(String(path ?? ""));
+  const sourcePath = suppliedFd === null ? __pi_vfs.absoluteInputPath(String(path ?? "")) : null;
   let ownedFd = null;
   let fdEntry = null;
-  let position = start;
+  let position = start ?? null;
+  let bytesRead = 0;
   const closeOwnedFd = () => {
     const fd = ownedFd;
     const entry = fdEntry;
@@ -15405,46 +15416,65 @@ export function createReadStream(path, opts) {
       try { stream.fd = null; } catch (_) {}
     }
   };
+
+  const pull = () => {
+    __pi_vfs.assertFdOwner(owner, "read");
+    if (ownedFd === null) {
+      ownedFd = openSync(sourcePath, flags, mode);
+      fdEntry = __pi_vfs.getFdEntry(ownedFd);
+      stream.fd = ownedFd;
+    }
+    if (__pi_vfs.fds.get(ownedFd) !== fdEntry || !fdEntry.readable) {
+      throw new Error(`EBADF: bad file descriptor, fd ${String(ownedFd)}`);
+    }
+    // Without start, end caps this stream's byte count and each read advances
+    // the shared cursor. With start, the inclusive range is file-relative.
+    const remaining = Math.max(0, fstatSync(ownedFd).size - (position ?? fdEntry.position));
+    const rangeRemaining = end - (position ?? bytesRead) + 1;
+    const length = Math.min(highWaterMark, rangeRemaining, remaining);
+    if (length <= 0) {
+      stream.push(null);
+      return;
+    }
+    const bytes = Buffer.alloc(length);
+    const count = readSync(ownedFd, bytes, 0, length, position);
+    if (position !== null) position += count;
+    bytesRead += count;
+    if (count > 0) stream.push(bytes.subarray(0, count));
+    if (count === 0 || count === rangeRemaining || count === remaining) stream.push(null);
+  };
+
   const stream = new Readable({
     encoding: encoding || undefined,
     highWaterMark,
+    autoDestroy: autoClose,
     read() {
       if (this.destroyed || this._readableState.ended) return;
-      __pi_vfs.assertFdOwner(owner, "read");
-      if (ownedFd === null) {
-        // The existing host bridge captures a bounded whole-file snapshot;
-        // demand controls when it is opened and how much reaches the queue.
-        ownedFd = openSync(sourcePath, "r");
-        fdEntry = __pi_vfs.getFdEntry(ownedFd);
-        this.fd = ownedFd;
+      try { pull(); }
+      catch (error) {
+        if (autoClose) throw error;
+        // Keep the descriptor available to the caller on a read failure.
+        // Explicit destruction, including iterator cancellation, still closes it.
+        this.emit("error", error);
       }
-      if (__pi_vfs.fds.get(ownedFd) !== fdEntry) {
-        throw new Error(`EBADF: bad file descriptor, fd ${String(ownedFd)}`);
-      }
-      const remaining = Math.max(0, fstatSync(ownedFd).size - position);
-      const length = Math.min(highWaterMark, end - position + 1, remaining);
-      if (length <= 0) {
-        this.push(null);
-        return;
-      }
-      const bytes = Buffer.alloc(length);
-      const count = readSync(ownedFd, bytes, 0, length, position);
-      position += count;
-      this.bytesRead += count;
-      // Readable owns cross-chunk decoding, pressure and the next pull.
-      if (count > 0) this.push(bytes.subarray(0, count));
-      if (count === 0 || position > end || count === remaining) this.push(null);
     },
     destroy(error, callback) {
-      // Teardown only releases an already owned virtual handle. A changed
-      // principal must not turn successful cleanup into a new read error.
       try { closeOwnedFd(); } catch (_) {}
       callback(error);
     },
   });
-  stream.path = __pi_vfs.normalizePath(sourcePath);
+  stream.path = sourcePath === null ? undefined : __pi_vfs.normalizePath(sourcePath);
   stream.fd = null;
-  stream.bytesRead = 0;
+  Object.defineProperty(stream, "bytesRead", { get: () => bytesRead });
+  if (suppliedFd !== null) {
+    // Claim only a descriptor belonging to this creator, including when the
+    // stream is destroyed before its first pull.
+    const entry = __pi_vfs.getFdEntry(suppliedFd);
+    __pi_vfs.assertFdOwner(entry, "read");
+    ownedFd = suppliedFd;
+    fdEntry = entry;
+    stream.fd = suppliedFd;
+  }
   return stream;
 }
 export function createWriteStream(path, opts) {
@@ -31555,8 +31585,8 @@ mod tests {
         // The existing bounded whole-file host snapshot is unchanged.
         (
             "node:fs",
-            92_779,
-            "6dab1836cdc391f53d1cc1c9a791421392c537c84601d51da4cccceef3cdf9e6",
+            93_895,
+            "2f584e06a06272daf6ef92cc781880122d3546ddd0a2fbe13245260b348850a9",
         ),
         (
             "@mariozechner/pi-ai",
@@ -47244,6 +47274,104 @@ globalThis.__spawn_abort_result = result;
             assert_eq!(result["shorthand"], json!("0Aé中😀Z9"));
             assert_eq!(result["largeMark"], json!("0Aé中😀Z9"));
             assert_eq!(result["invalidOptions"], json!(8));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_read_stream_preserves_descriptor_cursor_and_ownership() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let script = r"
+                globalThis.fsReadDescriptor = { done: false };
+                (async () => {
+                    const fs = await import('node:fs');
+                    const collect = async stream => {
+                        const chunks = [];
+                        for await (const chunk of stream) chunks.push(chunk);
+                        return Buffer.concat(chunks).toString();
+                    };
+                    const nextByte = fd => {
+                        const byte = Buffer.alloc(1);
+                        return fs.readSync(fd, byte, 0, 1, null) ? String(byte) : '';
+                    };
+                    const released = fd => {
+                        try { fs.fstatSync(fd); return false; }
+                        catch (error) { return String(error).includes('EBADF'); }
+                    };
+                    const result = {};
+                    let fd;
+                    await __pi_with_extension_async(__pi_test_secret, 'reader.a', async () => {
+                        fs.writeFileSync('/tmp/source', 'abcdefghi');
+                        fs.writeFileSync('/tmp/decoy', 'WRONG');
+                        fd = fs.openSync('/tmp/source', 'r');
+                        fs.readSync(fd, Buffer.alloc(3), 0, 3, null);
+                        const ranged = fs.createReadStream('/tmp/decoy', {
+                            fd, start: 1, end: 2, autoClose: false, highWaterMark: 1,
+                        });
+                        result.ranged = await collect(ranged);
+                        result.afterRange = nextByte(fd);
+                        const sequential = fs.createReadStream({
+                            toString() { throw new Error('supplied fd must ignore path'); }
+                        }, { fd, end: 1, autoClose: false, highWaterMark: 1 });
+                        result.sequential = await collect(sequential);
+                        result.bytesRead = sequential.bytesRead;
+                        result.afterSequential = nextByte(fd);
+                        result.retained = sequential.fd === fd && !sequential.closed;
+                        const pathStream = fs.createReadStream('/tmp/source', { autoClose: false });
+                        await collect(pathStream);
+                        result.pathRetained = fs.fstatSync(pathStream.fd).size === 9;
+                        const owned = pathStream.fd;
+                        pathStream.on('error', () => {});
+                        pathStream.destroy(new Error('cancel'));
+                        result.explicitlyReleased = released(owned);
+                    });
+                    await __pi_with_extension_async(__pi_test_secret, 'reader.b', async () => {
+                        try { fs.createReadStream('/tmp/decoy', { fd }); }
+                        catch (error) { result.foreignDenied = String(error).includes('host read denied'); }
+                    });
+                    await __pi_with_extension_async(__pi_test_secret, 'reader.a', async () => {
+                        result.afterForeign = nextByte(fd);
+                        fs.createReadStream(null, { fd }).destroy();
+                        result.cancelledBeforeRead = released(fd);
+                        const invalid = fs.openSync('/tmp/write-only', 'w');
+                        const failed = fs.createReadStream(null, { fd: invalid, autoClose: false });
+                        const error = new Promise(resolve => failed.once('error', resolve));
+                        failed.resume();
+                        result.readError = String(await error).includes('EBADF');
+                        result.canStillWrite = fs.writeSync(invalid, 'safe') === 4;
+                        fs.closeSync(invalid);
+                        const last = fs.openSync('/tmp/source', 'r');
+                        result.whole = await collect(fs.createReadStream(null, { fd: last }));
+                        result.closedAtEof = released(last);
+                    });
+                    globalThis.fsReadDescriptor = { done: true, ...result };
+                })().catch(error => { globalThis.fsReadDescriptor.error = String(error); });
+            ";
+            runtime
+                .eval(&privileged_test_script(&runtime, script))
+                .await
+                .expect("evaluate supplied file descriptors");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsReadDescriptor").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["ranged"], json!("bc"));
+            assert_eq!(result["afterRange"], json!("d"));
+            assert_eq!(result["sequential"], json!("ef"));
+            assert_eq!(result["bytesRead"], json!(2));
+            assert_eq!(result["afterSequential"], json!("g"));
+            assert_eq!(result["retained"], json!(true));
+            assert_eq!(result["pathRetained"], json!(true));
+            assert_eq!(result["explicitlyReleased"], json!(true));
+            assert_eq!(result["foreignDenied"], json!(true));
+            assert_eq!(result["afterForeign"], json!("h"));
+            assert_eq!(result["cancelledBeforeRead"], json!(true));
+            assert_eq!(result["readError"], json!(true));
+            assert_eq!(result["canStillWrite"], json!(true));
+            assert_eq!(result["whole"], json!("abcdefghi"));
+            assert_eq!(result["closedAtEof"], json!(true));
         });
     }
 
