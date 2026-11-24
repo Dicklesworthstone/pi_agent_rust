@@ -284,7 +284,10 @@ mod tests {
             json!("tool_calls"),
         );
         process_response(&mut state, &serde_json::to_vec(&body).unwrap()).unwrap();
-        assert!(matches!(state.pending_events.front(), Some(StreamEvent::Start { .. })));
+        assert!(matches!(
+            state.pending_events.front(),
+            Some(StreamEvent::Start { .. })
+        ));
         assert_eq!(tool_ends(&state), 2);
         let message = finish(&state);
         assert_eq!(message.stop_reason, StopReason::ToolUse);
@@ -341,11 +344,13 @@ mod tests {
             body["choices"] = Value::Array(
                 indices
                     .into_iter()
-                    .map(|index| json!({
-                        "index": index,
-                        "message": {"tool_calls": [call("untrusted", "{}")]},
-                        "finish_reason": "tool_calls"
-                    }))
+                    .map(|index| {
+                        json!({
+                            "index": index,
+                            "message": {"tool_calls": [call("untrusted", "{}")]},
+                            "finish_reason": "tool_calls"
+                        })
+                    })
                     .collect(),
             );
             process_response(&mut state, &serde_json::to_vec(&body).unwrap()).unwrap();
@@ -361,10 +366,19 @@ mod tests {
     #[test]
     fn completion_never_completes_invalid_or_truncated_tool_batches() {
         let cases = [
-            (vec![call("a", r#"{"path":"unfinished"#)], json!("tool_calls")),
-            (vec![call("a", r#"{"path":"a","path":"b"}"#)], json!("tool_calls")),
+            (
+                vec![call("a", r#"{"path":"unfinished"#)],
+                json!("tool_calls"),
+            ),
+            (
+                vec![call("a", r#"{"path":"a","path":"b"}"#)],
+                json!("tool_calls"),
+            ),
             (vec![call("a", "[]")], json!("tool_calls")),
-            (vec![call("same", "{}"), call("same", "{}")], json!("tool_calls")),
+            (
+                vec![call("same", "{}"), call("same", "{}")],
+                json!("tool_calls"),
+            ),
             (vec![call("", "{}")], json!("tool_calls")),
             (vec![call("a", "{}")], Value::Null),
             (vec![call("a", "{}")], json!("length")),
@@ -414,7 +428,11 @@ mod tests {
             let message = finish(&state);
             assert_eq!(
                 message.stop_reason,
-                if reason.is_null() { StopReason::Error } else { StopReason::Refusal }
+                if reason.is_null() {
+                    StopReason::Error
+                } else {
+                    StopReason::Refusal
+                }
             );
             assert!(matches!(message.content.as_slice(),
                 [ContentBlock::Text(text)] if text.text == "Cannot do that."));
@@ -449,7 +467,10 @@ mod tests {
         process_response(&mut state, &serde_json::to_vec(&body).unwrap()).unwrap();
         let result = finish(&state);
         assert_eq!(result.stop_reason, StopReason::Error);
-        assert_eq!(result.error_message.as_deref(), Some("Provider rejected the request."));
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("Provider rejected the request.")
+        );
         assert!((result.usage.cost.total - 0.25).abs() < f64::EPSILON);
         assert_eq!(tool_ends(&state), 0);
     }
@@ -479,7 +500,10 @@ mod tests {
             panic!("missing replayable thinking block");
         };
         assert_eq!(thinking.thinking, "Inspect the file.");
-        let signature = thinking.thinking_signature.as_ref().expect("opaque continuation");
+        let signature = thinking
+            .thinking_signature
+            .as_ref()
+            .expect("opaque continuation");
         assert!(signature.contains("opaque-continuation"));
         assert!(signature.contains("signed-state"));
         assert!(!thinking.thinking.contains("opaque-continuation"));

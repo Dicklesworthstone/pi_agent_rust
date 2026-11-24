@@ -37968,7 +37968,11 @@ globalThis.fetchUploadState = {
                 .expect("evaluate multipart upload");
             let requests = runtime.drain_hostcall_requests();
             assert_eq!(requests.len(), 3);
-            assert!(requests.iter().all(|request| matches!(&request.kind, HostcallKind::Http)));
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| matches!(&request.kind, HostcallKind::Http))
+            );
             let payload = &requests[0].payload;
             assert_eq!(payload["method"], "POST");
             assert_eq!(payload["headers"]["x-test"], "kept");
@@ -38196,7 +38200,11 @@ return checks;
             drain_until_idle(&runtime, &clock).await;
             let result = get_global_json(&runtime, "fetchRejectedBodyFixture").await;
             assert_eq!(result["done"], serde_json::json!(true), "{result}");
-            assert_eq!(result["checks"].as_array().map(Vec::len), Some(9), "{result}");
+            assert_eq!(
+                result["checks"].as_array().map(Vec::len),
+                Some(9),
+                "{result}"
+            );
             assert!(
                 runtime.drain_hostcall_requests().is_empty(),
                 "invalid or cancelled uploads must not enter the native HTTP queue"
@@ -50635,7 +50643,7 @@ globalThis.fsWriteStorage = { done: false };
         });
     }
 
-    const WEB_STREAM_TEST_HELPERS: &str = r#"
+    const WEB_STREAM_TEST_HELPERS: &str = r"
 const checks = [];
 const check = (condition, label) => { if (!condition) throw new Error(label); checks.push(label); };
 const tick = async (n = 24) => { for (let i = 0; i < n; i++) await Promise.resolve(); };
@@ -50656,7 +50664,7 @@ const rejectsWith = async (promise, reason, label) => {
     check(!result.ok && result.error === reason, label);
 };
 const defer = () => { let resolve, reject; const promise = new Promise((a,b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
-"#;
+";
 
     fn assert_web_stream_fixture(source: &str, expected_checks: usize) {
         futures::executor::block_on(async {
@@ -50690,7 +50698,7 @@ const defer = () => { let resolve, reject; const promise = new Promise((a,b) => 
     #[allow(clippy::too_many_lines)]
     fn pijs_web_writable_preserves_order_backpressure_and_abort() {
         assert_web_stream_fixture(
-            r#"
+            r"
 const start = defer();
 const first = defer();
 const calls = [];
@@ -50780,7 +50788,7 @@ reentrantWriter = reentrant.getWriter();
 check(!(await settle(reentrantWriter.write('x'), 'reentrant size')).ok, 'size callback cannot enqueue after reentrant close');
 await success(reentrantWriter.closed, 'reentrant close completes');
 return checks;
-"#,
+",
             23,
         );
     }
@@ -50789,7 +50797,7 @@ return checks;
     #[allow(clippy::too_many_lines)]
     fn pijs_web_pipes_own_locks_cancellation_and_pending_io() {
         assert_web_stream_fixture(
-            r#"
+            r"
 const buffered = new ReadableStream({ start(controller) { controller.enqueue(1); controller.enqueue(2); controller.close(); } });
 const bufferedReader = buffered.getReader();
 let readerClosed = false;
@@ -50968,7 +50976,7 @@ syntheticController.abort(authenticReason);
 await rejectsWith(syntheticPipe, authenticReason, 'synthetic event cannot consume the real abort listener');
 check(syntheticCancels === 1 && syntheticAborts === 1 && !syntheticSource.locked && !syntheticSink.locked, 'authentic abort still owns endpoint cleanup once');
 return checks;
-"#,
+",
             56,
         );
     }
@@ -50977,7 +50985,7 @@ return checks;
     #[allow(clippy::too_many_lines)]
     fn pijs_web_transforms_propagate_demand_callbacks_and_failures() {
         assert_web_stream_fixture(
-            r#"
+            r"
 const transformStart = defer(), transformGate = defer();
 let transforms = 0, flushes = 0;
 const transform = new TransformStream({
@@ -51101,7 +51109,7 @@ for (const create of [
     check(rejected, 'unsupported mode or invalid callback fails explicitly ' + checks.length);
 }
 return checks;
-"#,
+",
             32,
         );
     }
@@ -51110,7 +51118,7 @@ return checks;
     #[allow(clippy::too_many_lines)]
     fn pijs_web_text_streams_preserve_split_unicode_and_errors() {
         assert_web_stream_fixture(
-            r#"
+            r"
 const decode = async (chunks, options) => {
     const output = [];
     const decoder = new TextDecoderStream('utf-8', options);
@@ -51152,7 +51160,7 @@ const bytes = new ByteLengthQueuingStrategy({ highWaterMark: 12 });
 check(count.highWaterMark === 4 && count.size('anything') === 1, 'count strategy measures chunks');
 check(bytes.highWaterMark === 12 && bytes.size(Uint8Array.of(1,2,3)) === 3, 'byte strategy measures bytes');
 return checks;
-"#,
+",
             13,
         );
     }

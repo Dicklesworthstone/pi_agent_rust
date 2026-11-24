@@ -242,11 +242,7 @@ impl HubLease {
 
     /// Recheck under the same lock as kill after OS spawn. A cancellation
     /// between preparation and activation never resurrects this task.
-    pub(super) fn mark_correction_running(
-        &self,
-        pid: u32,
-        result: &mut SubagentResult,
-    ) -> bool {
+    pub(super) fn mark_correction_running(&self, pid: u32, result: &mut SubagentResult) -> bool {
         if result.is_error {
             return false;
         }

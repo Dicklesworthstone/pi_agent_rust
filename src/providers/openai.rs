@@ -746,8 +746,7 @@ impl OpenAIProvider {
     }
 
     fn validate_response_mode(&self, body: &serde_json::Value) -> Result<()> {
-        if body.get("stream").and_then(serde_json::Value::as_bool)
-            != Some(self.streams_responses())
+        if body.get("stream").and_then(serde_json::Value::as_bool) != Some(self.streams_responses())
         {
             return Err(Error::validation(
                 "OpenAI request must preserve the configured streaming mode",
@@ -6374,7 +6373,10 @@ mod tests {
 
     #[test]
     fn compat_non_streaming_uses_json_transport_and_preserves_tool_usage() {
-        for content_type in ["application/json; charset=utf-8", "application/vnd.api+json"] {
+        for content_type in [
+            "application/json; charset=utf-8",
+            "application/vnd.api+json",
+        ] {
             let body = json!({
                 "choices": [{
                     "index": 0,
@@ -6429,7 +6431,10 @@ mod tests {
                         && call.id == "search-1"
                         && call.arguments == json!({"query": "Rust"})));
             let request = rx.recv_timeout(Duration::from_secs(5)).expect("request");
-            assert_eq!(request.headers.get("accept").map(String::as_str), Some("application/json"));
+            assert_eq!(
+                request.headers.get("accept").map(String::as_str),
+                Some("application/json")
+            );
             let request: serde_json::Value = serde_json::from_str(&request.body).unwrap();
             assert_eq!(request["stream"], false);
             assert!(request.get("stream_options").is_none());
@@ -6498,7 +6503,11 @@ mod tests {
             .expect("non-streaming audio body");
         assert_eq!(body["stream"], false);
         assert!(body.get("stream_options").is_none());
-        assert!(provider.validate_audio_request(&body).expect("priced audio"));
+        assert!(
+            provider
+                .validate_audio_request(&body)
+                .expect("priced audio")
+        );
 
         let mut rewritten = body;
         rewritten["stream"] = json!(true);
@@ -6566,14 +6575,12 @@ mod tests {
             let (base_url, server) = spawn_completion_test_response(body, length, true);
             let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
             let provider = crate::provider::guard_with_cost_budget(
-                std::sync::Arc::new(
-                    audio_test_provider()
-                        .with_base_url(base_url)
-                        .with_compat(Some(CompatConfig {
-                            supports_streaming: Some(false),
-                            ..Default::default()
-                        })),
-                ),
+                std::sync::Arc::new(audio_test_provider().with_base_url(base_url).with_compat(
+                    Some(CompatConfig {
+                        supports_streaming: Some(false),
+                        ..Default::default()
+                    }),
+                )),
                 budget.clone(),
             );
             let context = audio_test_context(vec![audio_test_media("YQ==", "audio/wav")]);
@@ -6585,7 +6592,10 @@ mod tests {
             runtime.block_on(async {
                 let mut events = provider.stream(&context, &options).await.unwrap();
                 if read_first_event {
-                    assert!(matches!(events.next().await, Some(Ok(StreamEvent::Start { .. }))));
+                    assert!(matches!(
+                        events.next().await,
+                        Some(Ok(StreamEvent::Start { .. }))
+                    ));
                 }
                 drop(events);
             });

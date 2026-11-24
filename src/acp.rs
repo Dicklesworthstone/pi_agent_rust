@@ -1108,8 +1108,13 @@ async fn run_stdio_inner(options: AcpOptions, shutdown: Option<AbortSignal>) -> 
         let _ = writer_done_tx.send(result);
     });
 
-    let result =
-        Box::pin(run_with_input(options, AcpInput::Stdio(in_rx), out_tx, shutdown)).await;
+    let result = Box::pin(run_with_input(
+        options,
+        AcpInput::Stdio(in_rx),
+        out_tx,
+        shutdown,
+    ))
+    .await;
     // Prompt settlement can leave final frames queued. The process must keep
     // running until stdout flushes them, or report that delivery is incomplete.
     // A blocked OS write cannot be joined safely on an async worker.
@@ -1171,7 +1176,13 @@ async fn run(
     in_rx: asupersync::channel::mpsc::Receiver<String>,
     out_tx: AcpOutput,
 ) -> Result<()> {
-    Box::pin(run_with_input(options, AcpInput::Lines(in_rx), out_tx, None)).await
+    Box::pin(run_with_input(
+        options,
+        AcpInput::Lines(in_rx),
+        out_tx,
+        None,
+    ))
+    .await
 }
 
 /// Core ACP event loop, including ordered stdin failures and owner cleanup.
@@ -5897,7 +5908,9 @@ mod tests {
             );
             // Delay the native turn's actual persistence, not just the prompt
             // guard: a shutdown that merely signals abort must remain pending.
-            let saving = OwnedMutexGuard::lock(Arc::clone(&stored), &cx).await.unwrap();
+            let saving = OwnedMutexGuard::lock(Arc::clone(&stored), &cx)
+                .await
+                .unwrap();
             let path = saving.path.clone().unwrap();
             let (shutdown, requested) = AbortHandle::new();
             let mut dispatch = Box::pin(run_with_input(

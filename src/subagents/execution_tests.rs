@@ -637,7 +637,11 @@ fi
     ] {
         assert!(arguments.contains(&required), "missing {required}");
     }
-    for forbidden in ["--skill", "--workspace-roots-file", "--append-system-prompt"] {
+    for forbidden in [
+        "--skill",
+        "--workspace-roots-file",
+        "--append-system-prompt",
+    ] {
         assert!(!arguments.contains(&forbidden), "leaked {forbidden}");
     }
     let correction_system =
@@ -645,7 +649,8 @@ fi
     assert!(correction_system.starts_with(SCHEMA_CORRECTION_SYSTEM_PROMPT));
     assert!(!correction_system.contains("Original profile instructions"));
     assert!(!correction_system.contains("Original skill instructions"));
-    let correction_input = std::fs::read_to_string(tool.global_dir.join("correction-input")).unwrap();
+    let correction_input =
+        std::fs::read_to_string(tool.global_dir.join("correction-input")).unwrap();
     let correction: Value =
         serde_json::from_str(correction_input.strip_prefix("Task: ").unwrap()).unwrap();
     assert_eq!(correction["previousOutput"], r#"{"count":1,}"#);
@@ -763,7 +768,8 @@ fi
         "launched\nlaunched\n"
     );
     let correction = std::fs::read_to_string(root.path().join("corrective-task")).unwrap();
-    let correction: Value = serde_json::from_str(correction.strip_prefix("Task: ").unwrap()).unwrap();
+    let correction: Value =
+        serde_json::from_str(correction.strip_prefix("Task: ").unwrap()).unwrap();
     assert_eq!(correction["previousOutput"], invalid);
     let errors = correction["validationErrors"].as_array().unwrap();
     assert_eq!(errors.len(), 1);
@@ -3224,7 +3230,10 @@ fn hub_revival_keeps_schema_isolation_and_authored_task_across_corrective_retry(
     let retry_source = {
         let registry = crate::agent_hub::registry().lock().expect("hub registry"); // ubs:ignore: native replay-policy oracle
         let retry = registry.native_revival_source(retry_id)?;
-        assert_eq!(retry.entry.revived_from.as_deref(), Some(source.id.as_str()));
+        assert_eq!(
+            retry.entry.revived_from.as_deref(),
+            Some(source.id.as_str())
+        );
         assert_eq!(
             registry.get(&source.id).expect("original source").status,
             crate::agent_hub::ChildStatus::Done

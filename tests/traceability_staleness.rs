@@ -22,9 +22,11 @@ const PROVIDER_SUPPORT_MODULES: &[&str] = &[
     "model_fetch",
     "azure_terminal_safety_tests",
     "openai_terminal_safety_tests",
+    "openai_completion",
     "openai_deepseek",
     "openai_deepseek_tests",
     "openai_openrouter",
+    "openai_responses_complete",
     "tool_schema",
 ];
 const REQUIRED_ARTIFACT_INVENTORY_AREAS: &[&str] = &[

@@ -1760,7 +1760,9 @@ fn corrective_retry_task(
             validation_errors: errors,
         },
     )
-    .map_err(|_| "PI_SUBAGENT_TASK_LIMIT: complete schema correction exceeds the task byte limit")?;
+    .map_err(
+        |_| "PI_SUBAGENT_TASK_LIMIT: complete schema correction exceeds the task byte limit",
+    )?;
     String::from_utf8(prompt.bytes)
         .map_err(|_| "PI_SUBAGENT_SCHEMA_OUTPUT: correction must contain valid UTF-8")
 }

@@ -1981,8 +1981,10 @@ where
         // Completed argument JSON alone cannot authorize execution. In
         // particular, the shared Agent accepts calls on Length as well as
         // ToolUse, so preserve partial content as an Error on this boundary.
-        if matches!(&outcome, ResponseOutcome::Incomplete(_) | ResponseOutcome::Refusal)
-            && self.partial_has_tool_call()
+        if matches!(
+            &outcome,
+            ResponseOutcome::Incomplete(_) | ResponseOutcome::Refusal
+        ) && self.partial_has_tool_call()
         {
             self.reject_tool_response(
                 if matches!(&outcome, ResponseOutcome::Refusal) {
@@ -3054,9 +3056,8 @@ mod tests {
             "model": "gpt-5.2-codex",
             "input": [],
         });
-        let accepted =
-            validate_rewritten_responses_request(missing_stream, true)
-                .expect("missing stream accepted");
+        let accepted = validate_rewritten_responses_request(missing_stream, true)
+            .expect("missing stream accepted");
         assert_eq!(accepted["stream"], serde_json::Value::Bool(true));
 
         for (label, invalid) in [

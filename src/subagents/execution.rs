@@ -467,7 +467,10 @@ impl ChildRunner {
             retry.result.is_error = true;
             retry.result.error = Some(format!(
                 "Schema-only correction failed: {}",
-                repaired.error.as_deref().unwrap_or("child execution failed")
+                repaired
+                    .error
+                    .as_deref()
+                    .unwrap_or("child execution failed")
             ));
             append_bounded_line(&mut retry.result.stderr, &repaired.stderr);
             return retry.defer(owner, false, update).await;

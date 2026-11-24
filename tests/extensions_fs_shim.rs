@@ -2256,7 +2256,13 @@ fn fs_watch_file_validates_options_and_bounds_watchers_and_listeners() {
                     listener: refused(() => fs.watchFile('/options', {})),
                     unwatchListener: refused(() => fs.unwatchFile('/options', false)),
                 };
-                try { fs.watch('/options'); } catch (error) { watchValidation.native = error.code === 'ERR_FEATURE_UNAVAILABLE'; }
+                try { fs.watch('/options', { recursive: true }); } catch (error) { watchValidation.recursiveUnavailable = error.code === 'ERR_FEATURE_UNAVAILABLE'; }
+                try { fs.watch('/options'); } catch (error) { watchValidation.missingEnoent = error.code === 'ENOENT'; }
+                fs.writeFileSync('/options', 'ok');
+                const shallowWatch = fs.watch('/options');
+                watchValidation.shallowWatch = typeof shallowWatch.close === 'function';
+                shallowWatch.close();
+                fs.unlinkSync('/options');
                 const watcher = fs.watchFile('/bounded-0', () => {});
                 for (let index = 1; index < 32; index++) watcher.on('change', () => {});
                 watchValidation.listenerLimit = refused(() => watcher.on('change', () => {}));
@@ -2267,7 +2273,7 @@ fn fs_watch_file_validates_options_and_bounds_watchers_and_listeners() {
             });
         "#).await.unwrap();
         let checks = runtime.read_global_json("watchValidation").await.unwrap();
-        assert_eq!(checks.as_object().unwrap().len(), 10);
+        assert_eq!(checks.as_object().unwrap().len(), 12);
         for (name, check) in checks.as_object().unwrap() {
             assert_eq!(check, &serde_json::Value::Bool(true), "{name}: {checks}");
         }

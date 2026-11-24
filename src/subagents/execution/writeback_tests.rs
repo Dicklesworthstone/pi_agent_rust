@@ -137,7 +137,10 @@ fn interrupted_schema_repair_reaps_child_and_preserves_unapplied_original_worktr
                     futures::poll!(&mut running).is_pending(),
                     "{interruption}: run settled before its schema-only repair started"
                 );
-                assert!(Instant::now() < deadline, "schema-only repair never started");
+                assert!(
+                    Instant::now() < deadline,
+                    "schema-only repair never started"
+                );
                 poll_pause(&owner).await;
             }
             let original_id = fs::read_to_string(runner.global_dir.join("original.hub"))
@@ -164,10 +167,7 @@ fn interrupted_schema_repair_reaps_child_and_preserves_unapplied_original_worktr
                 .unwrap();
             {
                 let hub = registry().lock().unwrap();
-                assert_eq!(
-                    hub.get(&original_id).unwrap().status,
-                    ChildStatus::Running
-                );
+                assert_eq!(hub.get(&original_id).unwrap().status, ChildStatus::Running);
                 assert_eq!(hub.control_pid(&original_id), Some(pid));
             }
             assert_eq!(

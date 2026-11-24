@@ -62,7 +62,9 @@ fn reject(state: &mut CompleteState, message: &str) {
 #[allow(clippy::too_many_lines)] // Keep whole-response acceptance and billing together.
 fn process_response(state: &mut CompleteState, body: &[u8]) -> Result<()> {
     if body.len() > MAX_RESPONSE_BYTES {
-        return Err(Error::api("OpenAI Responses JSON exceeds the 8 MiB body limit"));
+        return Err(Error::api(
+            "OpenAI Responses JSON exceeds the 8 MiB body limit",
+        ));
     }
     let response: CompleteResponse = serde_json::from_slice(body).map_err(|error| {
         Error::api(format!(
@@ -80,7 +82,11 @@ fn process_response(state: &mut CompleteState, body: &[u8]) -> Result<()> {
         reject(state, "duplicate or ambiguous JSON object keys");
         return Ok(());
     }
-    if response.object.as_deref().is_some_and(|object| object != "response") {
+    if response
+        .object
+        .as_deref()
+        .is_some_and(|object| object != "response")
+    {
         reject(state, "unexpected response object type");
         return Ok(());
     }
@@ -135,12 +141,9 @@ fn process_response(state: &mut CompleteState, body: &[u8]) -> Result<()> {
     let mut parts = 0;
     let mut refused = false;
     for (index, raw) in output.iter().enumerate() {
-        let item: CompleteItem = match serde_json::from_value(raw.clone()) {
-            Ok(item) => item,
-            Err(_) => {
-                reject(state, "malformed or unsupported output item");
-                return Ok(());
-            }
+        let Ok(item) = serde_json::from_value::<CompleteItem>(raw.clone()) else {
+            reject(state, "malformed or unsupported output item");
+            return Ok(());
         };
         // IDs are copied into every content-part key and replay signature.
         // Bound them before those copies, using the same limit as input replay.
@@ -148,12 +151,16 @@ fn process_response(state: &mut CompleteState, body: &[u8]) -> Result<()> {
             || item.id().len() > MAX_RESPONSES_ITEM_ID_LEN
             || !ids.insert(item.id().to_string())
         {
-            reject(state, "output item identity is empty, oversized or duplicated");
+            reject(
+                state,
+                "output item identity is empty, oversized or duplicated",
+            );
             return Ok(());
         }
-        if item.status().is_some_and(|status| {
-            status != "completed" && !(incomplete && status == "incomplete")
-        }) {
+        if item
+            .status()
+            .is_some_and(|status| status != "completed" && !(incomplete && status == "incomplete"))
+        {
             reject(state, "output item has a nonterminal status");
             return Ok(());
         }
@@ -163,7 +170,9 @@ fn process_response(state: &mut CompleteState, body: &[u8]) -> Result<()> {
             return Ok(());
         }
         match item {
-            CompleteItem::Message { id, role, content, .. } => {
+            CompleteItem::Message {
+                id, role, content, ..
+            } => {
                 if role != "assistant" {
                     reject(state, "output message does not have the assistant role");
                     return Ok(());
@@ -180,7 +189,13 @@ fn process_response(state: &mut CompleteState, body: &[u8]) -> Result<()> {
                 }
                 state.capture_message_item_id(&id);
             }
-            CompleteItem::Reasoning { id, summary, content, encrypted_content, .. } => {
+            CompleteItem::Reasoning {
+                id,
+                summary,
+                content,
+                encrypted_content,
+                ..
+            } => {
                 for (index, part) in summary.into_iter().enumerate() {
                     state.apply_reasoning_snapshot(
                         ReasoningKind::Summary,
@@ -199,9 +214,21 @@ fn process_response(state: &mut CompleteState, body: &[u8]) -> Result<()> {
                 }
                 state.capture_reasoning_item(&id, encrypted_content.as_deref(), "", raw);
             }
-            CompleteItem::FunctionCall { id, call_id, name, arguments, status } => {
-                if status.as_deref().is_some_and(|status| status != "completed") {
-                    reject(state, "function call was not completed; local tool calls withheld");
+            CompleteItem::FunctionCall {
+                id,
+                call_id,
+                name,
+                arguments,
+                status,
+            } => {
+                if status
+                    .as_deref()
+                    .is_some_and(|status| status != "completed")
+                {
+                    reject(
+                        state,
+                        "function call was not completed; local tool calls withheld",
+                    );
                     return Ok(());
                 }
                 if !state.admit_tool_event(
@@ -220,14 +247,19 @@ fn process_response(state: &mut CompleteState, body: &[u8]) -> Result<()> {
         }
     }
     if refused && state.partial_has_tool_call() {
-        reject(state, "refusal combined with function calls; local tool calls withheld");
+        reject(
+            state,
+            "refusal combined with function calls; local tool calls withheld",
+        );
         return Ok(());
     }
-    state.finish(if refused && matches!(&outcome, ResponseOutcome::Completed) {
-        ResponseOutcome::Refusal
-    } else {
-        outcome
-    });
+    state.finish(
+        if refused && matches!(&outcome, ResponseOutcome::Completed) {
+            ResponseOutcome::Refusal
+        } else {
+            outcome
+        },
+    );
     Ok(())
 }
 
@@ -295,9 +327,9 @@ impl CompleteItem {
     fn part_count(&self) -> usize {
         match self {
             Self::Message { content, .. } => content.len(),
-            Self::Reasoning { summary, content, .. } => {
-                summary.len() + content.as_ref().map_or(0, Vec::len)
-            }
+            Self::Reasoning {
+                summary, content, ..
+            } => summary.len() + content.as_ref().map_or(0, Vec::len),
             Self::FunctionCall { .. } => 1,
         }
     }
@@ -394,15 +426,21 @@ mod tests {
     }
 
     fn tool_ends(state: &CompleteState) -> usize {
-        state.pending_events.iter().filter(|event| {
-            matches!(event, StreamEvent::ToolCallEnd { .. })
-        }).count()
+        state
+            .pending_events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+            .count()
     }
 
     fn assert_rejected_with_usage(state: &CompleteState) {
         let message = terminal(state);
         assert_eq!(message.stop_reason, StopReason::Error);
-        assert_eq!(tool_ends(state), 0, "no sibling may authorize a local effect");
+        assert_eq!(
+            tool_ends(state),
+            0,
+            "no sibling may authorize a local effect"
+        );
         assert_eq!(message.usage.input, 75);
         assert_eq!(message.usage.cache_read, 25);
         assert_eq!(message.usage.output, 20);
@@ -418,13 +456,17 @@ mod tests {
             "encrypted_content": "opaque-continuation"
         });
         let body = reply(json!([
-            reasoning.clone(), text_item(),
+            reasoning.clone(),
+            text_item(),
             call("fc_1", "call_1", r#"{"path":"a.rs"}"#),
             call("fc_2", "call_2", r#"{"path":"b.rs"}"#)
         ]));
         let mut state = state();
         process_response(&mut state, &serde_json::to_vec(&body).unwrap()).unwrap();
-        assert!(matches!(state.pending_events.front(), Some(StreamEvent::Start { .. })));
+        assert!(matches!(
+            state.pending_events.front(),
+            Some(StreamEvent::Start { .. })
+        ));
         assert_eq!(tool_ends(&state), 2);
         let message = terminal(&state);
         assert_eq!(message.stop_reason, StopReason::ToolUse);
@@ -457,11 +499,17 @@ mod tests {
     #[test]
     fn complete_response_keeps_summary_only_and_opaque_only_reasoning() {
         for (item, expected) in [
-            (json!({"type":"reasoning", "id":"rs_1", "summary":[
-                {"type":"summary_text", "text":"A useful summary."}
-            ]}), "A useful summary."),
-            (json!({"type":"reasoning", "id":"rs_1", "summary":[],
-                "encrypted_content":"opaque-only"}), ""),
+            (
+                json!({"type":"reasoning", "id":"rs_1", "summary":[
+                    {"type":"summary_text", "text":"A useful summary."}
+                ]}),
+                "A useful summary.",
+            ),
+            (
+                json!({"type":"reasoning", "id":"rs_1", "summary":[],
+                "encrypted_content":"opaque-only"}),
+                "",
+            ),
         ] {
             let mut state = state();
             let body = reply(json!([item.clone(), text_item()]));
@@ -473,7 +521,8 @@ mod tests {
             };
             assert_eq!(thinking.thinking, expected);
             assert_eq!(
-                serde_json::from_str::<Value>(thinking.thinking_signature.as_deref().unwrap()).unwrap(),
+                serde_json::from_str::<Value>(thinking.thinking_signature.as_deref().unwrap())
+                    .unwrap(),
                 item
             );
         }
@@ -513,7 +562,14 @@ mod tests {
 
     #[test]
     fn complete_response_terminal_metadata_never_authorizes_unfinished_tools() {
-        for status in ["incomplete", "failed", "cancelled", "queued", "in_progress", "unknown"] {
+        for status in [
+            "incomplete",
+            "failed",
+            "cancelled",
+            "queued",
+            "in_progress",
+            "unknown",
+        ] {
             let mut state = state();
             let mut body = reply(json!([call("fc_1", "call_1", "{}")]));
             body["status"] = json!(status);
@@ -617,14 +673,16 @@ mod tests {
         }
         let mut oversized = state();
         let error = process_response(&mut oversized, &vec![b' '; MAX_RESPONSE_BYTES + 1])
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("8 MiB"));
         assert!(oversized.pending_events.is_empty());
 
         let too_many_items = reply(json!(vec![text_item(); MAX_OUTPUT_ITEMS + 1]));
         let mut too_many_parts = reply(json!([text_item()]));
         too_many_parts["output"][0]["content"] = json!(vec![
-            json!({"type":"output_text", "text":"x"}); MAX_OUTPUT_PARTS + 1
+            json!({"type":"output_text", "text":"x"});
+            MAX_OUTPUT_PARTS + 1
         ]);
         for body in [too_many_items, too_many_parts] {
             let mut state = state();
@@ -643,16 +701,26 @@ mod tests {
         ] {
             item["id"] = json!("x".repeat(MAX_RESPONSES_ITEM_ID_LEN));
             let mut accepted = state();
-            process_response(&mut accepted, &serde_json::to_vec(&reply(json!([item.clone()]))).unwrap())
-                .unwrap();
+            process_response(
+                &mut accepted,
+                &serde_json::to_vec(&reply(json!([item.clone()]))).unwrap(),
+            )
+            .unwrap();
             assert_eq!(terminal(&accepted).stop_reason, StopReason::Stop);
 
             item["id"] = json!("x".repeat(MAX_RESPONSES_ITEM_ID_LEN + 1));
             let mut rejected = state();
-            process_response(&mut rejected, &serde_json::to_vec(&reply(json!([item]))).unwrap())
-                .unwrap();
+            process_response(
+                &mut rejected,
+                &serde_json::to_vec(&reply(json!([item]))).unwrap(),
+            )
+            .unwrap();
             assert_rejected_with_usage(&rejected);
-            assert_eq!(rejected.pending_events.len(), 2, "reject before cloning per-part IDs");
+            assert_eq!(
+                rejected.pending_events.len(),
+                2,
+                "reject before cloning per-part IDs"
+            );
             assert!(terminal(&rejected).content.is_empty());
         }
     }
