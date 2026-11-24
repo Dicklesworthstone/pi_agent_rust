@@ -109,8 +109,12 @@ fn workspace_grants_are_frozen_through_queue_retry_and_revival_then_stay_revoked
     let canonical = crate::extensions::safe_canonicalize(additional.path());
     let expected = json!([canonical]);
     let manifests = std::fs::read_to_string(root.path().join("root-manifests"))
-        .expect("three actual child manifests");
-    assert_eq!(manifests.lines().count(), 3);
+        .expect("original and explicitly revived child manifests");
+    assert_eq!(
+        manifests.lines().count(),
+        2,
+        "schema-only correction must not inherit workspace access"
+    );
     for line in manifests.lines() {
         let value: Value = serde_json::from_str(line).expect("bounded JSON manifest");
         assert_eq!(value["roots"], expected);
@@ -328,7 +332,7 @@ fn large_definition_and_schema_use_a_frozen_prompt_file_for_each_native_retry()
 printf '%s\n' "$@" >> arguments
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --append-system-prompt)
+        --append-system-prompt|--system-prompt)
             shift
             test -f "$1"
             printf '%s\n' "$1" >> prompt-paths
@@ -365,13 +369,16 @@ fi
     assert!(!output.is_error, "{output:?}");
     assert_eq!(result(&output)["schemaRetries"], 1);
     assert_eq!(result(&output)["data"], json!({"accepted":true}));
-    let expected = format!(
+    let original_prompt = format!(
         "{}\n\nYour final answer MUST be a single JSON value matching this JSON Schema (no prose, no code fences):\n{schema}",
         body.trim(),
     );
+    let correction_prompt = format!(
+        "{SCHEMA_CORRECTION_SYSTEM_PROMPT}\n\nYour final answer MUST be a single JSON value matching this JSON Schema (no prose, no code fences):\n{schema}"
+    );
     assert_eq!(
         std::fs::read_to_string(root.path().join("system-instructions-used"))?,
-        expected.repeat(2)
+        format!("{original_prompt}{correction_prompt}")
     );
     let arguments = std::fs::read_to_string(root.path().join("arguments"))?;
     assert!(!arguments.contains("Full definition."));
@@ -529,6 +536,131 @@ fn oversized_inline_chain_expansion_preserves_prior_results_without_a_second_lau
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Assert process identity, cost channel and instruction isolation together.
+fn schema_correction_cannot_repeat_effects_or_inherit_task_authority() {
+    let script = format!(
+        r#"set -eu
+correction=false
+for argument in "$@"; do
+    if [ "$argument" = --no-tools ]; then correction=true; fi
+done
+printf '%s\n' "$PI_SUBAGENT_RUN_ID" >> "$PI_CODING_AGENT_DIR/run-ids"
+if "$correction"; then
+    test -z "${{PI_SUBAGENT_STEER_FILE-}}" || exit 70
+    test -z "${{PI_SUBAGENT_HUB_ADDRESS-}}" || exit 71
+    test -n "${{PI_SUBAGENT_COST_ADDRESS-}}" || exit 72
+    test -n "${{PI_SUBAGENT_COST_TOKEN-}}" || exit 73
+    printf '%s\n' "$@" > "$PI_CODING_AGENT_DIR/correction-arguments"
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --system-prompt ]; then
+            shift
+            cat "$1" > "$PI_CODING_AGENT_DIR/correction-system"
+        fi
+        shift
+    done
+    cat > "$PI_CODING_AGENT_DIR/correction-input"
+{}
+else
+    test -n "${{PI_SUBAGENT_STEER_FILE-}}" || exit 74
+    printf 'repeat the original side effect\n' >> "$PI_SUBAGENT_STEER_FILE"
+    cat > "$PI_CODING_AGENT_DIR/original-input"
+    printf 'executed once\n' >> "$PI_CODING_AGENT_DIR/effects"
+    printf '%s\n' "$$" > "$PI_CODING_AGENT_DIR/original-pid"
+{}
+fi
+"#,
+        emit(&[ended(r#"{"count":1}"#, "stop")]),
+        emit(&[ended(r#"{"count":1,}"#, "stop")]),
+    );
+    let (_root, mut tool) = fixture(&script);
+    let skill = tool.global_dir.join("private-skill.md");
+    std::fs::write(
+        &skill,
+        "Original skill instructions must not reach correction.",
+    )
+    .unwrap();
+    std::fs::write(
+        tool.global_dir.join("agents/worker.md"),
+        format!(
+            "---\nname: worker\ndescription: side-effect fixture\ntools: read,bash,hub\nskills: {}\n---\nOriginal profile instructions must not reach correction.",
+            skill.display()
+        ),
+    )
+    .unwrap();
+    let scope = crate::cost::CostScope::default();
+    scope.set(Some(
+        crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap(),
+    ));
+    tool = tool.with_cost_scope(scope);
+    let assignment = "Perform the original side effect exactly once.";
+    let output = run(
+        &tool,
+        json!({"agent":"worker", "task":assignment, "schemaMode":"strict",
+            "outputSchema":{"type":"object", "required":["count"],
+                "properties":{"count":{"const":1}}}}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    let result = result(&output);
+    assert_eq!(result["data"], json!({"count":1}));
+    assert_eq!(result["schemaRetries"], 1);
+    assert_eq!(result["task"], assignment);
+    assert_eq!(result["tools"], json!(["read", "bash", "hub"]));
+    assert_eq!(
+        std::fs::read_to_string(tool.global_dir.join("effects")).unwrap(),
+        "executed once\n"
+    );
+    let original_pid = std::fs::read_to_string(tool.global_dir.join("original-pid"))
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert_eq!(result["pid"], original_pid);
+    let run_ids = std::fs::read_to_string(tool.global_dir.join("run-ids")).unwrap();
+    let run_ids: Vec<_> = run_ids.lines().collect();
+    assert_eq!(run_ids.len(), 2);
+    assert_eq!(run_ids[0], run_ids[1]);
+    assert_eq!(result["hubId"], run_ids[0]);
+    let arguments = std::fs::read_to_string(tool.global_dir.join("correction-arguments")).unwrap();
+    let arguments: Vec<_> = arguments.lines().collect();
+    for required in [
+        "--no-tools",
+        "--no-implicit-tools",
+        "--no-mcp",
+        "--no-extensions",
+        "--no-skills",
+        "--no-context-files",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-migrations",
+        "--hide-cwd-in-prompt",
+        "--system-prompt",
+    ] {
+        assert!(arguments.contains(&required), "missing {required}");
+    }
+    for forbidden in ["--skill", "--workspace-roots-file", "--append-system-prompt"] {
+        assert!(!arguments.contains(&forbidden), "leaked {forbidden}");
+    }
+    let correction_system =
+        std::fs::read_to_string(tool.global_dir.join("correction-system")).unwrap();
+    assert!(correction_system.starts_with(SCHEMA_CORRECTION_SYSTEM_PROMPT));
+    assert!(!correction_system.contains("Original profile instructions"));
+    assert!(!correction_system.contains("Original skill instructions"));
+    let correction_input = std::fs::read_to_string(tool.global_dir.join("correction-input")).unwrap();
+    let correction: Value =
+        serde_json::from_str(correction_input.strip_prefix("Task: ").unwrap()).unwrap();
+    assert_eq!(correction["previousOutput"], r#"{"count":1,}"#);
+    assert!(!correction_input.contains(assignment));
+    assert!(!correction_input.contains("repeat the original side effect"));
+    let source = crate::agent_hub::registry()
+        .lock()
+        .unwrap()
+        .native_revival_source(run_ids[0])
+        .unwrap();
+    assert_eq!(source.launch.task.task, assignment);
+    assert!(source.entry.revived_from.is_none());
+}
+
+#[test]
 fn large_inline_schema_retry_uses_new_stdin_and_retains_the_original_assignment() {
     let script = format!(
         "printf '\\n---attempt---\\n' >> instructions-used\ncat >> instructions-used\n\
@@ -553,19 +685,19 @@ fn large_inline_schema_retry_uses_new_stdin_and_retains_the_original_assignment(
     assert_eq!(result(&output)["task"], original);
     let instructions = std::fs::read_to_string(root.path().join("instructions-used")).unwrap();
     assert_eq!(instructions.matches("---attempt---").count(), 2);
-    assert_eq!(instructions.matches(original.as_str()).count(), 2);
-    assert_eq!(
-        instructions
-            .matches("previous output failed schema validation")
-            .count(),
-        1
-    );
+    assert_eq!(instructions.matches(original.as_str()).count(), 1);
+    let correction = instructions.rsplit("---attempt---\nTask: ").next().unwrap();
+    let correction: Value = serde_json::from_str(correction).unwrap();
+    assert_eq!(correction["previousOutput"], "not JSON");
+    assert!(correction["validationErrors"].is_array());
 }
 
 #[test]
-fn an_oversized_correction_does_not_launch_or_apply_a_second_attempt() {
+fn a_maximal_assignment_does_not_consume_the_answer_correction_budget() {
     let script = format!(
-        "printf 'launched\\n' >> launches\n{}",
+        "printf 'launched\\n' >> launches\n\
+         if [ -f attempted ]; then\n{}else\n: > attempted\n{}fi\n",
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
         emit(&[ended("not JSON", "stop")])
     );
     let (root, tool) = fixture(&script);
@@ -575,20 +707,14 @@ fn an_oversized_correction_does_not_launch_or_apply_a_second_attempt() {
         json!({"agent":"worker", "task":original,
             "outputSchema":{"type":"object"}, "schemaMode":"strict"}),
     );
-    assert!(output.is_error, "{output:?}");
-    assert_eq!(result(&output)["schemaRetries"], 0);
-    assert_eq!(result(&output)["schemaValid"], false);
-    assert_eq!(result(&output)["output"], "not JSON");
+    assert!(!output.is_error, "{output:?}");
+    assert_eq!(result(&output)["schemaRetries"], 1);
+    assert_eq!(result(&output)["schemaValid"], true);
+    assert_eq!(result(&output)["data"], json!({"accepted":true}));
     assert_eq!(result(&output)["task"], original);
-    assert!(
-        result(&output)["error"]
-            .as_str()
-            .unwrap()
-            .contains("PI_SUBAGENT_TASK_LIMIT")
-    );
     assert_eq!(
         std::fs::read_to_string(root.path().join("launches")).unwrap(),
-        "launched\n"
+        "launched\nlaunched\n"
     );
 }
 
@@ -637,24 +763,29 @@ fi
         "launched\nlaunched\n"
     );
     let correction = std::fs::read_to_string(root.path().join("corrective-task")).unwrap();
-    assert!(correction.starts_with(&format!("Task: {assignment}")));
-    assert!(correction.contains("PI_SUBAGENT_SCHEMA_OUTPUT"));
-    assert!(correction.contains(OUTPUT_VALIDATION_TRUNCATED));
-    assert!(correction.len() < assignment.len() + 2 * MAX_OUTPUT_VALIDATION_BYTES);
-    assert!(!correction.contains("rejected-value-"));
+    let correction: Value = serde_json::from_str(correction.strip_prefix("Task: ").unwrap()).unwrap();
+    assert_eq!(correction["previousOutput"], invalid);
+    let errors = correction["validationErrors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    let diagnostic = errors[0].as_str().unwrap();
+    assert!(diagnostic.len() <= MAX_OUTPUT_VALIDATION_BYTES);
+    assert!(diagnostic.contains("PI_SUBAGENT_SCHEMA_OUTPUT"));
+    assert!(diagnostic.contains(OUTPUT_VALIDATION_TRUNCATED));
+    assert!(!diagnostic.contains("rejected-value-"));
+    assert!(!correction.to_string().contains(assignment));
 }
 
 #[test]
 fn workflow_schema_retry_keeps_its_smaller_complete_task_budget() {
     let script = format!(
         "printf 'launched\\n' >> launches\n{}",
-        emit(&[ended("not JSON", "stop")])
+        emit(&[ended(&"x".repeat(64 * 1024), "stop")])
     );
     let (root, tool) = fixture(&script);
     let output = run(
         &tool,
         json!({"workflow":[{"id":"bounded", "call":{
-            "agent":"worker", "task":"x".repeat(64 * 1024),
+            "agent":"worker", "task":"return the bounded answer",
             "outputSchema":{"type":"object"}, "schemaMode":"strict"
         }}]}),
     );
@@ -890,7 +1021,7 @@ fn task_file_snapshot_survives_schema_retry_and_explicit_hub_revival() {
     let instructions = std::fs::read_to_string(root.path().join("instructions-used"))
         .expect("all native child instructions");
     assert_eq!(instructions.matches("---attempt---").count(), 3);
-    assert_eq!(instructions.matches(original.as_str()).count(), 3);
+    assert_eq!(instructions.matches(original.as_str()).count(), 2);
     assert!(!instructions.contains("replacement must not run"));
 }
 
@@ -1691,21 +1822,54 @@ fn failed_first_chain_step_never_launches_the_next_assignment() {
 
 #[test]
 fn failed_corrective_retry_is_not_replaced_with_earlier_permissive_success() {
-    let script = format!(
-        "if [ -f phase ]; then\n exit 9\nelse\n : > phase\n{}fi\n",
-        emit(&[ended("not JSON", "stop")])
-    );
-    let (_dir, tool) = fixture(&script);
-    let mut input = request();
-    input["outputSchema"] = json!({"type":"object"});
-    input["schemaMode"] = json!("permissive");
-    let output = run(&tool, input);
-    assert!(output.is_error, "retry failure must win: {output:?}");
-    assert_eq!(result(&output)["status"], "failed");
-    assert_eq!(result(&output)["exitCode"], 9);
-    assert_eq!(result(&output)["schemaRetries"], 1);
-    assert_eq!(result(&output)["schemaValid"], false);
-    assert!(result(&output).get("data").is_none());
+    for isolated in [false, true] {
+        let script = format!(
+            "if [ -f phase ]; then\n exit 9\nelse\n : > phase\n\
+             printf 'original effect\\n' > tracked.txt\n{}fi\n",
+            emit(&[ended("not JSON", "stop")])
+        );
+        let (_dir, tool) = fixture(&script);
+        let mut input = request();
+        input["outputSchema"] = json!({"type":"object"});
+        input["schemaMode"] = json!("permissive");
+        if isolated {
+            initialize_git(&tool.cwd);
+            input["isolation"] = json!("worktree");
+            input["isoApply"] = json!("apply");
+        }
+        let output = run(&tool, input);
+        assert!(output.is_error, "retry failure must win: {output:?}");
+        let result = result(&output);
+        assert_eq!(result["status"], "failed");
+        assert_eq!(
+            result["exitCode"], 0,
+            "original process metadata is retained"
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("Child exited with code 9")
+        );
+        assert_eq!(result["output"], "not JSON");
+        assert_eq!(result["schemaRetries"], 1);
+        assert_eq!(result["schemaValid"], false);
+        assert!(result.get("data").is_none());
+        assert!(result.get("preservedWorktrees").is_none());
+        if isolated {
+            assert_eq!(result["iso"]["applyMode"], "keep");
+            assert_eq!(result["iso"]["applied"], false);
+            assert_eq!(
+                std::fs::read_to_string(tool.cwd.join("tracked.txt")).unwrap(),
+                "original\n"
+            );
+            let retained = Path::new(result["iso"]["worktreePath"].as_str().unwrap());
+            assert_eq!(
+                std::fs::read_to_string(retained.join("tracked.txt")).unwrap(),
+                "original effect\n"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1846,7 +2010,11 @@ fn isolated_serial_task_preserves_the_parents_package_directory() {
 #[allow(clippy::too_many_lines)] // Drive queueing, symlink retargeting and schema retry through real children.
 fn queued_isolated_retry_keeps_the_captured_package_when_a_symlink_changes() {
     let script = format!(
-        "assignment=$(cat)\n\
+        "correction=false\n\
+         for argument in \"$@\"; do\n\
+           if [ \"$argument\" = --no-tools ]; then correction=true; fi\n\
+         done\n\
+         assignment=$(cat)\n\
          case \"$assignment\" in\n\
          'Task: retarget source alias')\n\
            mv selected selected-before\n\
@@ -1854,12 +2022,12 @@ fn queued_isolated_retry_keeps_the_captured_package_when_a_symlink_changes() {
            exit 0 ;;\n\
          esac\n\
          test \"$(cat tracked.txt)\" = 'api original' || exit 8\n\
-         test ! -e rejected.txt || exit 9\n\
-         if [ -f \"$PI_CODING_AGENT_DIR/corrective-attempt\" ]; then\n\
-           printf 'accepted in api\\n' > accepted.txt\n{}\
+         if \"$correction\"; then\n\
+           test \"$(cat accepted.txt)\" = 'accepted in api' || exit 9\n{}\
          else\n\
-           : > \"$PI_CODING_AGENT_DIR/corrective-attempt\"\n\
-           printf 'rejected in api\\n' > rejected.txt\n{}\
+           test ! -e accepted.txt || exit 10\n\
+           printf 'executed\\n' >> \"$PI_CODING_AGENT_DIR/package-effects\"\n\
+           printf 'accepted in api\\n' > accepted.txt\n{}\
          fi\n",
         emit(&[ended("alias changed", "stop")]),
         emit(&[ended(r#"{"accepted":true}"#, "stop")]),
@@ -1894,7 +2062,6 @@ fn queued_isolated_retry_keeps_the_captured_package_when_a_symlink_changes() {
         std::fs::read_to_string(package.join("accepted.txt")).unwrap(),
         "accepted in api\n"
     );
-    assert!(!package.join("rejected.txt").exists());
     assert!(!other.join("accepted.txt").exists());
     assert_eq!(
         std::fs::read_to_string(other.join("tracked.txt")).unwrap(),
@@ -1908,12 +2075,10 @@ fn queued_isolated_retry_keeps_the_captured_package_when_a_symlink_changes() {
         std::fs::read_link(tool.cwd.join("selected")).unwrap(),
         Path::new("packages/other")
     );
-    let rejected = &value["preservedWorktrees"][0];
-    assert_eq!(rejected["applied"], false);
-    let kept = Path::new(rejected["worktreePath"].as_str().unwrap());
+    assert!(value.get("preservedWorktrees").is_none());
     assert_eq!(
-        std::fs::read_to_string(kept.join("packages/api/rejected.txt")).unwrap(),
-        "rejected in api\n"
+        std::fs::read_to_string(tool.global_dir.join("package-effects")).unwrap(),
+        "executed\n"
     );
 }
 
@@ -2065,7 +2230,11 @@ fn queued_isolated_schema_retry_uses_the_snapshot_before_nonisolated_siblings() 
     let control = tempfile::tempdir().unwrap();
     let marker = quote(control.path().join("attempted").to_str().unwrap());
     let script = format!(
-        "assignment=$(cat)\n\
+        "correction=false\n\
+         for argument in \"$@\"; do\n\
+           if [ \"$argument\" = --no-tools ]; then correction=true; fi\n\
+         done\n\
+         assignment=$(cat)\n\
          case \"$assignment\" in\n\
          'Task: shared writer')\n\
            printf 'shared parent edit\\n' > tracked.txt\n\
@@ -2074,12 +2243,11 @@ fn queued_isolated_schema_retry_uses_the_snapshot_before_nonisolated_siblings() 
          esac\n\
          test \"$(cat tracked.txt)\" = original || exit 8\n\
          test ! -e sibling.txt || exit 9\n\
-         test ! -e rejected.txt || exit 10\n\
-         if [ -f {marker} ]; then\n\
-           printf 'accepted only\\n' > accepted.txt\n{}\
+         if \"$correction\"; then\n\
+           test \"$(cat accepted.txt)\" = 'original attempt' || exit 10\n{}\
          else\n\
-           : > {marker}\n\
-           printf 'rejected attempt\\n' > rejected.txt\n{}\
+           printf 'executed\\n' >> {marker}\n\
+           printf 'original attempt\\n' > accepted.txt\n{}\
          fi\n",
         emit(&[ended("shared edit finished", "stop")]),
         emit(&[ended(r#"{"accepted":true}"#, "stop")]),
@@ -2107,17 +2275,13 @@ fn queued_isolated_schema_retry_uses_the_snapshot_before_nonisolated_siblings() 
     );
     assert_eq!(
         std::fs::read_to_string(tool.cwd.join("accepted.txt")).unwrap(),
-        "accepted only\n"
+        "original attempt\n"
     );
     assert!(tool.cwd.join("sibling.txt").exists());
-    assert!(!tool.cwd.join("rejected.txt").exists());
-    let rejected = &value["preservedWorktrees"][0];
-    assert_eq!(rejected["applyMode"], "keep");
-    assert_eq!(rejected["applied"], false);
-    let kept = Path::new(rejected["worktreePath"].as_str().unwrap());
+    assert!(value.get("preservedWorktrees").is_none());
     assert_eq!(
-        std::fs::read_to_string(kept.join("rejected.txt")).unwrap(),
-        "rejected attempt\n"
+        std::fs::read_to_string(control.path().join("attempted")).unwrap(),
+        "executed\n"
     );
 }
 
@@ -2388,20 +2552,23 @@ fn invalid_typed_output_keeps_worktree_edits_even_in_permissive_mode() {
 }
 
 #[test]
-fn valid_corrective_retry_applies_only_accepted_edits() {
-    // Retry state must not become part of either workspace snapshot.
+fn valid_schema_correction_applies_only_the_original_attempts_edits() {
+    // Count external effects independently of the isolated workspace.
     let retry_state = tempfile::tempdir().unwrap();
     let marker = quote(retry_state.path().join("attempted").to_str().unwrap());
     let script = format!(
-        "if [ -f {marker} ]; then\n\
-         test \"$(cat tracked.txt)\" = original || exit 8\n\
-         test ! -e rejected.txt || exit 8\n\
-         printf 'accepted\\n' > tracked.txt\n\
+        "correction=false\n\
+         for argument in \"$@\"; do\n\
+           if [ \"$argument\" = --no-tools ]; then correction=true; fi\n\
+         done\n\
+         if \"$correction\"; then\n\
+         test \"$(cat tracked.txt)\" = 'original execution' || exit 8\n\
+         test \"$(cat accepted.txt)\" = first-only || exit 9\n\
          {}\
          else\n\
-         : > {marker}\n\
-         printf 'rejected\\n' > tracked.txt\n\
-         printf 'first-only\\n' > rejected.txt\n\
+         printf 'executed\\n' >> {marker}\n\
+         printf 'original execution\\n' > tracked.txt\n\
+         printf 'first-only\\n' > accepted.txt\n\
          {}\
          fi\n",
         emit(&[ended(r#"{"accepted":true}"#, "stop")]),
@@ -2429,21 +2596,16 @@ fn valid_corrective_retry_applies_only_accepted_edits() {
     assert_eq!(result["iso"]["applied"], true);
     assert_eq!(
         std::fs::read_to_string(tool.cwd.join("tracked.txt")).unwrap(),
-        "accepted\n"
+        "original execution\n"
     );
-    assert!(!tool.cwd.join("rejected.txt").exists());
-    let preserved = result["preservedWorktrees"].as_array().unwrap();
-    assert_eq!(preserved.len(), 1);
-    assert_eq!(preserved[0]["applyMode"], "keep");
-    assert_eq!(preserved[0]["applied"], false);
-    let path = Path::new(preserved[0]["worktreePath"].as_str().unwrap());
+    assert!(result.get("preservedWorktrees").is_none());
     assert_eq!(
-        std::fs::read_to_string(path.join("tracked.txt")).unwrap(),
-        "rejected\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(path.join("rejected.txt")).unwrap(),
+        std::fs::read_to_string(tool.cwd.join("accepted.txt")).unwrap(),
         "first-only\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(retry_state.path().join("attempted")).unwrap(),
+        "executed\n"
     );
 }
 
@@ -3008,16 +3170,19 @@ fn active_and_killed_revival_owners_block_replacement_until_drop_reaps_the_child
 fn hub_revival_keeps_schema_isolation_and_authored_task_across_corrective_retry()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let script = format!(
-        "if [ ! -f \"$PI_CODING_AGENT_DIR/source-finished\" ]; then\n\
+        "correction=false\n\
+         for argument in \"$@\"; do\n\
+           if [ \"$argument\" = --no-tools ]; then correction=true; fi\n\
+         done\n\
+         if [ ! -f \"$PI_CODING_AGENT_DIR/source-finished\" ]; then\n\
            : > \"$PI_CODING_AGENT_DIR/source-finished\"\n{}\
-         elif [ ! -f \"$PI_CODING_AGENT_DIR/correction\" ]; then\n\
-           : > \"$PI_CODING_AGENT_DIR/correction\"\n\
-           printf 'rejected\\n' > tracked.txt\n{}\
+         elif \"$correction\"; then\n{}\
          else\n\
+           printf 'executed\\n' >> \"$PI_CODING_AGENT_DIR/revival-effects\"\n\
            printf 'accepted\\n' > tracked.txt\n{}fi\n",
         emit(&[ended("{\"accepted\":true}", "stop")]),
-        emit(&[ended("not JSON", "stop")]),
         emit(&[ended("{\"accepted\":true}", "stop")]),
+        emit(&[ended("not JSON", "stop")]),
     );
     let (_directory, tool) = fixture(&script);
     initialize_git(&tool.cwd);
@@ -3050,30 +3215,20 @@ fn hub_revival_keeps_schema_isolation_and_authored_task_across_corrective_retry(
         std::fs::read_to_string(tool.cwd.join("tracked.txt"))?,
         "accepted\n"
     );
-    let preserved = result["preservedWorktrees"]
-        .as_array()
-        .expect("rejected attempt preserved"); // ubs:ignore: schema-rejection disposition oracle
-    assert_eq!(preserved.len(), 1);
-    assert_eq!(preserved[0]["applied"], false);
-    let rejected = preserved[0]["worktreePath"]
-        .as_str()
-        .expect("preserved worktree path"); // ubs:ignore: real isolation evidence
+    assert!(result.get("preservedWorktrees").is_none());
     assert_eq!(
-        std::fs::read_to_string(Path::new(rejected).join("tracked.txt"))?,
-        "rejected\n"
+        std::fs::read_to_string(tool.global_dir.join("revival-effects"))?,
+        "executed\n"
     );
     let retry_id = revived_id(&output);
     let retry_source = {
         let registry = crate::agent_hub::registry().lock().expect("hub registry"); // ubs:ignore: native replay-policy oracle
         let retry = registry.native_revival_source(retry_id)?;
-        let first_id = retry
-            .entry
-            .revived_from
-            .as_deref()
-            .expect("corrective lineage"); // ubs:ignore: one-attempt lineage oracle
-        let first = registry.get(first_id).expect("first revival attempt"); // ubs:ignore: actual attempt registry evidence
-        assert_eq!(first.revived_from.as_deref(), Some(source.id.as_str()));
-        assert_eq!(first.status, crate::agent_hub::ChildStatus::Failed);
+        assert_eq!(retry.entry.revived_from.as_deref(), Some(source.id.as_str()));
+        assert_eq!(
+            registry.get(&source.id).expect("original source").status,
+            crate::agent_hub::ChildStatus::Done
+        );
         assert_eq!(retry.entry.status, crate::agent_hub::ChildStatus::Done);
         assert_eq!(retry.launch.task.task, assignment);
         assert_eq!(retry.launch.task.isolation.as_deref(), Some("worktree"));

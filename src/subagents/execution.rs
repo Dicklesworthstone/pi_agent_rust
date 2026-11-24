@@ -312,9 +312,9 @@ impl ChildRunner {
         self.public_result(result)
     }
 
-    /// At most one fresh corrective run. The first attempt's isolated edits
-    /// are retained, never applied as input to that retry. The original
-    /// deadline is retained too, including time spent waiting in the queue.
+    /// At most one tool-free correction of the completed answer. The original
+    /// attempt owns its effects, worktree and cancellation lease throughout;
+    /// formatting never re-executes the assignment or creates another patch.
     #[allow(clippy::too_many_lines)] // Keep acceptance, retry and disposition together.
     async fn run_pending(
         &self,
@@ -352,8 +352,8 @@ impl ChildRunner {
         let owner = AgentCx::for_current_or_request();
         // Capture before execution spends the budget. A later explicit
         // revival must not inherit a zero budget from a timed-out settlement.
-        // Schema retries share this authored task and launch policy instead
-        // of retaining their generated corrective prompt as a new assignment.
+        // Preserve the authored task and launch policy for explicit revival;
+        // schema correction never replaces it with the generated repair input.
         let launch = self.revival.as_ref().map_or_else(
             || RevivalSpec {
                 agent: agent.clone(),
@@ -374,9 +374,9 @@ impl ChildRunner {
             },
             |(_, launch)| launch.clone(),
         );
-        // Serial tasks also capture once before launch. Their corrective retry
-        // must inherit the same package and files, even if a callback or another
-        // writer changes the parent directory after the first attempt.
+        // Serial tasks also capture once before launch. Any schema correction
+        // retains that original worktree, even if a callback or another writer
+        // changes the parent directory after execution.
         let captured = if baseline.is_none() {
             self.capture_baselines(agents, std::slice::from_ref(&task))
                 .pop()
@@ -396,6 +396,7 @@ impl ChildRunner {
                 &launch,
                 self.revival.as_ref().map(|(id, _)| id.as_str()),
                 baseline,
+                None,
             )
             .await;
         if attempt.result.is_error || schema.is_none() {
@@ -416,36 +417,30 @@ impl ChildRunner {
         }
 
         let errors = attempt.result.validation_errors.clone().unwrap_or_default();
-        attempt.result.fail("Child output failed schema validation; preserving this attempt before one corrective retry.".to_string());
-        let mut previous = attempt.finish(&owner, false, update).await;
-        // A hub kill during validation/settlement is not a schema failure to
-        // repair by launching a replacement child behind the operator's back.
-        if matches!(previous.status, SubagentStatus::Cancelled) {
-            return PendingRun::Settled(previous);
+        // Keep the original lease and worktree live while the returned data is
+        // repaired. This progress boundary remains cancellable and does not
+        // announce a terminal hub result or apply any original edits.
+        let original = attempt.result.clone();
+        attempt.result.status = SubagentStatus::Running;
+        emit_progress(update, &attempt.result);
+        if !attempt.check(&owner) {
+            return attempt.defer(owner, false, update).await;
         }
-        // Finishing an attempt can perform a snapshot or invoke a host callback.
-        // Never spend a new launch after either cancellation or budget expiry.
-        if owner.checkpoint().is_err() {
-            cancel(&mut previous, CANCELLED);
-            emit_progress(update, &previous);
-            return PendingRun::Settled(previous);
-        }
-        if let Err(error) = self.deadline.check() {
-            previous.fail(error.to_string());
-            emit_progress(update, &previous);
-            return PendingRun::Settled(previous);
-        }
-        let corrective_task = match corrective_retry_task(&task.task, &errors, self.max_task_bytes)
-        {
-            Ok(task) => task,
-            Err(error) => {
-                previous.fail(error.to_string());
-                emit_progress(update, &previous);
-                return PendingRun::Settled(previous);
-            }
-        };
+        let corrective_task =
+            match corrective_retry_task(&original.output, &errors, self.max_task_bytes) {
+                Ok(task) => task,
+                Err(error) => {
+                    attempt.result.fail(error.to_string());
+                    return attempt.defer(owner, false, update).await;
+                }
+            };
         let corrective = SubagentTask {
             task: corrective_task,
+            task_file: None,
+            task_file_sha256: None,
+            cwd: Some(original.cwd.clone()),
+            isolation: None,
+            iso_apply: None,
             ..task.clone()
         };
         let mut retry = self
@@ -457,26 +452,32 @@ impl ChildRunner {
                 Some(schema),
                 &owner,
                 &launch,
-                previous.hub_id.as_deref(),
-                baseline,
+                None,
+                None,
+                Some((attempt, schema)),
             )
             .await;
+        // The repair process contributes only an answer. Metadata, file-input
+        // identity, execution policy and the owned patch remain the original
+        // attempt's, including the native revival policy held by its hub lease.
+        let repaired = std::mem::replace(&mut retry.result, original);
         retry.result.schema_retries = Some(1);
-        // Keep the public assignment stable; corrective prompt text is a
-        // transport detail, not a replacement for the user's original task.
-        retry.result.task = launch.display_task().to_string();
-        if let Some(iso) = previous.iso {
-            retry.result.preserved_worktrees.push(iso);
-        }
-        if retry.result.is_error {
-            retry.result.schema_valid = Some(false);
-            retry.result.validation_errors = Some(errors);
+        if repaired.is_error {
+            retry.result.status = repaired.status;
+            retry.result.is_error = true;
+            retry.result.error = Some(format!(
+                "Schema-only correction failed: {}",
+                repaired.error.as_deref().unwrap_or("child execution failed")
+            ));
+            append_bounded_line(&mut retry.result.stderr, &repaired.stderr);
             return retry.defer(owner, false, update).await;
         }
+        retry.result.output = repaired.output;
         match validate_child_output(&retry.result.output, schema) {
             Ok(data) => {
                 retry.result.data = Some(data);
                 retry.result.schema_valid = Some(true);
+                retry.result.validation_errors = None;
             }
             Err(errors) => {
                 retry.result.schema_valid = Some(false);
@@ -504,14 +505,29 @@ impl ChildRunner {
         launch: &RevivalSpec,
         revived_from: Option<&str>,
         baseline: Option<&BaselineCapture>,
+        correction: Option<(Attempt, &Value)>,
     ) -> Attempt {
+        let correcting = correction.is_some();
         let cwd = self.task_cwd(&task);
-        let args = child_args(
-            agent,
-            self.role_model_spec.as_deref(),
-            launch.parent_model.as_ref(),
-            task.model_selection.as_ref(),
-            schema,
+        let args = correction.as_ref().map_or_else(
+            || {
+                child_args(
+                    agent,
+                    self.role_model_spec.as_deref(),
+                    launch.parent_model.as_ref(),
+                    task.model_selection.as_ref(),
+                    schema,
+                )
+            },
+            |(_, schema)| {
+                super::schema_correction_args(
+                    agent,
+                    self.role_model_spec.as_deref(),
+                    launch.parent_model.as_ref(),
+                    task.model_selection.as_ref(),
+                    schema,
+                )
+            },
         );
         // Every assignment uses the same private regular-file transport.
         // Inline instructions, predecessor output and corrective retries can
@@ -529,10 +545,16 @@ impl ChildRunner {
         };
         let mut args = super::with_fallback_policy_args(args, task.fallback_policy.as_deref());
         let policy = isolation_policy(&task);
-        let mut attempt = Attempt::new(
-            SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args),
-            self.deadline,
-        );
+        let mut result =
+            SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args);
+        let mut attempt = if let Some((mut original, _)) = correction {
+            result.hub_id = original.result.hub_id.clone();
+            result.tools.clear();
+            original.result = result;
+            original
+        } else {
+            Attempt::new(result, self.deadline)
+        };
         attempt.result.task = launch.display_task().to_string();
         let stdin = match stdin {
             Ok(stdin) => stdin,
@@ -541,7 +563,7 @@ impl ChildRunner {
                 return attempt;
             }
         };
-        if !check_budget(owner, self.deadline, &mut attempt.result) {
+        if !attempt.check(owner) {
             return attempt;
         }
         if let Some(budget) = &launch.cost_budget
@@ -576,21 +598,28 @@ impl ChildRunner {
         }
         // Tracking is a launch prerequisite, not optional telemetry. A failed
         // registration must never leave an unsteerable/uncontrollable child.
-        let hub_entry = match attempt.hub.register(
-            &agent.name,
-            &launch.task.task,
-            self.hub_kind,
-            launch.clone(),
-            revived_from,
-        ) {
-            Ok(entry) => entry,
-            Err(error) => {
-                attempt.result.fail(error.to_string());
+        let hub_entry = if correcting {
+            let Some(entry) = attempt.hub.correction_entry(&mut attempt.result) else {
                 return attempt;
+            };
+            entry
+        } else {
+            match attempt.hub.register(
+                &agent.name,
+                &launch.task.task,
+                self.hub_kind,
+                launch.clone(),
+                revived_from,
+            ) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    attempt.result.fail(error.to_string());
+                    return attempt;
+                }
             }
         };
         attempt.result.hub_id = Some(hub_entry.id.clone());
-        if self.foreground {
+        if self.foreground && !correcting {
             let hold = crate::agent_hub::registry()
                 .lock()
                 .map_err(|_| {
@@ -608,10 +637,10 @@ impl ChildRunner {
             }
         }
         emit_progress(update, &attempt.result);
-        if !check_budget(owner, self.deadline, &mut attempt.result) {
+        if !attempt.check(owner) {
             return attempt;
         }
-        if isolated {
+        if isolated && !correcting {
             let baseline = match baseline {
                 Some(Ok(baseline)) => baseline,
                 Some(Err(error)) => {
@@ -645,7 +674,7 @@ impl ChildRunner {
                 }
             }
         }
-        if !check_budget(owner, self.deadline, &mut attempt.result) {
+        if !attempt.check(owner) {
             return attempt;
         }
         // Only concrete paths in this captured worktree may be granted. The
@@ -653,6 +682,7 @@ impl ChildRunner {
         let workspace_transport = match launch
             .workspace_roots
             .as_ref()
+            .filter(|_| !correcting)
             .map(|roots| {
                 roots.prepare(
                     attempt.isolation.as_ref().map(|(handle, _)| handle),
@@ -693,7 +723,7 @@ impl ChildRunner {
         if !attempt.check(owner) {
             return attempt;
         }
-        let messaging = attempt.result.tools.iter().any(|tool| tool == "hub");
+        let messaging = !correcting && attempt.result.tools.iter().any(|tool| tool == "hub");
         let hub_channel = if messaging || launch.cost_budget.is_some() {
             match crate::agent_hub::ipc::ChildChannel::bind(
                 &hub_entry.id,
@@ -729,8 +759,14 @@ impl ChildRunner {
                 "PI_SUBAGENT_DEPTH",
                 launch.depth.max(child_depth()).to_string(),
             )
-            .env("PI_SUBAGENT_STEER_FILE", &hub_entry.steer_path)
             .env("PI_SUBAGENT_RUN_ID", &hub_entry.id);
+        if correcting {
+            // Queued task steering belongs to the original execution, never
+            // to a pass that is permitted only to repair returned JSON data.
+            command.env_remove("PI_SUBAGENT_STEER_FILE");
+        } else {
+            command.env("PI_SUBAGENT_STEER_FILE", &hub_entry.steer_path);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -784,7 +820,14 @@ impl ChildRunner {
         if !attempt.check(owner) {
             return attempt;
         }
-        if !attempt.hub.mark_running(child.id(), &mut attempt.result) {
+        let activated = if correcting {
+            attempt
+                .hub
+                .mark_correction_running(child.id(), &mut attempt.result)
+        } else {
+            attempt.hub.mark_running(child.id(), &mut attempt.result)
+        };
+        if !activated {
             return attempt;
         }
         emit_progress(update, &attempt.result);

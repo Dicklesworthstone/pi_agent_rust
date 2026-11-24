@@ -466,6 +466,31 @@ impl AgentHubRegistry {
         }
     }
 
+    /// A schema-only continuation retains the original acceptance lease after
+    /// its process has been reaped. Historical `entry.pid` is not authority:
+    /// the live-process map must be empty before another child can own it.
+    pub(crate) fn can_start_schema_correction(&self, id: &str) -> bool {
+        self.active_executions.contains(id)
+            && self.native_launches.contains_key(id)
+            && self.control_pid(id).is_none()
+            && self
+                .entries
+                .get(id)
+                .is_some_and(|entry| entry.status == ChildStatus::Running)
+    }
+
+    pub(crate) fn resume_schema_correction(&mut self, id: &str, pid: u32) -> bool {
+        if pid == 0 || !self.can_start_schema_correction(id) {
+            return false;
+        }
+        let Some(entry) = self.entries.get_mut(id) else {
+            return false;
+        };
+        entry.pid = Some(pid);
+        self.live_processes.insert(id.to_string(), pid);
+        true
+    }
+
     /// A historical PID must never authorize signalling a reused OS process.
     /// A reaped child can still be killed logically while writeback is pending.
     #[must_use]

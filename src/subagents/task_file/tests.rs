@@ -104,15 +104,31 @@ fn stdin_transport_child_fixture() -> std::result::Result<(), Box<dyn std::error
 }
 
 #[test]
-fn large_stdin_and_retry_are_inherited_without_command_arguments_on_every_platform()
+fn large_stdin_and_correction_are_inherited_without_command_arguments_on_every_platform()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
-    let original = format!("Full assignment\r\n{}", "résumé 雪\n".repeat(24 * 1024));
-    let retry = crate::subagents::corrective_retry_task(
-        &original,
-        &["expected an integer".to_string()],
-        MAX_BYTES,
-    )?;
+    let original = format!(
+        "Previous answer \"quoted\" \\\r\n{}",
+        "résumé 雪\n".repeat(24 * 1024)
+    );
+    let errors = ["expected an integer".to_string()];
+    let retry = crate::subagents::corrective_retry_task(&original, &errors, MAX_BYTES)?;
+    let decoded: serde_json::Value = serde_json::from_str(&retry)?;
+    assert_eq!(decoded["previousOutput"], original);
+    assert_eq!(decoded["validationErrors"], json!(errors));
+    assert!(
+        retry.len() > original.len(),
+        "escaping counts toward the limit"
+    );
+    assert_eq!(
+        crate::subagents::corrective_retry_task(&original, &errors, retry.len())?,
+        retry
+    );
+    assert!(
+        crate::subagents::corrective_retry_task(&original, &errors, retry.len() - 1)
+            .unwrap_err()
+            .contains("PI_SUBAGENT_TASK_LIMIT")
+    );
     for (index, task) in [original, retry].iter().enumerate() {
         let received = root.path().join(format!("received-{index}.txt"));
         let owner = AgentCx::for_current_or_request();

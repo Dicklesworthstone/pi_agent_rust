@@ -218,6 +218,55 @@ impl HubLease {
         true
     }
 
+    /// Preserve one task's acceptance and cancellation authority while its
+    /// already-reaped process is replaced by a tool-free formatting pass.
+    pub(super) fn correction_entry(&self, result: &mut SubagentResult) -> Option<ChildEntry> {
+        let Some(id) = self.id.as_deref() else {
+            apply_admission(result, Admission::Refused(HUB_MISSING));
+            return None;
+        };
+        let Ok(hub) = registry().lock() else {
+            apply_admission(result, Admission::Refused(HUB_POISONED));
+            return None;
+        };
+        if hub.can_start_schema_correction(id) {
+            return hub.get(id);
+        }
+        let refusal = match disposition(hub.get(id).map(|entry| entry.status)) {
+            Admission::Live => Admission::Refused(HUB_ACTIVATED),
+            refusal => refusal,
+        };
+        apply_admission(result, refusal);
+        None
+    }
+
+    /// Recheck under the same lock as kill after OS spawn. A cancellation
+    /// between preparation and activation never resurrects this task.
+    pub(super) fn mark_correction_running(
+        &self,
+        pid: u32,
+        result: &mut SubagentResult,
+    ) -> bool {
+        if result.is_error {
+            return false;
+        }
+        let Some(id) = self.id.as_deref() else {
+            return apply_admission(result, Admission::Refused(HUB_MISSING));
+        };
+        let Ok(mut hub) = registry().lock() else {
+            return apply_admission(result, Admission::Refused(HUB_POISONED));
+        };
+        if hub.resume_schema_correction(id, pid) {
+            result.status = SubagentStatus::Running;
+            return true;
+        }
+        let refusal = match disposition(hub.get(id).map(|entry| entry.status)) {
+            Admission::Live => Admission::Refused(HUB_ACTIVATED),
+            refusal => refusal,
+        };
+        apply_admission(result, refusal)
+    }
+
     /// Keep process-control retirement separate from result acceptance. The
     /// OS reaper owns this guard, including on early return or future drop;
     /// a pending ordered writeback retains only its result-acceptance lease.

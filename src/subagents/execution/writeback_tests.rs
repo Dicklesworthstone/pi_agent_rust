@@ -83,6 +83,151 @@ fn identity(pending: &PendingRun) -> (String, PathBuf) {
     (id, attempt.isolation.as_ref().unwrap().0.path.clone())
 }
 
+fn gated_schema_repair_fixture() -> (tempfile::TempDir, ChildRunner, SubagentTask) {
+    let (root, runner, mut task) = fixture();
+    fs::create_dir_all(&runner.global_dir).unwrap();
+    fs::write(
+        &runner.child_binary,
+        r#"#!/bin/sh
+set -eu
+repair=false
+for argument in "$@"; do
+    if [ "$argument" = "--no-tools" ]; then repair=true; fi
+done
+if [ "$repair" = true ]; then
+    printf '%s\n' "$$" > "$PI_CODING_AGENT_DIR/repair.pid"
+    printf '%s\n' "$PI_SUBAGENT_RUN_ID" > "$PI_CODING_AGENT_DIR/repair.hub"
+    : > "$PI_CODING_AGENT_DIR/repair.started"
+    while [ ! -f "$PI_CODING_AGENT_DIR/repair.release" ]; do sleep 0.01; done
+    printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"{\"verdict\":\"pass\"}"}]}]}'
+else
+    printf 'child edit\n' > tracked.txt
+    pwd > "$PI_CODING_AGENT_DIR/original.worktree"
+    printf '%s\n' "$PI_SUBAGENT_RUN_ID" > "$PI_CODING_AGENT_DIR/original.hub"
+    printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"completed edit"}]}]}'
+fi
+"#,
+    )
+    .unwrap();
+    task.output_schema = Some(json!({
+        "type":"object", "required":["verdict"],
+        "properties":{"verdict":{"type":"string"}},
+    }));
+    task.schema_mode = SchemaMode::Strict;
+    (root, runner, task)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn interrupted_schema_repair_reaps_child_and_preserves_unapplied_original_worktree() {
+    for interruption in ["parent cancellation", "hub kill", "future drop"] {
+        let (_root, runner, request) = gated_schema_repair_fixture();
+        let agents = BTreeMap::from([("tan".to_string(), super::super::tan_agent_definition())]);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let owner = AgentCx::for_request();
+            let run = runner.run_one(&agents, request, None, None);
+            let mut running = Box::pin(owner.with_current(run));
+            let ready = runner.global_dir.join("repair.started");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(
+                    futures::poll!(&mut running).is_pending(),
+                    "{interruption}: run settled before its schema-only repair started"
+                );
+                assert!(Instant::now() < deadline, "schema-only repair never started");
+                poll_pause(&owner).await;
+            }
+            let original_id = fs::read_to_string(runner.global_dir.join("original.hub"))
+                .unwrap()
+                .trim()
+                .to_string();
+            let repair_id = fs::read_to_string(runner.global_dir.join("repair.hub"))
+                .unwrap()
+                .trim()
+                .to_string();
+            assert_eq!(
+                repair_id, original_id,
+                "repair must retain the original lease"
+            );
+            let worktree = PathBuf::from(
+                fs::read_to_string(runner.global_dir.join("original.worktree"))
+                    .unwrap()
+                    .trim(),
+            );
+            let pid = fs::read_to_string(runner.global_dir.join("repair.pid"))
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap();
+            {
+                let hub = registry().lock().unwrap();
+                assert_eq!(
+                    hub.get(&original_id).unwrap().status,
+                    ChildStatus::Running
+                );
+                assert_eq!(hub.control_pid(&original_id), Some(pid));
+            }
+            assert_eq!(
+                fs::read(runner.cwd.join("tracked.txt")).unwrap(),
+                b"original\n"
+            );
+            assert_eq!(
+                fs::read(worktree.join("tracked.txt")).unwrap(),
+                b"child edit\n"
+            );
+            if interruption == "future drop" {
+                drop(running);
+            } else {
+                if interruption == "hub kill" {
+                    registry().lock().unwrap().mark_killed(&original_id);
+                } else {
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancel schema repair"),
+                    );
+                }
+                let result = running.await;
+                assert!(matches!(result.status, SubagentStatus::Cancelled));
+                assert!(result.is_error);
+                assert!(result.preserved_worktrees.is_empty());
+                let isolation = result.iso.unwrap();
+                assert_eq!(PathBuf::from(isolation.worktree_path), worktree);
+                assert_eq!(isolation.apply_mode, "keep");
+                assert!(!isolation.applied);
+                assert!(isolation.patch.contains("child edit"));
+            }
+            {
+                let hub = registry().lock().unwrap();
+                assert_eq!(
+                    hub.get(&original_id).unwrap().status,
+                    if interruption == "hub kill" {
+                        ChildStatus::Killed
+                    } else {
+                        ChildStatus::Cancelled
+                    },
+                );
+                assert!(hub.control_pid(&original_id).is_none());
+            }
+            let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+            assert!(
+                rustix::process::test_kill_process(pid).is_err(),
+                "{interruption}: repair process survived cleanup"
+            );
+            assert_eq!(
+                fs::read(runner.cwd.join("tracked.txt")).unwrap(),
+                b"original\n"
+            );
+            assert_eq!(
+                fs::read(worktree.join("tracked.txt")).unwrap(),
+                b"child edit\n"
+            );
+        });
+    }
+}
+
 #[test]
 fn isolated_roots_map_into_the_capture_and_disclose_external_and_missing_exclusions() {
     let (root, runner, mut request) = fixture();
