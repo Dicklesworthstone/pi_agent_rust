@@ -26,8 +26,22 @@ capability-gated hostcall interface.
 | `node:http` | Partial | `request`, `get`, `STATUS_CODES`, `METHODS`, `IncomingMessage`, `ClientRequest`; outbound calls use `pi.http()`, explicit loopback `createServer` listeners are private in-memory routes |
 | `node:url` | Partial | `URL` (globalThis), `URLSearchParams`, `parse`, `format`, `resolve`, `fileURLToPath`, `pathToFileURL` |
 | `node:stream` | Partial | `Readable`, `Writable`, `Transform`, `PassThrough`, `Duplex`, `pipeline`, `finished` |
+| `node:stream/web` | Partial | `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoderStream`, `TextDecoderStream`, `ByteLengthQueuingStrategy`, `CountQueuingStrategy` |
 | `node:net` | Stub | `createConnection` (stub), `Socket` (stub); `createServer` throws -- network APIs outside sandbox |
 | `node:readline` | Partial | `createInterface`, `promises.createInterface` -- questions use `pi.ui('input')` when available and resolve to empty strings otherwise |
+
+### Web Streams
+
+The global Web Streams constructors and `node:stream/web` exports support
+`pipeTo`/`pipeThrough`, ordered asynchronous sink writes, transform/flush
+callbacks, reader/writer locks and completion promises, backpressure, and
+abort/error propagation. Cancellation waits for owned writes to settle before
+releasing pipe locks, including when `preventAbort` is selected.
+
+Text streams preserve UTF-8 characters across chunk boundaries; decoding
+supports fatal errors and BOM handling. Other decoder encodings and byte/BYOB
+streams are explicitly unsupported. These are JavaScript sandbox streams;
+underlying I/O continues to use the existing authorized host interfaces.
 
 ### `node:fs` Detail
 
