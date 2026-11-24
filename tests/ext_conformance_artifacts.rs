@@ -1995,6 +1995,31 @@ fn resolve_manifest_scan_root(ext_dir: &Path, entry_abs: &Path) -> PathBuf {
     ext_dir.to_path_buf()
 }
 
+/// Scope provider-registration detection to the executed sub-package when a
+/// workspace artifact contains independent sibling packages (such as
+/// `third-party/ben-vargas-pi-packages`, where `pi-ancestor-discovery` is the
+/// executed entry and `pi-synthetic-provider` is an unrelated sibling package).
+fn resolve_executed_package_root(ext_dir: &Path, entry_abs: &Path) -> PathBuf {
+    let mut current = entry_abs.parent();
+    while let Some(dir) = current {
+        if dir == ext_dir || !dir.starts_with(ext_dir) {
+            break;
+        }
+        let pkg_path = dir.join("package.json");
+        if pkg_path.is_file() {
+            if let Ok(bytes) = fs::read(&pkg_path)
+                && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && !package_declared_entry_points(&json).is_empty()
+            {
+                return dir.to_path_buf();
+            }
+            break;
+        }
+        current = dir.parent();
+    }
+    resolve_manifest_scan_root(ext_dir, entry_abs)
+}
+
 #[allow(clippy::too_many_lines)]
 #[test]
 fn test_generate_validated_manifest() {
@@ -2044,6 +2069,8 @@ fn test_generate_validated_manifest() {
         let source_tier = determine_source_tier(&entry_path);
         let entry_abs = artifacts_dir.join(&entry_path);
         let scan_root = resolve_manifest_scan_root(ext_dir, &entry_abs);
+        let provider_scan_root = resolve_executed_package_root(ext_dir, &entry_abs);
+        let same_provider_root = provider_scan_root == scan_root;
         let ts_files = collect_ts_files(&scan_root);
         let has_npm_deps = has_npm_dependencies(&scan_root);
 
@@ -2085,6 +2112,14 @@ fn test_generate_validated_manifest() {
             })
             .map_or(static_registrations, |prev| prev.registrations.clone());
 
+        let registers_providers = if same_provider_root {
+            all_content.contains("registerProvider(")
+        } else {
+            collect_ts_files(&provider_scan_root).iter().any(|file| {
+                fs::read_to_string(file).is_ok_and(|content| content.contains("registerProvider("))
+            })
+        };
+
         let caps = ManifestCapabilities {
             registers_tools: !registrations.tools.is_empty()
                 || existing_by_id.get(id).map_or_else(
@@ -2101,7 +2136,7 @@ fn test_generate_validated_manifest() {
                     || all_content.contains("registerFlag("),
                     |prev| prev.capabilities.registers_flags,
                 ),
-            registers_providers: all_content.contains("registerProvider("),
+            registers_providers,
             subscribes_events: registrations.event_handlers.clone(),
             uses_exec: cap_names.contains(&"exec"),
             uses_http: cap_names.contains(&"http"),
@@ -2471,6 +2506,22 @@ fn test_resolve_manifest_scan_root_scopes_bundled_monorepo_subpackage() {
         assert_eq!(
             resolve_manifest_scan_root(&marckrenn_dir, &marckrenn_entry),
             marckrenn_dir.join("sub-bar")
+        );
+    }
+
+    // Executed-package scoping for provider detection isolates sibling packages
+    // with explicit pi.extensions declarations (e.g. ben-vargas-pi-packages).
+    assert_eq!(
+        resolve_executed_package_root(&plain_mono, &pkg_a_entry),
+        pkg_a
+    );
+    let ben_vargas_dir =
+        repo_root.join("tests/ext_conformance/artifacts/third-party/ben-vargas-pi-packages");
+    let ben_vargas_entry = ben_vargas_dir.join("pi-ancestor-discovery/extensions/index.ts");
+    if ben_vargas_entry.is_file() {
+        assert_eq!(
+            resolve_executed_package_root(&ben_vargas_dir, &ben_vargas_entry),
+            ben_vargas_dir.join("pi-ancestor-discovery")
         );
     }
 }

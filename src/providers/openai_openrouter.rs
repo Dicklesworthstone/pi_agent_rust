@@ -588,7 +588,7 @@ mod tests {
                 .build_request_json(&context, &StreamOptions::default())
                 .unwrap();
             assert_eq!(request["messages"][0]["reasoning_details"], details);
-            assert!(request["messages"][0].get("content").is_none());
+            assert_eq!(request["messages"][0]["content"], json!(""));
         }
         for delta in [
             json!({"content": "plain reply"}),

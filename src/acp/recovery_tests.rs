@@ -1567,10 +1567,9 @@ fn dispatcher_prompt_keywords_use_authored_text_without_consuming_reference_cont
             .to_string()
             .contains("REFERENCE-BLOB")
     );
-    assert!(
-        user_content(&requests[3].1)
-            .to_string()
-            .contains("[resource: orchestrate]")
+    assert_eq!(
+        user_content(&requests[3].1),
+        &json!([{"type": "text", "text": "orchestrate"}])
     );
 }
 

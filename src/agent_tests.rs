@@ -1045,14 +1045,26 @@ mod tests {
 
     #[derive(Debug)]
     struct CapturingProvider {
+        provider_name: &'static str,
         api: &'static str,
+        model_id: &'static str,
         calls: StdArc<StdTestMutex<Vec<CapturedProviderContext>>>,
     }
 
     impl CapturingProvider {
         fn new(api: &'static str) -> Self {
+            Self::new_with_identity("capturing-provider", api, "capture-model")
+        }
+
+        fn new_with_identity(
+            provider_name: &'static str,
+            api: &'static str,
+            model_id: &'static str,
+        ) -> Self {
             Self {
+                provider_name,
                 api,
+                model_id,
                 calls: StdArc::new(StdTestMutex::new(Vec::new())),
             }
         }
@@ -1063,10 +1075,9 @@ mod tests {
     }
 
     #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
     impl Provider for CapturingProvider {
         fn name(&self) -> &str {
-            "capturing-provider"
+            self.provider_name
         }
 
         fn api(&self) -> &str {
@@ -1074,7 +1085,7 @@ mod tests {
         }
 
         fn model_id(&self) -> &str {
-            "capture-model"
+            self.model_id
         }
 
         async fn stream(
@@ -1506,14 +1517,10 @@ mod tests {
                     }
                     let live = serde_json::to_value(session.agent.messages()).unwrap();
                     for next in entries {
-                        let error = run_native_effect_turn(
-                            &mut session,
-                            next,
-                            None,
-                            Arc::new(|_| {}),
-                        )
-                        .await
-                        .expect_err("an abandoned effect must fence native re-entry");
+                        let error =
+                            run_native_effect_turn(&mut session, next, None, Arc::new(|_| {}))
+                                .await
+                                .expect_err("an abandoned effect must fence native re-entry");
                         assert!(
                             error.is_session_persistence(),
                             "{entry:?} -> {next:?}: {error}"
@@ -1573,7 +1580,9 @@ mod tests {
                     );
                 }
                 assert!(matches!(retained.start_attempt(), Err(Error::Session(_))));
-                inflight.finish(0.75).expect("an owned bill must still settle");
+                inflight
+                    .finish(0.75)
+                    .expect("an owned bill must still settle");
                 assert_eq!(retained.spent(), 0.75);
                 assert_eq!(
                     std::fs::read_to_string(temp.path().join("native-effect.txt")).unwrap(),
@@ -1652,7 +1661,11 @@ mod tests {
             assert!(result.is_err());
             let error = session.ensure_provider_reentry_allowed().unwrap_err();
             assert!(error.is_session_persistence());
-            assert!(error.to_string().contains("PI_NATIVE_TOOL_TURN_INTERRUPTED"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("PI_NATIVE_TOOL_TURN_INTERRUPTED")
+            );
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
             assert!(!temp.path().join("native-effect.txt").exists());
         });
@@ -2002,7 +2015,8 @@ mod tests {
             session
                 .ensure_provider_reentry_allowed()
                 .expect("a completed checkpoint leaves no unpersisted tool effects");
-            let provider = CapturingProvider::new("test-api");
+            let provider =
+                CapturingProvider::new_with_identity("stall-fixture", "test-api", "test-model");
             let captured = provider.calls();
             session.agent.set_provider(Arc::new(provider));
             session
