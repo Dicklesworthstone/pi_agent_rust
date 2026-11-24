@@ -17746,12 +17746,13 @@ class Readable extends Stream {
         return await pending;
       },
       async return() {
+        const cancel = !done && !stream.destroyed;
         queue.length = 0;
         queuedBytes = 0;
         settleDone();
-        // Node's default iterator owns the stream. A for-await break must
-        // cancel a live Web reader instead of leaving its HTTP request running.
-        if (!stream.destroyed) stream.destroy();
+        // Early return cancels a live source. QuickJS also calls return()
+        // after normal exhaustion, when the stream's EOF policy already ran.
+        if (cancel) stream.destroy();
         return { value: undefined, done: true };
       },
       [Symbol.asyncIterator]() { return this; },
@@ -31602,8 +31603,8 @@ mod tests {
         // Only this deliberately changed module is re-pinned.
         (
             "node:stream",
-            50_718,
-            "068c9bb73c68c4febc53dfcd10933d92408991dfb03aaf7f5348ddc93f8d19de",
+            50_755,
+            "a92d1c4b6f8649ca6c86f4e0d35cf02fba54e123ce5f6a85ac34166449f37d5a",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -47321,8 +47322,19 @@ globalThis.__spawn_abort_result = result;
                         result.afterSequential = nextByte(fd);
                         result.retained = sequential.fd === fd && !sequential.closed;
                         const pathStream = fs.createReadStream('/tmp/source', { autoClose: false });
-                        await collect(pathStream);
-                        result.pathRetained = fs.fstatSync(pathStream.fd).size === 9;
+                        const finished = pathStream[Symbol.asyncIterator]();
+                        await finished.next();
+                        result.reachedEof = (await finished.next()).done;
+                        await finished.return();
+                        result.pathRetained = !pathStream.closed && fs.fstatSync(pathStream.fd).size === 9;
+                        const partial = fs.createReadStream('/tmp/source', {
+                            autoClose: false, highWaterMark: 1,
+                        });
+                        const active = partial[Symbol.asyncIterator]();
+                        result.firstByte = String((await active.next()).value);
+                        const partialFd = partial.fd;
+                        await active.return();
+                        result.earlyReturnClosed = partial.closed && released(partialFd);
                         const owned = pathStream.fd;
                         pathStream.on('error', () => {});
                         pathStream.destroy(new Error('cancel'));
@@ -47363,7 +47375,10 @@ globalThis.__spawn_abort_result = result;
             assert_eq!(result["bytesRead"], json!(2));
             assert_eq!(result["afterSequential"], json!("g"));
             assert_eq!(result["retained"], json!(true));
+            assert_eq!(result["reachedEof"], json!(true));
             assert_eq!(result["pathRetained"], json!(true));
+            assert_eq!(result["firstByte"], json!("a"));
+            assert_eq!(result["earlyReturnClosed"], json!(true));
             assert_eq!(result["explicitlyReleased"], json!(true));
             assert_eq!(result["foreignDenied"], json!(true));
             assert_eq!(result["afterForeign"], json!("h"));
