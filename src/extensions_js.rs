@@ -13409,6 +13409,10 @@ const __pi_vfs = (() => {
     nextFd: 100,
     nextInode: 1,
   };
+  // Descriptor writes grow an owned backing store geometrically. Keeping it
+  // separate from public read buffers avoids retaining every stream chunk or
+  // copying the entire accumulated file again for each acknowledged write.
+  const writeStorage = new WeakMap();
   const extensionTmpRoot = "/__pi_extension_tmp";
   const windowsPaths = globalThis.process && globalThis.process.platform === "win32";
   const metadataClock = typeof globalThis.__pi_now_ms_native === "function"
@@ -13704,6 +13708,7 @@ const __pi_vfs = (() => {
     let file = state.files.get(path);
     if (file) {
       file.bytes = bytes;
+      writeStorage.delete(file);
     } else {
       file = { bytes, metadata: ensureMetadata(path, "file", seed), path };
       state.files.set(path, file);
@@ -13724,6 +13729,27 @@ const __pi_vfs = (() => {
 
   function replaceFileBytes(file, bytes) {
     file.bytes = bytes;
+    writeStorage.delete(file);
+    file.metadata.mtimeMs = file.metadata.ctimeMs = metadataTime();
+  }
+
+  function writeFileChunk(file, cursor, chunk) {
+    if (chunk.byteLength === 0) return;
+    const required = cursor + chunk.byteLength;
+    if (!Number.isSafeInteger(required)) {
+      throw new RangeError("file write exceeds the safe integer range");
+    }
+    const current = file.bytes;
+    let storage = writeStorage.get(file);
+    if (!storage || required > storage.byteLength) {
+      const capacity = Math.max(required, current.byteLength, storage ? storage.byteLength * 2 : 4096);
+      const next = new Uint8Array(capacity);
+      next.set(current);
+      storage = next;
+      writeStorage.set(file, storage);
+    }
+    storage.set(chunk, cursor);
+    file.bytes = storage.subarray(0, Math.max(current.byteLength, required));
     file.metadata.mtimeMs = file.metadata.ctimeMs = metadataTime();
   }
 
@@ -14425,6 +14451,7 @@ const __pi_vfs = (() => {
   state.setFile = setFile;
   state.unlinkFile = unlinkFile;
   state.replaceFileBytes = replaceFileBytes;
+  state.writeFileChunk = writeFileChunk;
   state.toBytes = toBytes;
   state.decodeBytes = decodeBytes;
   state.readHostBytes = readHostBytes;
@@ -15069,12 +15096,7 @@ export function writeSync(fd, buffer, offset, length, position) {
   if (entry.append) cursor = entry.file.bytes.byteLength;
   else if (!explicitPosition) cursor = entry.position;
 
-  const current = entry.file.bytes;
-  const required = cursor + chunk.byteLength;
-  const next = new Uint8Array(Math.max(current.byteLength, required));
-  next.set(current, 0);
-  next.set(chunk, cursor);
-  if (chunk.byteLength > 0) __pi_vfs.replaceFileBytes(entry.file, next);
+  __pi_vfs.writeFileChunk(entry.file, cursor, chunk);
 
   if (!explicitPosition) {
     entry.position = cursor + chunk.byteLength;
@@ -15426,76 +15448,130 @@ export function createReadStream(path, opts) {
   return stream;
 }
 export function createWriteStream(path, opts) {
-  const options = opts && typeof opts === "object" ? opts : {};
-  const encoding = typeof options.encoding === "string" ? options.encoding : "utf8";
-  const flags = typeof options.flags === "string" ? options.flags : "w";
-  const fd = openSync(path, flags, options.mode);
-  const fdEntry = __pi_vfs.getFdEntry(fd);
-  const bufferedChunks = [];
+  const options = typeof opts === "string" ? { encoding: opts }
+    : opts && typeof opts === "object" ? opts : {};
+  const encoding = options.encoding ?? "utf8";
+  const flags = options.flags ?? "w";
+  const highWaterMark = options.highWaterMark ?? 64 * 1024;
+  const autoClose = options.autoClose ?? true;
+  const suppliedFd = options.fd ?? null;
+  let position = options.start ?? null;
+  if (typeof encoding !== "string" || !Buffer.isEncoding(encoding)) {
+    throw new TypeError("write stream encoding must be a supported Buffer encoding");
+  }
+  if (position !== null && (!Number.isSafeInteger(position) || position < 0)) {
+    throw new RangeError("write stream start must be a nonnegative safe integer");
+  }
+  if (typeof autoClose !== "boolean") {
+    throw new TypeError("write stream autoClose must be a boolean");
+  }
+  if (suppliedFd !== null && (!Number.isSafeInteger(suppliedFd) || suppliedFd < 0)) {
+    throw new TypeError("write stream fd must be a nonnegative integer");
+  }
+  const owner = { extensionId: __pi_vfs.currentExtensionId() };
+  // Supplied descriptors ignore path, including its coercion and authority.
+  const sourcePath = suppliedFd === null
+    ? __pi_vfs.absoluteInputPath(String(path ?? "").replace(/\\/g, "/")) : null;
+  let fd = null;
+  let fdEntry = null;
+  let bytesWritten = 0;
   let closed = false;
+  let openError = null;
 
-  // A stream owns the descriptor it opened. Close it at most once, and only
-  // while that exact descriptor is still registered. Lifecycle scrubs keep
-  // descriptor IDs monotonic, so a stale stream must never close a newer entry.
+  const requireOpen = () => {
+    if (openError) throw openError;
+    __pi_vfs.assertFdOwner(owner, "write");
+    if (closed) throw new Error("EBADF: write stream descriptor is closed");
+    if (fd === null) {
+      if (suppliedFd !== null) {
+        const entry = __pi_vfs.getFdEntry(suppliedFd);
+        // Never claim a foreign handle, even for error-path cleanup.
+        __pi_vfs.assertFdOwner(entry, "write");
+        fd = suppliedFd;
+        fdEntry = entry;
+      } else {
+        fd = openSync(sourcePath, flags, options.mode);
+        fdEntry = __pi_vfs.getFdEntry(fd);
+      }
+      stream.fd = fd;
+    }
+    if (__pi_vfs.fds.get(fd) !== fdEntry) {
+      throw new Error("EBADF: bad file descriptor, fd " + String(fd));
+    }
+    return fd;
+  };
+
+  // An acknowledged write already changed the owned VFS file. Teardown only
+  // releases its exact descriptor; it never commits buffered foreign writes.
   const closeOwnedFd = () => {
     if (closed) return;
     closed = true;
-    if (__pi_vfs.fds.get(fd) !== fdEntry) return;
     try {
-      closeSync(fd);
-    } finally {
-      // A stream owns its exact descriptor even if cleanup runs under a
-      // different callback principal. Never release a reused numeric handle.
-      if (__pi_vfs.fds.get(fd) === fdEntry) {
-        __pi_vfs.fds.delete(fd);
+      if (fd === null || __pi_vfs.fds.get(fd) !== fdEntry) return;
+      try { closeSync(fd); }
+      finally {
+        if (__pi_vfs.fds.get(fd) === fdEntry) __pi_vfs.fds.delete(fd);
       }
+    } finally {
+      fd = null;
+      fdEntry = null;
+      try { stream.fd = null; } catch (_) {}
     }
   };
 
   const stream = new Writable({
-    autoDestroy: false,
+    highWaterMark,
+    autoDestroy: autoClose,
     write(chunk, chunkEncoding, callback) {
       try {
-        const normalizedEncoding =
-          typeof chunkEncoding === "string" && chunkEncoding
-            ? chunkEncoding
-            : encoding;
-        const bytes = __pi_vfs.toBytes(chunk, normalizedEncoding);
-        bufferedChunks.push(bytes);
-        this.bytesWritten += bytes.byteLength;
+        const descriptor = requireOpen();
+        const bytes = typeof chunk === "string"
+          ? Buffer.from(chunk, chunkEncoding || encoding)
+          : __pi_vfs.toBytes(chunk, chunkEncoding || encoding);
+        const count = writeSync(descriptor, bytes, 0, bytes.byteLength, position);
+        if (position !== null) position += count;
+        bytesWritten += count;
         callback(null);
       } catch (err) {
-        const original = err instanceof Error ? err : new Error(String(err));
-        try { closeOwnedFd(); } catch (_) {}
-        callback(original);
+        callback(err instanceof Error ? err : new Error(String(err)));
       }
     },
     final(callback) {
       try {
-        for (const bytes of bufferedChunks) {
-          writeSync(fd, bytes, 0, bytes.byteLength, null);
-        }
-        closeOwnedFd();
+        // end() with no writes still creates/truncates an empty output file.
+        requireOpen();
+        if (autoClose) closeOwnedFd();
         callback(null);
       } catch (err) {
-        const original = err instanceof Error ? err : new Error(String(err));
-        try { closeOwnedFd(); } catch (_) {}
-        callback(original);
+        callback(err instanceof Error ? err : new Error(String(err)));
       }
     },
+    destroy(error, callback) {
+      // autoClose:false leaves even a failed descriptor with its caller.
+      try { if (autoClose) closeOwnedFd(); } catch (_) {}
+      callback(error);
+    },
   });
-  stream.path = __pi_vfs.normalizePath(path);
-  stream.fd = fd;
-  stream.bytesWritten = 0;
+  stream.path = sourcePath === null ? undefined : __pi_vfs.normalizePath(sourcePath);
+  stream.fd = null;
+  Object.defineProperty(stream, "bytesWritten", { get: () => bytesWritten });
+  // Writable must count strings with the configured encoding as well as pass
+  // that encoding to the write hook, so pressure measures output bytes.
+  const baseWrite = stream.write;
+  stream.write = function(chunk, chunkEncoding, callback) {
+    const cb = typeof chunkEncoding === "function" ? chunkEncoding : callback;
+    const enc = typeof chunkEncoding === "string" ? chunkEncoding : encoding;
+    return baseWrite.call(this, chunk, enc, cb);
+  };
   stream.cork = () => stream;
   stream.uncork = () => stream;
-  const baseDestroy = stream.destroy.bind(stream);
-  stream.destroy = (err) => {
-    // Preserve Stream.destroy's observable error/close behavior; descriptor
-    // cleanup is best-effort and must not replace an error supplied by caller.
-    try { closeOwnedFd(); } catch (_) {}
-    return baseDestroy(err);
-  };
+  // Validate Writable options before opening/truncating any file. Open errors
+  // are observable by listeners attached immediately after construction.
+  try { requireOpen(); }
+  catch (error) {
+    openError = error;
+    __queueMicrotaskPolyfill(() => stream.destroy(error));
+  }
   return stream;
 }
 export function readFile(path, optOrCb, cb) {
@@ -31402,11 +31478,13 @@ mod tests {
             "1d90f2b0398f5cb6ab4ccc060c48cf6d87df9bddaf37d01c92606f805fd34c22",
         ),
         // Demand-driven file reads add byte ranges and owned descriptor cleanup.
+        // Incremental write acknowledgements, descriptor ownership and amortized
+        // VFS growth are covered by the file-stream progress/storage regressions.
         // The existing bounded whole-file host snapshot is unchanged.
         (
             "node:fs",
-            89_521,
-            "9100f9eed9f9732c8d444444781b34b8969155a95ef455f62bfa1880f7afa323",
+            92_779,
+            "6dab1836cdc391f53d1cc1c9a791421392c537c84601d51da4cccceef3cdf9e6",
         ),
         (
             "@mariozechner/pi-ai",
@@ -47405,6 +47483,347 @@ globalThis.__spawn_abort_result = result;
                     .is_some_and(|error| error.contains("intentional stream destroy error"))
             );
             assert_eq!(result["destroyFdReleased"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_write_stream_acknowledges_visible_bytes_and_honors_options() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+globalThis.fsWriteProgress = { done: false };
+(async () => {
+    const fs = await import("node:fs");
+    const write = (stream, chunk) => new Promise((resolve, reject) => {
+        stream.write(chunk, error => error ? reject(error) : resolve());
+    });
+    const end = (stream, chunk) => new Promise((resolve, reject) => {
+        stream.end(chunk, error => error ? reject(error) : resolve());
+    });
+    const stream = fs.createWriteStream("/tmp/write-progress", { highWaterMark: 4 });
+    const events = [];
+    stream.on("finish", () => events.push("finish"));
+    stream.on("close", () => events.push("close"));
+    let visibleInCallback = "", bytesInCallback = 0, pressured;
+    const input = Buffer.from("abcd");
+    await new Promise((resolve, reject) => {
+        pressured = !stream.write(input, error => {
+            if (error) { reject(error); return; }
+            visibleInCallback = fs.readFileSync("/tmp/write-progress", "utf8");
+            bytesInCallback = stream.bytesWritten;
+            resolve();
+        });
+    });
+    const snapshot = fs.readFileSync("/tmp/write-progress");
+    input[0] = 120;
+    await write(stream, "ef");
+    const beforeFinish = fs.readFileSync("/tmp/write-progress", "utf8");
+    await end(stream);
+    const afterFinish = fs.readFileSync("/tmp/write-progress", "utf8");
+
+    const cancelled = fs.createWriteStream("/tmp/write-cancelled");
+    await write(cancelled, "retained");
+    cancelled.destroy();
+    const afterDestroy = fs.readFileSync("/tmp/write-cancelled", "utf8");
+
+    const update = fs.createWriteStream("/tmp/write-progress", { flags: "r+", start: 2 });
+    await write(update, "XY");
+    await end(update, "Z");
+    const updated = fs.readFileSync("/tmp/write-progress", "utf8");
+    const append = fs.createWriteStream("/tmp/write-progress", { flags: "a", start: 0 });
+    await end(append, "!");
+    const appended = fs.readFileSync("/tmp/write-progress", "utf8");
+
+    const hole = fs.createWriteStream("/tmp/write-hole", { start: 3 });
+    await end(hole, "A");
+    const holeHex = fs.readFileSync("/tmp/write-hole", "hex");
+    const encoded = fs.createWriteStream("/tmp/write-encoding", "utf16le");
+    await end(encoded, "AΩ");
+    const encodedHex = fs.readFileSync("/tmp/write-encoding", "hex");
+    const base64 = fs.createWriteStream("/tmp/write-base64", { encoding: "base64", highWaterMark: 3 });
+    const base64Pressure = !base64.write("YWJj");
+    await end(base64);
+    const decoded = fs.readFileSync("/tmp/write-base64", "utf8");
+
+    fs.writeFileSync("/tmp/write-options", "keep");
+    const invalid = [];
+    for (const options of [
+        { highWaterMark: -1 }, { highWaterMark: 1.5 }, { start: -1 },
+        { start: Number.MAX_SAFE_INTEGER + 1 }, { encoding: "not-an-encoding" },
+        { autoClose: "yes" }, { fd: -1 },
+    ]) {
+        try { fs.createWriteStream("/tmp/write-options", options); invalid.push(false); }
+        catch (_) { invalid.push(fs.readFileSync("/tmp/write-options", "utf8") === "keep"); }
+    }
+
+    fs.mkdirSync("/tmp/write-open-error");
+    const failedOpen = fs.createWriteStream("/tmp/write-open-error");
+    let failedOpenEvents = 0;
+    failedOpen.on("error", () => { failedOpenEvents++; });
+    fs.rmdirSync("/tmp/write-open-error");
+    let failedOpenError = "";
+    try { await write(failedOpen, "must-not-write"); }
+    catch (error) { failedOpenError = String(error); }
+    const failedOpenDidNotCreate = !fs.existsSync("/tmp/write-open-error");
+
+    globalThis.fsWriteProgress = {
+        done: true, pressured, highWaterMark: stream.writableHighWaterMark,
+        visibleInCallback, bytesInCallback, beforeFinish, afterFinish, events,
+        snapshot: String(snapshot), afterDestroy, cancelledClosed: cancelled.closed,
+        bytesWritten: stream.bytesWritten, fd: stream.fd, updated, appended,
+        holeHex, encodedHex, base64Pressure, decoded, invalid,
+        failedOpenDenied: failedOpenError.includes("EISDIR"), failedOpenDidNotCreate, failedOpenEvents,
+    };
+})().catch(error => { globalThis.fsWriteProgress.error = String(error); });
+"#,
+                )
+                .await
+                .expect("evaluate incremental file stream writes");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsWriteProgress").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["pressured"], json!(true));
+            assert_eq!(result["highWaterMark"], json!(4));
+            assert_eq!(result["visibleInCallback"], json!("abcd"));
+            assert_eq!(result["bytesInCallback"], json!(4));
+            assert_eq!(result["beforeFinish"], json!("abcdef"));
+            assert_eq!(result["afterFinish"], json!("abcdef"));
+            assert_eq!(result["events"], json!(["finish", "close"]));
+            assert_eq!(result["snapshot"], json!("abcd"));
+            assert_eq!(result["afterDestroy"], json!("retained"));
+            assert_eq!(result["cancelledClosed"], json!(true));
+            assert_eq!(result["bytesWritten"], json!(6));
+            assert_eq!(result["fd"], serde_json::Value::Null);
+            assert_eq!(result["updated"], json!("abXYZf"));
+            assert_eq!(result["appended"], json!("abXYZf!"));
+            assert_eq!(result["holeHex"], json!("00000041"));
+            assert_eq!(result["encodedHex"], json!("4100a903"));
+            assert_eq!(result["base64Pressure"], json!(true));
+            assert_eq!(result["decoded"], json!("abc"));
+            assert_eq!(
+                result["invalid"],
+                json!([true, true, true, true, true, true, true])
+            );
+            assert_eq!(result["failedOpenDenied"], json!(true));
+            assert_eq!(result["failedOpenDidNotCreate"], json!(true));
+            assert_eq!(result["failedOpenEvents"], json!(1));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_write_stream_preserves_descriptor_ownership_and_retention() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let script = r#"
+globalThis.fsWriteOwnership = { done: false };
+(async () => {
+    const fs = await import("node:fs");
+    const write = (stream, chunk) => new Promise(resolve => {
+        stream.write(chunk, error => resolve(error ? String(error) : ""));
+    });
+    const end = (stream, chunk) => new Promise(resolve => {
+        stream.end(chunk, error => resolve(error ? String(error) : ""));
+    });
+    let stream, ownedFd, foreignFd;
+    const result = {};
+    await __pi_with_extension_async(__pi_test_secret, "ext.writer.a", async () => {
+        stream = fs.createWriteStream("/tmp/owner-write");
+        stream.on("error", () => {});
+        ownedFd = stream.fd;
+        result.firstError = await write(stream, "safe");
+        fs.writeFileSync("/tmp/foreign-fd", "foreign");
+        foreignFd = fs.openSync("/tmp/foreign-fd", "r+");
+    });
+    await __pi_with_extension_async(__pi_test_secret, "ext.writer.b", async () => {
+        fs.writeFileSync("/tmp/owner-write", "other");
+        const unrelated = fs.openSync("/tmp/owner-write", "r+");
+        stream.fd = unrelated;
+        result.denied = (await write(stream, "EVIL")).includes("host write denied");
+        result.closed = stream.closed;
+        result.bytesWritten = stream.bytesWritten;
+        const buf = Buffer.alloc(5);
+        result.unrelatedKept = fs.readSync(unrelated, buf, 0, 5, 0) === 5
+            && String(buf) === "other";
+        fs.closeSync(unrelated);
+        const foreign = fs.createWriteStream("/tmp/not-created", { fd: foreignFd });
+        foreign.on("error", () => {});
+        result.foreignDenied = (await write(foreign, "EVIL")).includes("host write denied");
+        result.pathIgnored = !fs.existsSync("/tmp/not-created");
+    });
+    await __pi_with_extension_async(__pi_test_secret, "ext.writer.a", async () => {
+        result.ownedContent = fs.readFileSync("/tmp/owner-write", "utf8");
+        try { fs.closeSync(ownedFd); result.ownedReleased = false; }
+        catch (error) { result.ownedReleased = String(error).includes("EBADF"); }
+        result.foreignKept = fs.fstatSync(foreignFd).size === 7;
+        fs.closeSync(foreignFd);
+
+        const retainedFd = fs.openSync("/tmp/retained-fd", "w+");
+        fs.writeSync(retainedFd, "a");
+        const retained = fs.createWriteStream({
+            toString() { throw new Error("supplied fd must ignore path"); }
+        }, { fd: retainedFd, autoClose: false });
+        result.retainedError = await end(retained, "b");
+        result.retainedOpen = fs.fstatSync(retainedFd).size === 2;
+        result.retainedClosed = retained.closed;
+        fs.writeSync(retainedFd, "c");
+        result.retainedContent = fs.readFileSync("/tmp/retained-fd", "utf8");
+        fs.closeSync(retainedFd);
+
+        const failedFd = fs.openSync("/tmp/failed-retained", "w+");
+        const failed = fs.createWriteStream(null, { fd: failedFd, autoClose: false });
+        failed.on("error", () => {});
+        result.failedError = (await write(failed, {
+            toString() { throw new Error("conversion failure"); }
+        })).includes("conversion failure");
+        result.failedRetained = fs.fstatSync(failedFd).size === 0;
+        result.failedBytes = failed.bytesWritten;
+        fs.closeSync(failedFd);
+
+        const guarded = fs.createWriteStream("/tmp/guarded-fd");
+        const guardedFd = guarded.fd;
+        await write(guarded, "ok");
+        Object.defineProperty(guarded, "fd", {
+            get() { return 123456; },
+            set() { throw new Error("public fd setter"); },
+        });
+        guarded.destroy();
+        try { fs.closeSync(guardedFd); result.guardedReleased = false; }
+        catch (error) { result.guardedReleased = String(error).includes("EBADF"); }
+    });
+    globalThis.fsWriteOwnership = { done: true, ...result };
+})().catch(error => { globalThis.fsWriteOwnership.error = String(error); });
+"#;
+            runtime
+                .eval(&privileged_test_script(&runtime, script))
+                .await
+                .expect("evaluate file stream descriptor ownership");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsWriteOwnership").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["firstError"], json!(""));
+            assert_eq!(result["denied"], json!(true));
+            assert_eq!(result["closed"], json!(true));
+            assert_eq!(result["bytesWritten"], json!(4));
+            assert_eq!(result["unrelatedKept"], json!(true));
+            assert_eq!(result["foreignDenied"], json!(true));
+            assert_eq!(result["pathIgnored"], json!(true));
+            assert_eq!(result["ownedContent"], json!("safe"));
+            assert_eq!(result["ownedReleased"], json!(true));
+            assert_eq!(result["foreignKept"], json!(true));
+            assert_eq!(result["retainedError"], json!(""));
+            assert_eq!(result["retainedOpen"], json!(true));
+            assert_eq!(result["retainedClosed"], json!(false));
+            assert_eq!(result["retainedContent"], json!("abc"));
+            assert_eq!(result["failedError"], json!(true));
+            assert_eq!(result["failedRetained"], json!(true));
+            assert_eq!(result["failedBytes"], json!(0));
+            assert_eq!(result["guardedReleased"], json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_write_stream_storage_preserves_identity_with_linear_copy_work() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+globalThis.fsWriteStorage = { done: false };
+(async () => {
+    const fs = await import("node:fs");
+    const supplied = new Uint8Array([65, 66, 67, 68]);
+    fs.writeFileSync("/tmp/write-storage", supplied.buffer);
+    const fd = fs.openSync("/tmp/write-storage", "r+");
+    const peer = fs.openSync("/tmp/write-storage", "r+");
+    const before = fs.readFileSync("/tmp/write-storage");
+    fs.writeSync(fd, "Q", 0);
+    const callerUnchanged = Array.from(supplied);
+    const snapshotUnchanged = String(before);
+    const peerView = Buffer.alloc(4);
+    fs.readSync(peer, peerView, 0, 4, 0);
+    fs.ftruncateSync(fd, 2);
+    fs.writeSync(peer, "Z", 5);
+    const afterTruncate = fs.readFileSync("/tmp/write-storage", "hex");
+    fs.writeFileSync("/tmp/write-storage", "AB");
+    fs.writeSync(fd, "Y", 4);
+    const afterReplace = fs.readFileSync("/tmp/write-storage", "hex");
+    fs.renameSync("/tmp/write-storage", "/tmp/write-moved");
+    fs.writeSync(peer, "!", 5);
+    const afterRename = fs.readFileSync("/tmp/write-moved", "hex");
+    fs.unlinkSync("/tmp/write-moved");
+    fs.writeSync(fd, "?", 6);
+    const unlinkedNotRecreated = !fs.existsSync("/tmp/write-moved")
+        && !fs.existsSync("/tmp/write-storage") && fs.fstatSync(fd).size === 7;
+    fs.closeSync(fd);
+    fs.closeSync(peer);
+
+    // Count bytes copied, not elapsed wall time. Small writes and
+    // slow CI hosts cannot hide quadratic copies behind a timing threshold.
+    const chunk = Buffer.alloc(256, 120);
+    const count = 256;
+    const totalBytes = chunk.length * count;
+    const originalSet = Uint8Array.prototype.set;
+    let copiedBytes = 0;
+    const output = fs.createWriteStream("/tmp/write-many", { highWaterMark: 256 });
+    let everyCallbackVisible = true;
+    try {
+        Uint8Array.prototype.set = function(source, offset) {
+            copiedBytes += source.length;
+            return originalSet.call(this, source, offset);
+        };
+        for (let index = 0; index < count; index++) {
+            await new Promise((resolve, reject) => {
+                output.write(chunk, error => {
+                    if (error) { reject(error); return; }
+                    everyCallbackVisible = everyCallbackVisible
+                        && fs.statSync("/tmp/write-many").size === (index + 1) * chunk.length;
+                    resolve();
+                });
+            });
+        }
+        await new Promise((resolve, reject) => {
+            output.end(error => error ? reject(error) : resolve());
+        });
+    } finally { Uint8Array.prototype.set = originalSet; }
+    const bytes = fs.readFileSync("/tmp/write-many");
+    globalThis.fsWriteStorage = {
+        done: true, callerUnchanged, snapshotUnchanged, peerView: String(peerView),
+        afterTruncate, afterReplace, afterRename, unlinkedNotRecreated,
+        everyCallbackVisible, linearCopies: copiedBytes < totalBytes * 8,
+        copiedBytes, totalBytes, size: bytes.length,
+        allBytes: bytes.every(byte => byte === 120),
+    };
+})().catch(error => { globalThis.fsWriteStorage.error = String(error); });
+"#,
+                )
+                .await
+                .expect("evaluate file stream storage and copy work");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsWriteStorage").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["callerUnchanged"], json!([65, 66, 67, 68]));
+            assert_eq!(result["snapshotUnchanged"], json!("ABCD"));
+            assert_eq!(result["peerView"], json!("QBCD"));
+            assert_eq!(result["afterTruncate"], json!("51420000005a"));
+            assert_eq!(result["afterReplace"], json!("4142000059"));
+            assert_eq!(result["afterRename"], json!("414200005921"));
+            assert_eq!(result["unlinkedNotRecreated"], json!(true));
+            assert_eq!(result["everyCallbackVisible"], json!(true));
+            assert_eq!(result["linearCopies"], json!(true), "{result}");
+            assert_eq!(result["totalBytes"], json!(65_536));
+            assert_eq!(result["size"], json!(65_536));
+            assert_eq!(result["allBytes"], json!(true));
         });
     }
 
