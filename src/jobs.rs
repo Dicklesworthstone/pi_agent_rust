@@ -318,6 +318,22 @@ pub struct ArtifactCleanupOutcome {
 }
 
 impl ArtifactCleanupOutcome {
+    fn retention_error(&self, error: Error, operation: &str) -> Error {
+        self.with_partial_cleanup(match error {
+            Error::Io(source) => Error::tool("bash", format!("{operation}: {source}")),
+            admission_error => admission_error,
+        })
+    }
+
+    fn with_partial_cleanup(&self, mut error: Error) -> Error {
+        if self.removed_files > 0
+            && let Error::Tool { message, .. } = &mut error
+        {
+            message.push_str(&self.setup_failure_context());
+        }
+        error
+    }
+
     fn setup_failure_context(&self) -> String {
         format!(
             "; artifact cleanup before setup failure: policy={}, removedFiles={}, reclaimedBytes={}",
@@ -1097,9 +1113,14 @@ fn is_managed_job_artifact_name(name: &OsStr) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactCleanupCandidate>> {
+fn artifact_cleanup_candidates(
+    jobs_dir: &Path,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<Vec<ArtifactCleanupCandidate>> {
+    checkpoint()?;
     let mut candidates = Vec::new();
     for entry in std::fs::read_dir(jobs_dir)? {
+        checkpoint()?;
         let entry = entry?;
         if !is_managed_job_artifact_name(&entry.file_name()) {
             continue;
@@ -1117,12 +1138,12 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
         {
             Ok(artifact) => artifact,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         match fs4::FileExt::try_lock(&artifact) {
             Ok(()) => {}
             Err(fs4::TryLockError::WouldBlock) => continue,
-            Err(fs4::TryLockError::Error(err)) => return Err(err),
+            Err(fs4::TryLockError::Error(err)) => return Err(err.into()),
         }
         let opened = artifact.metadata()?;
         let opened_identity = FileIdentity::of_open_file(&artifact)?;
@@ -1132,7 +1153,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
                 fs4::FileExt::unlock(&artifact)?;
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         let current_identity = match FileIdentity::of_path_nofollow(&path) {
             Ok(identity) => identity,
@@ -1140,7 +1161,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
                 fs4::FileExt::unlock(&artifact)?;
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         if !current.file_type().is_file()
             || opened_identity != current_identity
@@ -1157,6 +1178,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
             identity: opened_identity,
         });
     }
+    checkpoint()?;
     candidates.sort_by(|left, right| {
         left.modified
             .cmp(&right.modified)
@@ -1165,17 +1187,21 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
     Ok(candidates)
 }
 
-fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Result<Option<u64>> {
+fn remove_unlocked_artifact(
+    candidate: &ArtifactCleanupCandidate,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<Option<u64>> {
+    checkpoint()?;
     match std::fs::symlink_metadata(&candidate.path) {
         Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => return Ok(None),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     }
     let before_identity = match FileIdentity::of_path_nofollow(&candidate.path) {
         Ok(identity) => identity,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
     if candidate.identity != before_identity {
         return Ok(None);
@@ -1187,12 +1213,12 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
     {
         Ok(artifact) => artifact,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
     match fs4::FileExt::try_lock(&artifact) {
         Ok(()) => {}
         Err(fs4::TryLockError::WouldBlock) => return Ok(None),
-        Err(fs4::TryLockError::Error(err)) => return Err(err),
+        Err(fs4::TryLockError::Error(err)) => return Err(err.into()),
     }
     let opened = artifact.metadata()?;
     let opened_identity = FileIdentity::of_open_file(&artifact)?;
@@ -1202,15 +1228,18 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
             fs4::FileExt::unlock(&artifact)?;
             return Ok(None);
         }
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
+    // Admission may block. Recheck the pathname identity after cancellation
+    // is checked and before unlink, while still holding the original file.
+    checkpoint()?;
     let current_identity = match FileIdentity::of_path_nofollow(&candidate.path) {
         Ok(identity) => identity,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             fs4::FileExt::unlock(&artifact)?;
             return Ok(None);
         }
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
     if !current.file_type().is_file()
         || before_identity != current_identity
@@ -1220,9 +1249,8 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
         return Ok(None);
     }
     let removed_bytes = opened.len();
-    let remove_result = std::fs::remove_file(&candidate.path);
-    fs4::FileExt::unlock(&artifact)?;
-    remove_result?;
+    std::fs::remove_file(&candidate.path)?;
+    drop(artifact);
     Ok(Some(removed_bytes))
 }
 
@@ -1269,10 +1297,15 @@ fn artifact_file_reserved_bytes(
     }
 }
 
-fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
+fn artifact_directory_usage(
+    jobs_dir: &Path,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<(u64, usize)> {
+    checkpoint()?;
     let mut bytes = 0u64;
     let mut entries = 0usize;
     for entry in std::fs::read_dir(jobs_dir)? {
+        checkpoint()?;
         let entry = entry?;
         if entry.file_name() == ".artifact-budget.lock" {
             continue;
@@ -1303,44 +1336,39 @@ fn enforce_artifact_retention(
     max_bytes: u64,
     max_entries: usize,
     min_retained: usize,
+    checkpoint: &dyn Fn() -> Result<()>,
 ) -> Result<ArtifactCleanupOutcome> {
-    let (mut stored_bytes, mut stored_entries) =
-        artifact_directory_usage(jobs_dir).map_err(|err| {
-            Error::tool(
-                "bash",
-                format!("Failed to inspect jobs artifact dir: {err}"),
-            )
-        })?;
     let mut outcome = ArtifactCleanupOutcome {
         policy: policy.as_str().to_string(),
         removed_files: 0,
         reclaimed_bytes: 0,
     };
+    let (mut stored_bytes, mut stored_entries) = artifact_directory_usage(jobs_dir, checkpoint)
+        .map_err(|err| outcome.retention_error(err, "Failed to inspect jobs artifact dir"))?;
     if artifact_capacity_available(stored_bytes, stored_entries, max_bytes, max_entries) {
+        checkpoint()?;
         return Ok(outcome);
     }
 
     if policy == ArtifactRetentionPolicy::Rotate {
-        let candidates = artifact_cleanup_candidates(jobs_dir).map_err(|err| {
-            Error::tool(
-                "bash",
-                format!("Failed to inspect jobs artifact retention candidates: {err}"),
-            )
+        let candidates = artifact_cleanup_candidates(jobs_dir, checkpoint).map_err(|err| {
+            outcome.retention_error(err, "Failed to inspect jobs artifact retention candidates")
         })?;
         let removable = candidates.len().saturating_sub(min_retained);
         for candidate in candidates.into_iter().take(removable) {
             if artifact_capacity_available(stored_bytes, stored_entries, max_bytes, max_entries) {
                 break;
             }
-            let removed_bytes = remove_unlocked_artifact(&candidate).map_err(|err| {
-                Error::tool(
-                    "bash",
-                    format!(
-                        "Failed to rotate jobs artifact {}: {err}",
-                        candidate.path.display()
-                    ),
-                )
-            })?;
+            let removed_bytes =
+                remove_unlocked_artifact(&candidate, checkpoint).map_err(|err| {
+                    outcome.retention_error(
+                        err,
+                        &format!(
+                            "Failed to rotate jobs artifact {}",
+                            candidate.path.display()
+                        ),
+                    )
+                })?;
             if let Some(removed_bytes) = removed_bytes {
                 stored_bytes = stored_bytes.saturating_sub(removed_bytes);
                 stored_entries = stored_entries.saturating_sub(1);
@@ -1350,8 +1378,9 @@ fn enforce_artifact_retention(
         }
     }
 
-    (stored_bytes, stored_entries) = artifact_directory_usage(jobs_dir)
-        .map_err(|err| Error::tool("bash", format!("Failed to verify jobs artifact dir: {err}")))?;
+    (stored_bytes, stored_entries) = artifact_directory_usage(jobs_dir, checkpoint)
+        .map_err(|err| outcome.retention_error(err, "Failed to verify jobs artifact dir"))?;
+    checkpoint().map_err(|err| outcome.retention_error(err, "Failed to reserve job artifact"))?;
     if !artifact_capacity_available(stored_bytes, stored_entries, max_bytes, max_entries) {
         return Err(Error::tool(
             "bash",
@@ -1375,6 +1404,7 @@ fn ensure_artifact_budget(jobs_dir: &Path, max_bytes: u64, max_entries: usize) -
         max_bytes,
         max_entries,
         MIN_RETAINED_ARTIFACT_FILES,
+        &|| Ok(()),
     )
     .map(|_| ())
 }
@@ -2154,10 +2184,11 @@ fn spawn_managed(
     std::fs::create_dir_all(&jobs_dir)
         .map_err(|e| Error::tool("bash", format!("Failed to create jobs artifact dir: {e}")))?;
 
-    let artifact_budget_lock = acquire_artifact_budget_lock(&jobs_dir, || {
+    let check_admission = || {
         check_shell_job_admission(&owner, &cancelled)?;
         ensure_session_spawn_generation(owner_session_id, spawn_generation)
-    })?;
+    };
+    let artifact_budget_lock = acquire_artifact_budget_lock(&jobs_dir, check_admission)?;
     let retention_policy = ArtifactRetentionPolicy::from_environment()?;
     let artifact_cleanup = enforce_artifact_retention(
         &jobs_dir,
@@ -2165,6 +2196,7 @@ fn spawn_managed(
         MAX_TOTAL_ARTIFACT_BYTES,
         MAX_ARTIFACT_FILES,
         MIN_RETAINED_ARTIFACT_FILES,
+        &check_admission,
     )?;
     let cleanup_failure_context = artifact_cleanup.setup_failure_context();
     let (artifact_path, artifact) = create_job_artifact(&jobs_dir, &id).map_err(|e| {
@@ -6034,7 +6066,7 @@ mod tests {
 
         let live_reservation = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
         assert_eq!(
-            artifact_directory_usage(temp.path()).expect("account for live artifact"),
+            artifact_directory_usage(temp.path(), &|| Ok(())).expect("account for live artifact"),
             (live_reservation, 1),
             "stored bytes are part of the live reservation, not an additional charge"
         );
@@ -6120,6 +6152,7 @@ mod tests {
             u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits"),
             10,
             0,
+            &|| Ok(()),
         )
         .expect_err("preservation refuses capacity instead of deleting");
         assert!(error.to_string().contains("retention policy: preserve"));
@@ -6130,12 +6163,90 @@ mod tests {
     }
 
     #[test]
+    fn artifact_inventory_stops_during_both_directory_passes() {
+        let temp = tempfile::tempdir().expect("artifact directory");
+        for index in 0..8 {
+            std::fs::write(temp.path().join(format!("job-{index:032x}.log")), b"log")
+                .expect("settled artifact");
+        }
+        for scan_candidates in [false, true] {
+            let visits = std::cell::Cell::new(0);
+            let checkpoint = || {
+                visits.set(visits.get() + 1);
+                if visits.get() == 3 {
+                    return Err(shell_job_cancelled_error());
+                }
+                Ok(())
+            };
+            let result = if scan_candidates {
+                artifact_cleanup_candidates(temp.path(), &checkpoint).map(|_| ())
+            } else {
+                artifact_directory_usage(temp.path(), &checkpoint).map(|_| ())
+            };
+            assert!(matches!(result, Err(Error::Tool { tool, message })
+                if tool == "jobs" && message.contains("PI_JOBS_CANCELLED")));
+            assert_eq!(visits.get(), 3);
+        }
+    }
+
+    #[test]
+    fn cancelled_rotation_preserves_locked_candidate_and_reports_prior_removals() {
+        let temp = tempfile::tempdir().expect("artifact directory");
+        let paths: Vec<_> = (0..3)
+            .map(|index| {
+                let path = temp.path().join(format!("job-{index:032x}.log"));
+                std::fs::write(&path, b"data").expect("settled artifact");
+                filetime::set_file_mtime(
+                    &path,
+                    filetime::FileTime::from_unix_time(1_700_000_000 + index, 0),
+                )
+                .expect("ordered artifacts");
+                path
+            })
+            .collect();
+        // An independent handle observes the checkpoint inside the locked
+        // unlink. The earlier candidate has already been removed by then.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&paths[1])
+            .expect("probe second artifact");
+        let checkpoint = || match fs4::FileExt::try_lock(&probe) {
+            Ok(()) => fs4::FileExt::unlock(&probe).map_err(Error::from),
+            Err(fs4::TryLockError::WouldBlock) => Err(Error::tool(
+                "jobs",
+                "PI_JOBS_TASK_TIMEOUT: original launch deadline elapsed",
+            )),
+            Err(fs4::TryLockError::Error(error)) => Err(error.into()),
+        };
+        let error = enforce_artifact_retention(
+            temp.path(),
+            ArtifactRetentionPolicy::Rotate,
+            u64::MAX,
+            2,
+            1,
+            &checkpoint,
+        )
+        .expect_err("deadline inside final identity check must preserve this file");
+        let Error::Tool { tool, message } = error else {
+            panic!("lost task admission error: {error}");
+        };
+        assert_eq!(tool, "jobs");
+        assert!(message.starts_with("PI_JOBS_TASK_TIMEOUT"));
+        assert!(message.contains("removedFiles=1, reclaimedBytes=4"));
+        assert!(!paths[0].exists());
+        assert_eq!(std::fs::read(&paths[1]).expect("cancelled unlink"), b"data");
+        assert_eq!(std::fs::read(&paths[2]).expect("retention floor"), b"data");
+        fs4::FileExt::try_lock(&probe).expect("cancelled rotation released its lock");
+    }
+
+    #[test]
     fn artifact_cleanup_candidate_identity_rejects_same_name_replacement() {
         let _guard = process_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("job-00000000000000000000000000000000.log");
         std::fs::write(&path, b"old!").expect("old artifact");
-        let candidate = artifact_cleanup_candidates(temp.path())
+        let candidate = artifact_cleanup_candidates(temp.path(), &|| Ok(()))
             .expect("candidate inventory")
             .pop()
             .expect("managed candidate");
@@ -6144,12 +6255,52 @@ mod tests {
         std::fs::write(&path, b"new!").expect("same-name replacement");
 
         assert_eq!(
-            remove_unlocked_artifact(&candidate).expect("identity check"),
+            remove_unlocked_artifact(&candidate, &|| Ok(())).expect("identity check"),
             None
         );
         assert_eq!(
             std::fs::read_to_string(path).expect("replacement preserved"),
             "new!"
+        );
+    }
+
+    #[test]
+    fn artifact_rotation_rechecks_identity_after_the_locked_admission_check() {
+        let directory = tempfile::tempdir().expect("artifact directory");
+        let path = directory
+            .path()
+            .join("job-00000000000000000000000000000000.log");
+        let displaced = directory.path().join("displaced");
+        std::fs::write(&path, b"old").expect("settled artifact");
+        let candidate = artifact_cleanup_candidates(directory.path(), &|| Ok(()))
+            .expect("inventory")
+            .pop()
+            .expect("managed artifact");
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("independent handle");
+        let checkpoint = || match fs4::FileExt::try_lock(&probe) {
+            Ok(()) => fs4::FileExt::unlock(&probe).map_err(Error::from),
+            Err(fs4::TryLockError::WouldBlock) => {
+                std::fs::rename(&path, &displaced)?;
+                std::fs::write(&path, b"replacement")?;
+                Ok(())
+            }
+            Err(fs4::TryLockError::Error(error)) => Err(error.into()),
+        };
+        assert_eq!(
+            remove_unlocked_artifact(&candidate, &checkpoint).expect("check locked identity"),
+            None
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("replacement preserved"),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(displaced).expect("old file preserved"),
+            b"old"
         );
     }
 
@@ -6178,6 +6329,7 @@ mod tests {
             reserved + 8,
             10,
             2,
+            &|| Ok(()),
         )
         .expect("rotation admits one new artifact");
         assert_eq!(
@@ -6199,6 +6351,7 @@ mod tests {
             reserved + 8,
             10,
             2,
+            &|| Ok(()),
         )
         .expect("the retained restart state remains within budget");
         assert_eq!(restart_outcome.removed_files, 0);
@@ -6228,6 +6381,7 @@ mod tests {
             reserved.saturating_add(4),
             10,
             2,
+            &|| Ok(()),
         )
         .expect_err("the recent-artifact floor prevents sufficient reclamation");
         let message = error.to_string();
@@ -6276,6 +6430,7 @@ mod tests {
             reserved.saturating_mul(2).saturating_add(4),
             10,
             1,
+            &|| Ok(()),
         )
         .expect("one unlocked settled artifact is reclaimable");
         assert_eq!(outcome.removed_files, 1);
@@ -6307,6 +6462,7 @@ mod tests {
             u64::MAX,
             1,
             0,
+            &|| Ok(()),
         )
         .expect_err("a symlink cannot become a cleanup candidate");
         assert!(error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));

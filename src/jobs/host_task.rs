@@ -375,6 +375,7 @@ where
 /// and future destruction stay on the task's worker, never the tool executor.
 pub struct NativeTaskLaunch {
     job: ForegroundJob,
+    artifact_cleanup: ArtifactCleanupOutcome,
     attempt: Arc<super::SessionSpawnAttempt>,
     owner: AgentCx,
     started: Instant,
@@ -383,21 +384,27 @@ pub struct NativeTaskLaunch {
 
 impl NativeTaskLaunch {
     fn check(&self) -> Result<()> {
-        check_owner(&self.owner)?;
-        ensure_session_spawn_generation(&self.attempt.owner_session_id, self.attempt.generation())?;
-        check_task_deadline(self.started, self.timeout)
+        let setup_error = |error| self.artifact_cleanup.with_partial_cleanup(error);
+        check_owner(&self.owner).map_err(setup_error)?;
+        ensure_session_spawn_generation(&self.attempt.owner_session_id, self.attempt.generation())
+            .map_err(setup_error)?;
+        check_task_deadline(self.started, self.timeout).map_err(setup_error)
     }
 
     pub fn snapshot(&self) -> Result<JobSnapshot> {
         self.check()?;
-        self.job.snapshot()
+        self.job
+            .snapshot()
+            .map_err(|error| self.artifact_cleanup.with_partial_cleanup(error))
     }
 
     /// Publish once, synchronously, after every fallible async preflight step.
     /// This transition is the first point at which the native future may run.
     pub fn publish(self) -> Result<JobSnapshot> {
         self.check()?;
-        self.job.publish_background(self.attempt.generation())
+        self.job
+            .publish_background(self.attempt.generation())
+            .map_err(|error| self.artifact_cleanup.with_partial_cleanup(error))
     }
 }
 
@@ -535,22 +542,23 @@ where
     // Shutdown can publish its fence while artifact I/O holds the lifecycle
     // lane. Recheck generation, cancellation and the original deadline before
     // publication; waiting for the artifact lock never renews that deadline.
-    check_admission()?;
+    let setup_error = |error| artifact_cleanup.with_partial_cleanup(error);
+    check_admission().map_err(setup_error)?;
     #[cfg(test)]
     super::invoke_before_native_registry_publication_hook(owner_session_id);
-    check_admission()?;
+    check_admission().map_err(setup_error)?;
     let handle = {
         let mut reg = registry()
             .lock()
-            .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
-        ensure_process_accepting_jobs(&reg)?;
+            .map_err(|_| setup_error(Error::tool("jobs", "jobs registry poisoned")))?;
+        ensure_process_accepting_jobs(&reg).map_err(setup_error)?;
         let generation = reg
             .owner_shutdown_generations
             .get(owner_session_id)
             .copied()
             .unwrap_or_default();
         if reg.closing_owners.contains_key(owner_session_id) || generation != attempt.generation() {
-            return Err(session_closing_error(owner_session_id));
+            return Err(setup_error(session_closing_error(owner_session_id)));
         }
         let entry = JobEntry {
             schema: TASK_SCHEMA,
@@ -567,7 +575,7 @@ where
             exit_code: None,
             pid: None,
             artifact_path,
-            artifact_cleanup,
+            artifact_cleanup: artifact_cleanup.clone(),
             tail: Arc::clone(&tail),
             artifact: Arc::clone(&artifact),
             output_complete: false,
@@ -646,9 +654,13 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .jobs
             .remove(&id);
-        return Err(Error::tool("jobs", format!("PI_JOBS_TASK_SPAWN: {error}")));
+        return Err(setup_error(Error::tool(
+            "jobs",
+            format!("PI_JOBS_TASK_SPAWN: {error}"),
+        )));
     }
     let launch = NativeTaskLaunch {
+        artifact_cleanup,
         job: ForegroundJob {
             handle,
             armed: true,
@@ -693,16 +705,21 @@ fn task_artifact(
     let directory = root.join("jobs");
     std::fs::create_dir_all(&directory)
         .map_err(|error| Error::tool("jobs", format!("PI_JOBS_TASK_ARTIFACT: {error}")))?;
-    let _budget = acquire_artifact_budget_lock(&directory, checkpoint)?;
+    let _budget = acquire_artifact_budget_lock(&directory, &checkpoint)?;
     let cleanup = enforce_artifact_retention(
         &directory,
         ArtifactRetentionPolicy::from_environment()?,
         MAX_TOTAL_ARTIFACT_BYTES,
         MAX_ARTIFACT_FILES,
         MIN_RETAINED_ARTIFACT_FILES,
+        &checkpoint,
     )?;
-    let (path, file) = create_job_artifact(&directory, id)
-        .map_err(|error| Error::tool("jobs", format!("PI_JOBS_TASK_ARTIFACT: {error}")))?;
+    let (path, file) = create_job_artifact(&directory, id).map_err(|error| {
+        cleanup.with_partial_cleanup(Error::tool(
+            "jobs",
+            format!("PI_JOBS_TASK_ARTIFACT: {error}"),
+        ))
+    })?;
     Ok((path, file, cleanup))
 }
 
@@ -1477,13 +1494,22 @@ mod tests {
                 assert!(sender.send_blocking(launch).is_ok());
                 drop(receiver);
             } else {
+                // Exercise propagation of an already committed cleanup across
+                // the final caller acknowledgment. Rotation is covered in jobs.rs.
+                launch.artifact_cleanup.removed_files = 1;
+                launch.artifact_cleanup.reclaimed_bytes = 4;
                 let error = launch.publish().expect_err("stale handoff must be refused");
                 let expected = match action {
                     "owner" => "PI_JOBS_TASK_CANCELLED",
                     "deadline" => "PI_JOBS_TASK_TIMEOUT",
                     _ => "PI_JOBS_SESSION_CLOSING",
                 };
-                assert!(error.to_string().contains(expected), "{error}");
+                let Error::Tool { tool, message } = error else {
+                    panic!("lost native admission error: {error}");
+                };
+                assert_eq!(tool, "jobs");
+                assert!(message.starts_with(expected), "{message}");
+                assert!(message.contains("removedFiles=1, reclaimedBytes=4"));
             }
             wait_for_native_admission_cleanup(&session);
             if let Some(shutdown) = shutdown {

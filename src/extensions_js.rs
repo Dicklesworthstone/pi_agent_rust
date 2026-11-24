@@ -48028,7 +48028,10 @@ globalThis.fsWriteFlags = { done: false };
             assert_eq!(result["invalidEncoding"], json!(true));
             assert_eq!(result["preserved"], json!("XYcdefZ!"));
             assert_eq!(result["truncateHost"], json!("overlay"));
-            assert_eq!(std::fs::metadata(&large).expect("host metadata").len(), size);
+            assert_eq!(
+                std::fs::metadata(&large).expect("host metadata").len(),
+                size
+            );
         });
     }
 
