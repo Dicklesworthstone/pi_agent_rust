@@ -34,6 +34,8 @@ use std::pin::Pin;
 
 #[path = "openai_deepseek.rs"]
 mod deepseek;
+#[path = "openai_openrouter.rs"]
+mod openrouter;
 
 // ============================================================================
 // Constants
@@ -715,7 +717,9 @@ impl OpenAIProvider {
         self.provider.eq_ignore_ascii_case("openrouter")
             || canonical_provider_id(&self.provider)
                 .is_some_and(|canonical| canonical == "openrouter")
-            || self.base_url.to_ascii_lowercase().contains("openrouter.ai")
+            || url::Url::parse(&self.base_url)
+                .ok()
+                .is_some_and(|url| url.host_str() == Some("openrouter.ai"))
     }
 
     fn build_request_json(
@@ -777,6 +781,7 @@ impl OpenAIProvider {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                reasoning_details: None,
             });
         }
 
@@ -784,6 +789,11 @@ impl OpenAIProvider {
         // user message. Collect images across the consecutive tool-result run
         // and attach them only after all of its tool replies (GH #248).
         let mut tool_images = Vec::new();
+        let openrouter_origin = if self.is_openrouter() {
+            openrouter::origin(&self.base_url)
+        } else {
+            None
+        };
         for message in context.messages.iter() {
             if !matches!(message, Message::ToolResult(_)) {
                 append_tool_result_attachments(&mut messages, &mut tool_images);
@@ -796,6 +806,12 @@ impl OpenAIProvider {
                     &self.provider,
                     &self.model,
                 ));
+            }
+            if let (Some(origin), Message::Assistant(assistant)) =
+                (openrouter_origin.as_deref(), message)
+            {
+                converted.reasoning_details =
+                    openrouter::replay(assistant, &self.provider, &self.model, origin);
             }
             messages.push(converted);
         }
@@ -1074,6 +1090,9 @@ impl Provider for OpenAIProvider {
             self.name().to_string(),
             native_audio,
             options.usage_observer.clone(),
+            self.is_openrouter()
+                .then(|| openrouter::origin(&self.base_url))
+                .flatten(),
         ))
     }
 }
@@ -1101,6 +1120,7 @@ fn wire_stream<S>(
     provider: String,
     audio_input_in_request: bool,
     usage_observer: Option<crate::provider::UsageObserver>,
+    openrouter_origin: Option<String>,
 ) -> EventStream
 where
     S: Stream<Item = std::io::Result<Vec<u8>>> + Unpin + Send + 'static,
@@ -1108,6 +1128,7 @@ where
     let mut state = StreamState::new(SseStream::new(source), model, api, provider);
     state.audio_input_in_request = audio_input_in_request;
     state.usage_observer = usage_observer;
+    state.openrouter_reasoning = openrouter_origin.map(openrouter::ReasoningDetails::new);
     let output = stream::unfold(Some(state), |active| async move {
         let mut state = active?;
         loop {
@@ -1201,6 +1222,9 @@ where
     partial: AssistantMessage,
     tool_calls: Vec<ToolCallState>,
     deepseek_recovery: Option<deepseek::Recovery>,
+    openrouter_reasoning: Option<openrouter::ReasoningDetails>,
+    openrouter_reasoning_index: Option<usize>,
+    openrouter_text_started: bool,
     pending_events: VecDeque<StreamEvent>,
     started: bool,
     done: bool,
@@ -1424,6 +1448,9 @@ where
             },
             tool_calls: Vec::new(),
             deepseek_recovery,
+            openrouter_reasoning: None,
+            openrouter_reasoning_index: None,
+            openrouter_text_started: false,
             pending_events: VecDeque::new(),
             started: false,
             done: false,
@@ -1447,8 +1474,15 @@ where
     }
 
     fn process_event(&mut self, data: &str) -> Result<()> {
-        let chunk: OpenAIStreamChunk = serde_json::from_str(data)
-            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+        let chunk: OpenAIStreamChunk = serde_json::from_str(data).map_err(|error| {
+            // A malformed frame may contain opaque reasoning or credentials.
+            // Serde's error text can echo field values; expose only its location.
+            Error::api(format!(
+                "Invalid OpenAI stream JSON at line {}, column {}",
+                error.line(),
+                error.column()
+            ))
+        })?;
         let selected = select_primary_choice(chunk.choices, |choice| choice.index);
         let authoritative_usage = self.finalized
             || matches!(&selected, Ok(Some(choice)) if choice.finish_reason.is_some());
@@ -1522,10 +1556,14 @@ where
         })?;
         if let Some(mut choice) = selected {
             choice.delta.normalize_reasoning();
+            if self.openrouter_reasoning.is_none() {
+                choice.delta.reasoning_details = None;
+            }
             if !self.started
                 && choice.finish_reason.is_none()
                 && choice.delta.content.is_none()
                 && choice.delta.reasoning_content.is_none()
+                && choice.delta.reasoning_details.is_none()
                 && choice.delta.tool_calls.is_none()
             {
                 self.ensure_started();
@@ -1708,6 +1746,17 @@ where
             }
         }
 
+        if self.partial.stop_reason != StopReason::Error
+            && let Some(index) = self.openrouter_reasoning_index
+            && let Some(signature) = self
+                .openrouter_reasoning
+                .as_ref()
+                .and_then(openrouter::ReasoningDetails::signature)
+            && let Some(ContentBlock::Thinking(thinking)) = self.partial.content.get_mut(index)
+        {
+            thinking.thinking_signature = Some(signature);
+        }
+
         for (content_index, block) in self.partial.content.iter().enumerate() {
             match block {
                 ContentBlock::Text(text) => {
@@ -1788,9 +1837,25 @@ where
             .push_back(StreamEvent::Done { reason, message });
     }
 
+    fn thinking_block(&mut self) -> usize {
+        if matches!(self.partial.content.last(), Some(ContentBlock::Thinking(_))) {
+            return self.partial.content.len() - 1;
+        }
+        let content_index = self.partial.content.len();
+        self.partial
+            .content
+            .push(ContentBlock::Thinking(ThinkingContent {
+                thinking: String::new(),
+                thinking_signature: None,
+            }));
+        self.pending_events
+            .push_back(StreamEvent::ThinkingStart { content_index });
+        content_index
+    }
+
     #[allow(clippy::too_many_lines)]
     fn process_choice(&mut self, choice: OpenAIChoice) {
-        let delta = choice.delta;
+        let mut delta = choice.delta;
         if self.finalized {
             if matches!(
                 choice.finish_reason.as_deref(),
@@ -1824,7 +1889,11 @@ where
                 || delta
                     .tool_calls
                     .as_ref()
-                    .is_some_and(|calls| !calls.is_empty());
+                    .is_some_and(|calls| !calls.is_empty())
+                || delta
+                    .reasoning_details
+                    .as_ref()
+                    .is_some_and(|details| details.as_array().is_none_or(|items| !items.is_empty()));
             if has_content {
                 self.record_error("OpenAI sent content after a terminal finish reason".to_string());
             }
@@ -1835,6 +1904,7 @@ where
         if delta.content.is_some()
             || delta.tool_calls.is_some()
             || delta.reasoning_content.is_some()
+            || delta.reasoning_details.is_some()
         {
             self.ensure_started();
         }
@@ -1845,28 +1915,45 @@ where
             self.ensure_started();
         }
 
-        // Handle reasoning content (e.g. DeepSeek R1)
+        if let Some(details) = delta.reasoning_details.take()
+            && let Some(capture) = self.openrouter_reasoning.as_mut()
+        {
+            match capture.extend(details) {
+                Ok(visible) => {
+                    // Metadata-only frames and even [] carry continuation
+                    // state. Store it in one internal thinking signature,
+                    // never as visible text or on every parallel tool call.
+                    if self.openrouter_reasoning_index.is_none() {
+                        // Details may first arrive after plain reasoning and
+                        // answer text. Reuse that reasoning block instead of
+                        // emitting a second, empty visible block.
+                        let existing = self
+                            .partial
+                            .content
+                            .iter()
+                            .position(|block| matches!(block, ContentBlock::Thinking(_)));
+                        let index = existing.unwrap_or_else(|| self.thinking_block());
+                        self.openrouter_reasoning_index = Some(index);
+                    }
+                    // Some gateways send both representations in one frame.
+                    if !visible.is_empty() {
+                        delta.reasoning_content = Some(visible);
+                    }
+                }
+                Err(error) => self.record_error(error.to_string()),
+            }
+        }
+
+        // OpenRouter can send final signatures after answer text, sometimes
+        // accompanied by the flat reasoning alias again. Capture those records
+        // above without reopening or duplicating a visible thinking block.
+        if self.openrouter_reasoning.is_some() && self.openrouter_text_started {
+            delta.reasoning_content = None;
+        }
+
+        // Handle visible reasoning content (including native DeepSeek R1).
         if let Some(reasoning) = delta.reasoning_content {
-            // Update partial content
-            let last_is_thinking =
-                matches!(self.partial.content.last(), Some(ContentBlock::Thinking(_)));
-
-            let content_index = if last_is_thinking {
-                self.partial.content.len() - 1
-            } else {
-                let idx = self.partial.content.len();
-                self.partial
-                    .content
-                    .push(ContentBlock::Thinking(ThinkingContent {
-                        thinking: String::new(),
-                        thinking_signature: None,
-                    }));
-
-                self.pending_events
-                    .push_back(StreamEvent::ThinkingStart { content_index: idx });
-
-                idx
-            };
+            let content_index = self.thinking_block();
 
             if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(content_index) {
                 t.thinking.push_str(&reasoning);
@@ -1881,6 +1968,7 @@ where
         // Handle text content. DeepSeek markup stays out of client snapshots
         // until the entire terminal tool batch has been validated.
         if let Some(content) = delta.content {
+            self.openrouter_text_started |= !content.is_empty();
             self.process_text(content);
         }
 
@@ -2283,6 +2371,9 @@ struct OpenAIMessage<'a> {
     /// Native DeepSeek reasoning replay; omitted for other dialects and roles.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<Cow<'a, str>>,
+    /// Opaque OpenRouter continuation, fenced by transport, provider, and model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_details: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2377,6 +2468,9 @@ struct OpenAIDelta {
     reasoning: Option<serde_json::Value>,
     #[serde(default)]
     reasoning_text: Option<serde_json::Value>,
+    /// Keep the gateway payload opaque until bounded, dialect-specific validation.
+    #[serde(default)]
+    reasoning_details: Option<serde_json::Value>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
 }
@@ -2616,6 +2710,7 @@ fn convert_message_to_openai<'a>(
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            reasoning_details: None,
         },
         Message::Custom(custom) => OpenAIMessage {
             role: Cow::Borrowed("user"),
@@ -2623,6 +2718,7 @@ fn convert_message_to_openai<'a>(
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            reasoning_details: None,
         },
         Message::Assistant(assistant) => {
             // Collect text content
@@ -2676,6 +2772,7 @@ fn convert_message_to_openai<'a>(
                 tool_calls,
                 tool_call_id: None,
                 reasoning_content: None,
+                reasoning_details: None,
             }
         }
         Message::ToolResult(result) => {
@@ -2739,6 +2836,7 @@ fn convert_message_to_openai<'a>(
                 tool_calls: None,
                 tool_call_id: Some(&result.tool_call_id),
                 reasoning_content: None,
+                reasoning_details: None,
             }
         }
     }
@@ -2771,6 +2869,7 @@ fn append_tool_result_attachments<'a>(
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        reasoning_details: None,
     });
 }
 

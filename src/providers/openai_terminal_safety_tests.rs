@@ -746,6 +746,7 @@ fn observed_wire(
             "openai".to_string(),
             false,
             None,
+            None,
         ),
         observation,
     )
@@ -1007,6 +1008,7 @@ impl crate::provider::Provider for AudioSourceProvider {
             self.name().to_string(),
             true,
             options.usage_observer.clone(),
+            None,
         ))
     }
 }
