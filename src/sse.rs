@@ -408,8 +408,9 @@ impl SseParser {
                 self.buffer.push_str(&data[consumed..]);
             }
         } else {
-            // Slow path: parse against a temporary combined source so we only
-            // retain the truly unconsumed tail instead of a giant drained buffer.
+            // Slow path: append fragments to the existing allocation. Rebuild
+            // only after consuming a prefix, so a large completed frame does
+            // not leave its allocation attached to a small unfinished tail.
             let mut combined = std::mem::take(&mut self.buffer);
             combined.push_str(data);
             // Re-scan from the last safe point (minus 1 to handle split CRLF).
@@ -427,8 +428,13 @@ impl SseParser {
                 if combined.len() - consumed > MAX_BUFFER_SIZE {
                     return Err(SseParseError::BufferLimit);
                 }
-                // Build buffer fresh from truly unprocessed tail only (no duplication).
-                self.buffer = combined[consumed..].to_string();
+                self.buffer = if consumed == 0 {
+                    // No complete line yet: copying this growing prefix on
+                    // every transport chunk makes fragmented lines quadratic.
+                    combined
+                } else {
+                    combined[consumed..].to_string()
+                };
             }
         }
         // Whether we drained or not, the entire remaining buffer has been scanned.
@@ -1181,6 +1187,85 @@ mod tests {
         let events = parser.feed("data: second\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "second");
+    }
+
+    #[test]
+    fn fragmented_line_reuses_existing_buffer_capacity() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed("data: ").is_empty());
+        let fragment = "payload-🦀λ".repeat(128);
+        let fragments = 128;
+        // Observe allocation reuse without a wall-clock threshold or relying
+        // on an allocator's growth policy. The old path copies the entire
+        // unfinished line even when this allocation already has enough room.
+        parser.buffer.reserve(fragment.len() * fragments + 1);
+        let allocation = parser.buffer.as_ptr();
+        for index in 0..fragments {
+            assert!(parser.feed(&fragment).is_empty());
+            assert_eq!(parser.buffer.as_ptr(), allocation, "fragment {index}");
+        }
+        assert!(parser.feed("").is_empty());
+        assert_eq!(parser.buffer.as_ptr(), allocation);
+        // A CR at the end of a chunk remains deferred for CRLF lookahead.
+        assert!(parser.feed("\r").is_empty());
+        assert_eq!(parser.buffer.as_ptr(), allocation);
+        let events = parser.feed("\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, fragment.repeat(fragments));
+        assert!(!parser.has_pending());
+        assert_eq!(parser.buffer.capacity(), 0);
+    }
+
+    #[test]
+    fn fragmented_line_completion_reclaims_capacity_and_preserves_following_frame() {
+        let mut parser = SseParser::new();
+        assert!(
+            parser
+                .feed("id: saved\nretry: 40\nevent: first\ndata: ")
+                .is_empty()
+        );
+        let payload = "x".repeat(128 * 1024);
+        assert!(parser.feed(&payload).is_empty());
+        let events = parser.feed("\n\nevent: second\ndata: n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "first");
+        assert_eq!(events[0].data, payload);
+        assert_eq!(events[0].id.as_deref(), Some("saved"));
+        assert!(events[0].id_was_explicit);
+        assert_eq!(parser.buffer, "data: n");
+        // Reuse must not keep a consumed large frame resident indefinitely.
+        assert!(parser.buffer.capacity() < 1024);
+
+        assert!(parser.feed("ext 🦀\r").is_empty());
+        let events = parser.feed("\n\r\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "second");
+        assert_eq!(events[0].data, "next 🦀");
+        assert_eq!(events[0].id.as_deref(), Some("saved"));
+        assert!(!events[0].id_was_explicit);
+        assert_eq!(events[0].retry, Some(40));
+        assert!(!parser.has_pending());
+    }
+
+    #[test]
+    fn retained_fragment_buffer_limit_remains_terminal() {
+        let mut parser = SseParser::new();
+        let events = parser.feed("data: good\n\nid: rejected\ndata: ");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "good");
+        let payload = "x".repeat(MAX_BUFFER_SIZE - "data: ".len());
+        assert!(parser.feed(&payload).is_empty());
+        assert_eq!(parser.buffer.len(), MAX_BUFFER_SIZE);
+
+        let events = parser.feed("x");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data, "SSE buffer limit exceeded");
+        assert!(events[0].id.is_none());
+        assert_eq!(parser.buffer.capacity(), 0);
+        assert!(!parser.has_pending());
+        assert!(parser.feed("\n\ndata: [DONE]\n\n").is_empty());
+        assert!(parser.flush().is_none());
     }
 
     #[test]
@@ -2231,6 +2316,29 @@ data: {"type":"message_stop"}
         let event = stream.pending_events.pop_front().expect("event");
         assert!(event.data.starts_with('😀'));
         assert_eq!(event.data.len(), 4 + 256 * 1024);
+    }
+
+    #[test]
+    fn fragmented_utf8_stream_reuses_the_unfinished_line() {
+        let mut stream = SseStream::new(stream::empty());
+        stream.process_chunk(b"data: ").expect("prefix");
+        let payload = "🦀λ".repeat(128);
+        stream.parser.buffer.reserve(payload.len());
+        let allocation = stream.parser.buffer.as_ptr();
+        // Every multibyte character straddles transport boundaries. Completing
+        // its UTF-8 tail must not copy the preceding line again.
+        for byte in payload.bytes() {
+            stream.process_chunk(&[byte]).expect("UTF-8 fragment");
+            assert!(stream.pending_events.is_empty());
+            assert_eq!(stream.parser.buffer.as_ptr(), allocation);
+        }
+        stream.process_chunk(b"\n\n").expect("event boundary");
+        let event = stream.pending_events.pop_front().expect("event");
+        assert_eq!(event.data, payload);
+        assert!(stream.pending_events.is_empty());
+        assert!(stream.utf8_buffer.is_empty());
+        assert!(!stream.parser.has_pending());
+        assert_eq!(stream.parser.buffer.capacity(), 0);
     }
 
     #[test]
