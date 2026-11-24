@@ -718,8 +718,7 @@ impl OpenAIProvider {
             || canonical_provider_id(&self.provider)
                 .is_some_and(|canonical| canonical == "openrouter")
             || url::Url::parse(&self.base_url)
-                .ok()
-                .is_some_and(|url| url.host_str() == Some("openrouter.ai"))
+                .is_ok_and(|url| url.host_str() == Some("openrouter.ai"))
     }
 
     fn build_request_json(
