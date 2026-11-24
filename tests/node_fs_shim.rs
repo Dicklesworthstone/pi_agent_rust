@@ -59,10 +59,10 @@ fn fs_ext_source(js_expr: &str) -> String {
 import fs from "node:fs";
 
 export default function activate(pi) {{
-  pi.on("agent_start", (event, ctx) => {{
+  pi.on("agent_start", async (event, ctx) => {{
     let result;
     try {{
-      result = String({js_expr});
+      result = String(await ({js_expr}));
     }} catch (e) {{
       result = "ERROR:" + e.message;
     }}
@@ -436,14 +436,16 @@ fn mkdtemp_sync_uses_virtual_absolute_tmp() {
 #[test]
 fn read_file_callback() {
     let result = eval_fs(
-        r#"(() => {
+        r#"new Promise((resolve, reject) => {
         fs.writeFileSync("tmp/cb.txt", "callback data");
-        let got = null;
-        fs.readFile("tmp/cb.txt", "utf8", (err, data) => { got = data; });
-        return got;
-    })()"#,
+        let returned = false;
+        fs.readFile("tmp/cb.txt", "utf8", (err, data) => {
+            if (err) reject(err); else resolve(returned + ":" + data);
+        });
+        returned = true;
+    })"#,
     );
-    assert_eq!(result, "callback data");
+    assert_eq!(result, "true:callback data");
 }
 
 // ─── Callback-based async writeFile ─────────────────────────────────────────
@@ -451,11 +453,14 @@ fn read_file_callback() {
 #[test]
 fn write_file_callback() {
     let result = eval_fs(
-        r#"(() => {
-        let err = "pending";
-        fs.writeFile("tmp/wcb.txt", "written", (e) => { err = e; });
-        return (err === null) + ":" + fs.readFileSync("tmp/wcb.txt", "utf8");
-    })()"#,
+        r#"new Promise((resolve, reject) => {
+        let returned = false;
+        fs.writeFile("tmp/wcb.txt", "written", (err) => {
+            if (err) reject(err);
+            else resolve(returned + ":" + fs.readFileSync("tmp/wcb.txt", "utf8"));
+        });
+        returned = true;
+    })"#,
     );
     assert_eq!(result, "true:written");
 }

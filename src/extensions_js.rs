@@ -14434,6 +14434,7 @@ const __pi_vfs = (() => {
   }
 
   function resetState(secret) {
+    globalThis.__pi_fs_watch_runtime.resetCallbacks(secret);
     __pi_reset_file_watchers(secret);
     const clearMap = globalThis.__pi_map_clear_primordial;
     const clearSet = globalThis.__pi_set_clear_primordial;
@@ -15831,151 +15832,209 @@ export function createWriteStream(path, opts) {
   }
   return stream;
 }
+// VFS work crosses admission in the calling extension's scope. Only callback
+// delivery is deferred; user callback exceptions must never become a second
+// filesystem completion. Capture the narrow scheduler before guest mutation.
+const enqueueFileCallback = globalThis.__pi_fs_watch_runtime.enqueue;
+function fileCallback(callback, operation, failedResult = () => []) {
+  if (typeof callback !== "function") {
+    const error = new TypeError("node:fs callback must be a function");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  let args;
+  try { args = [null, ...operation()]; }
+  catch (error) {
+    // Older VFS operations carry POSIX errors in their message. Callback
+    // consumers branch on error.code, especially ENOENT and EBADF.
+    if (error instanceof Error && error.code === undefined) {
+      const code = /^(E[A-Z0-9]+):/.exec(error.message);
+      if (code) error.code = code[1];
+    }
+    args = [error, ...failedResult()];
+  }
+  enqueueFileCallback(callback, args);
+}
+export function open(path, flagsOrCb, modeOrCb, cb) {
+  const callback = typeof flagsOrCb === "function" ? flagsOrCb
+    : typeof modeOrCb === "function" ? modeOrCb : cb;
+  const flags = typeof flagsOrCb === "function" ? "r" : flagsOrCb;
+  const mode = typeof modeOrCb === "function" ? undefined : modeOrCb;
+  fileCallback(callback, () => [openSync(path, flags, mode)]);
+}
+export function close(fd, callback) {
+  fileCallback(callback, () => { closeSync(fd); return []; });
+}
+function fileBufferRange(buffer, options = {}, currentPosition = false) {
+  const view = __pi_vfs.toWritableView(buffer);
+  const offset = options.offset ?? 0;
+  const length = options.length ?? (view.byteLength - offset);
+  let position = options.position ?? null;
+  if (currentPosition && position === -1) position = null;
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > view.byteLength) {
+    throw new RangeError("file buffer offset is out of range");
+  }
+  if (!Number.isSafeInteger(length) || length < 0 || length > view.byteLength - offset) {
+    throw new RangeError("file buffer length is out of range");
+  }
+  if (position !== null && (!Number.isSafeInteger(position) || position < 0)) {
+    throw new RangeError("file position must be a nonnegative safe integer or null");
+  }
+  return { offset, length, position };
+}
+export function read(fd, ...args) {
+  const callback = args.pop();
+  let buffer = args[0];
+  fileCallback(callback, () => {
+    let options;
+    if (ArrayBuffer.isView(buffer) || buffer instanceof ArrayBuffer) {
+      options = args[1] && typeof args[1] === "object" ? args[1]
+        : { offset: args[1], length: args[2], position: args[3] };
+    } else {
+      options = buffer ?? {};
+      if (typeof options !== "object") throw new TypeError("file read options must be an object");
+      buffer = options.buffer ?? Buffer.alloc(16 * 1024);
+    }
+    const { offset, length, position } = fileBufferRange(buffer, options, true);
+    return [readSync(fd, buffer, offset, length, position), buffer];
+  }, () => [0, buffer]);
+}
+export function write(fd, buffer, ...args) {
+  const callback = args.pop();
+  fileCallback(callback, () => {
+    if (typeof buffer === "string") {
+      const position = args[0] ?? null;
+      const encoding = args[1] ?? "utf8";
+      if (position !== null && (!Number.isSafeInteger(position) || position < 0)) {
+        throw new RangeError("file position must be a nonnegative safe integer or null");
+      }
+      if (typeof encoding !== "string" || !Buffer.isEncoding(encoding)) {
+        throw new TypeError("file encoding must be a supported Buffer encoding");
+      }
+      const bytes = Buffer.from(buffer, encoding);
+      return [writeSync(fd, bytes, 0, bytes.byteLength, position), buffer];
+    }
+    const options = args[0] && typeof args[0] === "object" ? args[0]
+      : { offset: args[0], length: args[1], position: args[2] };
+    const { offset, length, position } = fileBufferRange(buffer, options);
+    return [writeSync(fd, buffer, offset, length, position), buffer];
+  }, () => [0, buffer]);
+}
+export function fstat(fd, optOrCb, cb) {
+  const callback = typeof optOrCb === "function" ? optOrCb : cb;
+  fileCallback(callback, () => [fstatSync(fd)]);
+}
+export function ftruncate(fd, lenOrCb, cb) {
+  const callback = typeof lenOrCb === "function" ? lenOrCb : cb;
+  const length = typeof lenOrCb === "function" || lenOrCb === undefined ? 0 : lenOrCb;
+  fileCallback(callback, () => {
+    if (!Number.isSafeInteger(length) || length < 0) throw new RangeError("file length must be a nonnegative safe integer");
+    ftruncateSync(fd, length);
+    return [];
+  });
+}
+export function futimes(fd, atime, mtime, callback) {
+  fileCallback(callback, () => { futimesSync(fd, atime, mtime); return []; });
+}
+export function fsync(fd, callback) {
+  // All acknowledged VFS writes are already visible. Preserve the same
+  // authority check used by FileHandle.sync() without fabricating host I/O.
+  fileCallback(callback, () => { __pi_vfs.authorizeFdWrite(__pi_vfs.getFdEntry(fd)); return []; });
+}
+export function fdatasync(fd, callback) { fsync(fd, callback); }
 export function readFile(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   const encoding = typeof optOrCb === 'function' ? undefined : optOrCb;
-  if (typeof callback === 'function') {
-    try { callback(null, readFileSync(path, encoding)); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => [readFileSync(path, encoding)]);
 }
 export function writeFile(path, data, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
-  if (typeof callback === 'function') {
-    try { writeFileSync(path, data, opts); callback(null); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => { writeFileSync(path, data, opts); return []; });
 }
 export function stat(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
-  if (typeof callback === 'function') {
-    try { callback(null, statSync(path)); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => [statSync(path)]);
 }
 export function readdir(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
-  if (typeof callback === 'function') {
-    try { callback(null, readdirSync(path, opts)); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => [readdirSync(path, opts)]);
 }
 export function mkdir(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
-  if (typeof callback === 'function') {
-    try { callback(null, mkdirSync(path, opts)); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => [mkdirSync(path, opts)]);
+}
+export function mkdtemp(prefix, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
+  fileCallback(callback, () => [mkdtempSync(prefix, opts)]);
 }
 export function unlink(path, cb) {
-  if (typeof cb === 'function') {
-    try { unlinkSync(path); cb(null); }
-    catch (err) { cb(err); }
-  }
+  fileCallback(cb, () => { unlinkSync(path); return []; });
 }
 export function readlink(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
-  if (typeof callback === 'function') {
-    try { callback(null, readlinkSync(path, opts)); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => [readlinkSync(path, opts)]);
 }
 export function symlink(target, path, typeOrCb, cb) {
   const callback = typeof typeOrCb === 'function' ? typeOrCb : cb;
   const type = typeof typeOrCb === 'function' ? undefined : typeOrCb;
-  if (typeof callback === 'function') {
-    try { symlinkSync(target, path, type); callback(null); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => { symlinkSync(target, path, type); return []; });
 }
 export function lstat(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
-  if (typeof callback === 'function') {
-    try { callback(null, lstatSync(path)); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => [lstatSync(path)]);
 }
 export function rmdir(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
-  if (typeof callback === 'function') {
-    try { rmdirSync(path, opts); callback(null); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => { rmdirSync(path, opts); return []; });
 }
 export function rm(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
-  if (typeof callback === 'function') {
-    try { rmSync(path, opts); callback(null); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => { rmSync(path, opts); return []; });
 }
 export function rename(oldPath, newPath, cb) {
-  if (typeof cb === 'function') {
-    try { renameSync(oldPath, newPath); cb(null); }
-    catch (err) { cb(err); }
-  }
+  fileCallback(cb, () => { renameSync(oldPath, newPath); return []; });
 }
 export function copyFile(src, dest, flagsOrCb, cb) {
   const callback = typeof flagsOrCb === 'function' ? flagsOrCb : cb;
-  if (typeof callback === 'function') {
-    try { copyFileSync(src, dest); callback(null); }
-    catch (err) { callback(err); }
-  }
+  const flags = typeof flagsOrCb === 'function' ? undefined : flagsOrCb;
+  fileCallback(callback, () => { copyFileSync(src, dest, flags); return []; });
 }
 export function appendFile(path, data, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
-  if (typeof callback === 'function') {
-    try { appendFileSync(path, data, opts); callback(null); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => { appendFileSync(path, data, opts); return []; });
 }
 export function chmod(path, mode, cb) {
-  if (typeof cb === 'function') {
-    try { chmodSync(path, mode); cb(null); }
-    catch (err) { cb(err); }
-  }
+  fileCallback(cb, () => { chmodSync(path, mode); return []; });
 }
 export function chown(path, uid, gid, cb) {
-  if (typeof cb === 'function') {
-    try { chownSync(path, uid, gid); cb(null); }
-    catch (err) { cb(err); }
-  }
+  fileCallback(cb, () => { chownSync(path, uid, gid); return []; });
 }
 export function truncate(path, lenOrCb, cb) {
   const callback = typeof lenOrCb === "function" ? lenOrCb : cb;
   const len = typeof lenOrCb === "function" ? 0 : lenOrCb;
-  if (typeof callback === "function") {
-    try { truncateSync(path, len); callback(null); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => { truncateSync(path, len); return []; });
+}
+export function utimes(path, atime, mtime, callback) {
+  fileCallback(callback, () => { utimesSync(path, atime, mtime); return []; });
 }
 export function realpath(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
-  if (typeof callback === 'function') {
-    try { callback(null, realpathSync(path, opts)); }
-    catch (err) { callback(err); }
-  }
+  fileCallback(callback, () => [realpathSync(path, opts)]);
 }
 realpath.native = realpath;
 export function access(_path, modeOrCb, cb) {
   const callback = typeof modeOrCb === 'function' ? modeOrCb : cb;
   const mode = typeof modeOrCb === 'function' ? constants.F_OK : modeOrCb;
-  if (typeof callback === 'function') {
-    try {
-      accessSync(_path, mode);
-      callback(null);
-    } catch (err) {
-      callback(err);
-    }
-  }
+  fileCallback(callback, () => { accessSync(_path, mode); return []; });
 }
 // Promise file APIs accept genuine FileHandles, never the mutable public fd
 // field. The private lookup also checks the original entry after a close/reset.
@@ -16061,7 +16120,7 @@ export const promises = {
   chown: async (path, uid, gid) => chownSync(path, uid, gid),
   utimes: async (path, atime, mtime) => utimesSync(path, atime, mtime),
 };
-export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, lstatSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, rmSync, copyFileSync, renameSync, mkdirSync, accessSync, chmodSync, chownSync, utimesSync, truncateSync, readlinkSync, symlinkSync, openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, futimesSync, watch, watchFile, unwatchFile, createReadStream, createWriteStream, readFile, writeFile, stat, lstat, readdir, mkdir, unlink, readlink, symlink, rmdir, rm, rename, copyFile, appendFile, chmod, chown, truncate, realpath, access, promises };
+export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, lstatSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, rmSync, copyFileSync, renameSync, mkdirSync, accessSync, chmodSync, chownSync, utimesSync, truncateSync, readlinkSync, symlinkSync, openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, futimesSync, watch, watchFile, unwatchFile, createReadStream, createWriteStream, open, close, read, write, fstat, ftruncate, futimes, fsync, fdatasync, readFile, writeFile, stat, lstat, readdir, mkdir, mkdtemp, unlink, readlink, symlink, rmdir, rm, rename, copyFile, appendFile, chmod, chown, truncate, utimes, realpath, access, promises };
 "#)
         .trim()
         .to_string(),
@@ -30795,16 +30854,64 @@ const __pi_timer_runtime = (() => {
 // replace global timers. It captures the caller's existing timer authority;
 // no API accepts an owner or exposes a trusted rescheduling closure.
 Object.defineProperty(globalThis, '__pi_fs_watch_runtime', {
-    value: Object.freeze({
-        interval: __pi_timer_runtime.setInterval,
-        clear: __pi_timer_runtime.clear,
-        clearForReset: __pi_timer_runtime.clearForReset,
-        reference: __pi_timer_runtime.reference,
-        owner: () => __pi_get_current_extension_id() || '',
-        apply: __pi_reflect_apply_primordial,
-        freeze: Object.freeze,
-        Date,
-    }),
+    value: (() => {
+        let callbackEpoch = 0;
+        const tick = Promise.resolve();
+        const then = Function.prototype.call.bind(Promise.prototype.then);
+        const report = globalThis.__pi_console_output_native;
+        const stringify = String;
+        return Object.freeze({
+            interval: __pi_timer_runtime.setInterval,
+            clear: __pi_timer_runtime.clear,
+            clearForReset: __pi_timer_runtime.clearForReset,
+            reference: __pi_timer_runtime.reference,
+            owner: () => __pi_get_current_extension_id() || '',
+            apply: __pi_reflect_apply_primordial,
+            freeze: Object.freeze,
+            Date,
+            enqueue(callback, args) {
+                const owner = __pi_get_current_extension_id();
+                const scheduledEpoch = callbackEpoch;
+                then(tick, () => {
+                    if (scheduledEpoch !== callbackEpoch) return;
+                    // A callback's return value is ignored, as in node:fs.
+                    // Its synchronous body and any chained I/O retain only
+                    // the scheduling owner's authority, even after it exits.
+                    const invoke = () => {
+                        try { __pi_reflect_apply_primordial(callback, undefined, args); }
+                        catch (error) {
+                            // Error coercion can execute guest code. Keep it
+                            // inside the callback owner's scope and report
+                            // through the captured host logger, never a second
+                            // callback or an unobserved rejected promise.
+                            let message;
+                            try { message = stringify(error); }
+                            catch (_) { message = '<unprintable callback error>'; }
+                            report('error', 'Filesystem callback error: ' + message);
+                        }
+                    };
+                    try {
+                        if (owner) __pi_with_extension_sync(owner, invoke);
+                        else {
+                            if (__pi_get_current_extension_id()) {
+                                report('error', 'Unowned filesystem callback cannot borrow extension authority');
+                                return;
+                            }
+                            invoke();
+                        }
+                    } catch (_) {
+                        // Do not coerce a dispatch exception in a foreign
+                        // active scope. Its failure must still be observable.
+                        report('error', 'Filesystem callback dispatch failed: extension scope unavailable');
+                    }
+                });
+            },
+            resetCallbacks(secret) {
+                __pi_require_bridge_secret(secret);
+                callbackEpoch++;
+            },
+        });
+    })(),
     writable: false, configurable: false, enumerable: false,
 });
 
@@ -32294,8 +32401,8 @@ mod tests {
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            296_638,
-            "3c30158092e16af15596493b0cf97ecce0ffb030491bf73ce29ad746c5f44b6a",
+            299_181,
+            "9ff03c39cad17b85b2fe7dc87b27b5ba37a3e5a740158c8d18b0f2d653ed66fc",
         ),
         // Demand-driven file reads add byte ranges and owned descriptor cleanup.
         // Incremental write acknowledgements, descriptor ownership and amortized
@@ -32303,8 +32410,8 @@ mod tests {
         // The existing bounded whole-file host snapshot is unchanged.
         (
             "node:fs",
-            106_666,
-            "0e2e0de4e5b6b51a66b32a0236ff2b20507da330901981bd413a72f510c0a715",
+            111_204,
+            "393f4ee83aaa34a4df0f6cbb019c52dea063c74da33f8fc1d4da0e649f032229",
         ),
         (
             "@mariozechner/pi-ai",
@@ -40416,8 +40523,10 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(
                 get_global_json(&runtime, "nativeWatch").await["events"],
                 json!([
-                    ["rename", "completed.json"], ["change", "existing.json"],
-                    ["rename", "completed.json"], ["rename", "renamed.json"],
+                    ["rename", "completed.json"],
+                    ["change", "existing.json"],
+                    ["rename", "completed.json"],
+                    ["rename", "renamed.json"],
                 ])
             );
             runtime
@@ -40502,7 +40611,10 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             clock.advance(50);
             runtime.tick().await.expect("owner poll");
             let before = get_global_json(&runtime, "eventWatchOwner").await;
-            assert_eq!(before["denials"], json!(["EACCES", "EACCES", "EACCES", "EACCES"]));
+            assert_eq!(
+                before["denials"],
+                json!(["EACCES", "EACCES", "EACCES", "EACCES"])
+            );
             assert_eq!(before["calls"], json!([["ext.a", "rename", "done.json"]]));
             assert_eq!(before["closes"], json!(0));
             assert_eq!(before["distinct"], json!(true));
@@ -41011,6 +41123,343 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["accessCallbackErr"], serde_json::json!(true));
             assert_eq!(r["hasLstatSync"], serde_json::json!(true));
         });
+    }
+
+    #[test]
+    fn pijs_fs_descriptor_callbacks_preserve_buffers_cursors_and_errors() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+globalThis.fsCallbackDescriptors = { done: false };
+(async () => {
+    const fs = await import("node:fs");
+    const result = { deferred: true, completions: 0 };
+    const call = (name, ...args) => new Promise((resolve, reject) => {
+        let returned = false;
+        fs[name](...args, (error, ...values) => {
+            result.deferred &&= returned;
+            result.completions++;
+            if (error) reject(error); else resolve(values);
+        });
+        returned = true;
+    });
+    const names = ["open", "read", "write", "close", "fstat", "ftruncate",
+        "futimes", "fsync", "fdatasync", "mkdtemp", "utimes"];
+    result.exports = names.every(name => fs[name] === fs.default[name]
+        && typeof fs[name] === "function");
+    const path = "/tmp/callback-descriptors";
+    const [fd] = await call("open", path, "w+", 0o600);
+    const written = await call("write", fd, "Ω", null, "utf16le");
+    result.stringWrite = written[0] === 2 && written[1] === "Ω";
+    const bytes = new Uint8Array([65, 66, 67, 68]);
+    const view = new DataView(bytes.buffer, 1, 2);
+    const positioned = await call("write", fd, view, { offset: 0, length: 2, position: 2 });
+    result.sameWriteBuffer = positioned[0] === 2 && positioned[1] === view;
+    await call("write", fd, Buffer.from("!"), 0, 1, null);
+    await call("write", fd, "Z", 4, "utf8");
+    result.content = fs.readFileSync(path, "hex");
+    const into = Buffer.alloc(7, 120);
+    const read = await call("read", fd, into, 1, 5, 0);
+    result.read = [read[0], read[1] === into, into.toString("hex")];
+    const negativeOption = await call("read", fd, { length: 1, position: -1 });
+    const negativeBuffer = Buffer.alloc(1);
+    const negativePositional = await call("read", fd, negativeBuffer, 0, 1, -1);
+    result.sentinel = Buffer.from(negativeOption[1].subarray(0, negativeOption[0])).toString()
+        + negativeBuffer.subarray(0, negativePositional[0]).toString();
+    const cursor = await call("read", fd, { length: 2 });
+    result.cursor = Buffer.from(cursor[1].subarray(0, cursor[0])).toString();
+    const eof = await call("read", fd);
+    result.eof = [eof[0], eof[1].length];
+    await call("write", fd, "?");
+    const size = await call("fstat", fd, {});
+    result.size = size[0].size;
+    await call("futimes", fd, 12, 34);
+    result.mtime = fs.fstatSync(fd).mtimeMs;
+    await call("fsync", fd);
+    await call("fdatasync", fd);
+    await call("ftruncate", fd, 3);
+    result.truncated = fs.readFileSync(path, "hex");
+    await call("close", fd);
+    await new Promise(resolve => {
+        let returned = false;
+        fs.read(fd, into, (error, count, buffer) => {
+            result.closed = error.code === "EBADF" && count === 0
+                && buffer === into && returned;
+            resolve();
+        });
+        returned = true;
+    });
+    const [reader] = await call("open", path);
+    const defaultRead = await call("read", reader, { length: 3 });
+    result.defaultRead = Buffer.from(defaultRead[1].subarray(0, defaultRead[0])).toString("hex");
+    const array = new Uint8Array(6);
+    const target = new DataView(array.buffer, 1, 4);
+    const partial = await call("read", reader, target, { offset: 1, length: 2, position: 1 });
+    result.viewRead = partial[0] === 2 && partial[1] === target
+        && Array.from(array).join() === "0,0,3,33,0,0";
+    await new Promise(resolve => {
+        fs.write(reader, "lost", (error, count, buffer) => {
+            result.readOnly = error.code === "EBADF" && count === 0 && buffer === "lost";
+            resolve();
+        });
+    });
+    await call("close", reader);
+    result.missing = await call("open", "/tmp/no-such-callback-file")
+        .then(() => false, error => error.code === "ENOENT");
+    const [dir] = await call("mkdtemp", "./callback-directory-");
+    result.directory = fs.statSync(dir).isDirectory();
+    await call("utimes", path, 56, 78);
+    result.pathMtime = fs.statSync(path).mtimeMs;
+    globalThis.fsCallbackDescriptors = { ...result, done: true };
+})().catch(error => { globalThis.fsCallbackDescriptors.error = String(error); });
+"#,
+                )
+                .await
+                .expect("evaluate callback descriptor I/O");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsCallbackDescriptors").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            for key in [
+                "deferred",
+                "exports",
+                "stringWrite",
+                "sameWriteBuffer",
+                "closed",
+                "viewRead",
+                "readOnly",
+                "missing",
+                "directory",
+            ] {
+                assert_eq!(result[key], json!(true), "{key}: {result}");
+            }
+            assert_eq!(result["completions"], json!(24));
+            assert_eq!(result["content"], json!("a90321435a"));
+            assert_eq!(result["read"], json!([5, true, "78a90321435a78"]));
+            assert_eq!(result["sentinel"], json!("CZ"));
+            assert_eq!(result["cursor"], json!(""));
+            assert_eq!(result["eof"], json!([0, 16_384]));
+            assert_eq!(result["size"], json!(6));
+            assert_eq!(result["mtime"], json!(34_000));
+            assert_eq!(result["truncated"], json!("a90321"));
+            assert_eq!(result["defaultRead"], json!("a90321"));
+            assert_eq!(result["pathMtime"], json!(78_000));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_callbacks_keep_owner_deliver_once_and_retire_on_reset() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let script = r#"
+globalThis.fsCallbackLifecycle = { done: false };
+(async () => {
+    const fs = await import("node:fs");
+    const result = { owners: [], thrown: 0, retired: 0 };
+    const settle = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
+    let ownedFd;
+    await new Promise((resolve, reject) => {
+        __pi_begin_extension(__pi_test_secret, "ext.callbacks.a");
+        fs.open("/tmp/callback-owner", "w+", (error, fd) => {
+            if (error) { reject(error); return; }
+            ownedFd = fd;
+            result.owners.push(__pi_get_current_extension_id());
+            fs.write(fd, "owner", error => {
+                if (error) { reject(error); return; }
+                result.owners.push(__pi_get_current_extension_id());
+                fs.read(fd, { length: 5, position: 0 }, (error, count, buffer) => {
+                    if (error) { reject(error); return; }
+                    result.owners.push(__pi_get_current_extension_id());
+                    result.content = Buffer.from(buffer.subarray(0, count)).toString();
+                    resolve();
+                });
+            });
+        });
+        __pi_end_extension(__pi_test_secret);
+    });
+    __pi_begin_extension(__pi_test_secret, "ext.callbacks.b");
+    const denied = [];
+    fs.write(ownedFd, "attack", error => {
+        denied.push(!!error && String(error).includes("host write denied"));
+        result.foreignOwner = __pi_get_current_extension_id();
+    });
+    fs.close(ownedFd, error => denied.push(!!error && String(error).includes("denied")));
+    __pi_end_extension(__pi_test_secret);
+    await settle();
+    result.foreignDenied = denied.length === 2 && denied.every(Boolean);
+    __pi_begin_extension(__pi_test_secret, "ext.callbacks.a");
+    result.preserved = fs.readFileSync("/tmp/callback-owner", "utf8");
+    fs.closeSync(ownedFd);
+    const noCallback = [
+        () => fs.open("/tmp/callback-must-not-create", "w"),
+        () => fs.writeFile("/tmp/callback-must-not-create", "bad", null),
+        () => fs.read(ownedFd, Buffer.alloc(1)),
+        () => fs.write(ownedFd, "bad", 0),
+        () => fs.close(ownedFd),
+        () => fs.fstat(ownedFd, {}),
+        () => fs.ftruncate(ownedFd, 0),
+        () => fs.futimes(ownedFd, 0, 0),
+        () => fs.fsync(ownedFd),
+        () => fs.fdatasync(ownedFd),
+    ];
+    result.invalidCallbacks = noCallback.every(operation => {
+        try { operation(); return false; }
+        catch (error) { return error instanceof TypeError && error.code === "ERR_INVALID_ARG_TYPE"; }
+    });
+    result.notCreated = !fs.existsSync("/tmp/callback-must-not-create");
+    let returned = false;
+    fs.readFile("/tmp/callback-owner", "utf8", () => {
+        result.thrown++;
+        result.throwDeferred = returned;
+        throw new Error("callback-body-failed");
+    });
+    returned = true;
+    __pi_end_extension(__pi_test_secret);
+    await settle();
+    __pi_begin_extension(__pi_test_secret, "ext.callbacks.a");
+    fs.open("/tmp/callback-pending", "w+", () => {
+        result.retired++;
+        fs.writeFileSync("/tmp/callback-recreated", "stale");
+    });
+    result.pending = __pi_vfs_api.counts().fds;
+    __pi_vfs_api.reset(__pi_test_secret);
+    __pi_end_extension(__pi_test_secret);
+    await settle();
+    result.afterReset = __pi_vfs_api.counts().fds;
+    __pi_begin_extension(__pi_test_secret, "ext.callbacks.a");
+    result.notRecreated = !fs.existsSync("/tmp/callback-recreated");
+    fs.writeFile("/tmp/callback-fresh", "fresh", error => { result.fresh = !error; });
+    try { __pi_fs_watch_runtime.resetCallbacks("forged"); result.forged = false; }
+    catch (_) { result.forged = true; }
+    __pi_end_extension(__pi_test_secret);
+    await settle();
+    globalThis.fsCallbackLifecycle = { ...result, done: true };
+})().catch(error => { globalThis.fsCallbackLifecycle.error = String(error); });
+"#;
+            runtime
+                .eval(&privileged_test_script(&runtime, script))
+                .await
+                .expect("evaluate callback scope and lifecycle");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsCallbackLifecycle").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(
+                result["owners"],
+                json!(["ext.callbacks.a", "ext.callbacks.a", "ext.callbacks.a"])
+            );
+            for key in [
+                "foreignDenied",
+                "invalidCallbacks",
+                "notCreated",
+                "throwDeferred",
+                "notRecreated",
+                "fresh",
+                "forged",
+            ] {
+                assert_eq!(result[key], json!(true), "{key}: {result}");
+            }
+            assert_eq!(result["content"], json!("owner"));
+            assert_eq!(result["foreignOwner"], json!("ext.callbacks.b"));
+            assert_eq!(result["preserved"], json!("owner"));
+            assert_eq!(result["thrown"], json!(1));
+            assert_eq!(result["retired"], json!(0));
+            assert_eq!(result["pending"], json!(1));
+            assert_eq!(result["afterReset"], json!(0));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_callback_exceptions_reach_host_console() {
+        struct ConsoleCapture(Arc<StdMutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ConsoleCapture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "pijs.console"
+                    || *event.metadata().level() != tracing::Level::ERROR
+                {
+                    return;
+                }
+                struct Message(String);
+                impl tracing::field::Visit for Message {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(message.0);
+            }
+        }
+
+        let logs = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let subscriber = tracing_subscriber::registry().with(ConsoleCapture(Arc::clone(&logs)));
+        tracing::subscriber::with_default(subscriber, || {
+            futures::executor::block_on(async {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                    .await
+                    .expect("create runtime");
+                let script = r#"
+globalThis.fsCallbackReporting = { calls: 0, intercepted: 0 };
+import("node:fs").then(fs => {
+    const result = globalThis.fsCallbackReporting;
+    __pi_begin_extension(__pi_test_secret, "ext.callback.reporting");
+    fs.writeFileSync("/tmp/callback-reporting", "ok");
+    console.error = () => { result.intercepted++; };
+    fs.readFile("/tmp/callback-reporting", () => {
+        result.calls++;
+        throw { toString() {
+            result.errorOwner = __pi_get_current_extension_id();
+            return "callback-body-failed";
+        } };
+    });
+    fs.readFile("/tmp/callback-reporting", (error, data) => {
+        result.followup = !error && String(data) === "ok";
+        result.done = true;
+    });
+    __pi_end_extension(__pi_test_secret);
+});
+"#;
+                runtime
+                    .eval(&privileged_test_script(&runtime, script))
+                    .await
+                    .expect("evaluate reported callback exception");
+                drain_until_idle(&runtime, &clock).await;
+                let result = get_global_json(&runtime, "fsCallbackReporting").await;
+                assert_eq!(result["calls"], json!(1), "{result}");
+                assert_eq!(result["intercepted"], json!(0));
+                assert_eq!(result["errorOwner"], json!("ext.callback.reporting"));
+                assert_eq!(result["followup"], json!(true));
+            });
+        });
+        let logs = logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        assert!(
+            logs[0].contains("Filesystem callback error: callback-body-failed"),
+            "{logs:?}"
+        );
     }
 
     #[test]
@@ -49469,13 +49918,19 @@ globalThis.fsWriteStorage = { done: false };
                     result[name]["before"],
                     json!({"outcome": "pending", "closed": false, "receivedError": null})
                 );
-                assert_eq!(result[name]["after"]["receivedError"], serde_json::Value::Null);
+                assert_eq!(
+                    result[name]["after"]["receivedError"],
+                    serde_json::Value::Null
+                );
             }
             assert_eq!(
                 result["cancelFailure"]["after"]["outcome"],
                 json!("cancel cleanup failed")
             );
-            assert_eq!(result["cancelSuccess"]["after"]["outcome"], json!("cancelled"));
+            assert_eq!(
+                result["cancelSuccess"]["after"]["outcome"],
+                json!("cancelled")
+            );
             for name in ["eofFailure", "eofSuccess", "cancelFailure", "cancelSuccess"] {
                 assert_eq!(result[name]["after"]["closed"], json!(true));
                 assert_eq!(result[name]["after"]["listeners"], json!([0, 0, 0, 0]));

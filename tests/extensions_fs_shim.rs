@@ -3843,8 +3843,11 @@ fn fs_persistent_inputs_are_checked_before_normalization() {
                 const denied = actions.map((action) => {{ try {{ action(); return false; }} catch (_) {{ return true; }} }});
                 let promiseDenied = false;
                 try {{ await fs.promises.readFile(raw, 'utf8'); }} catch (_) {{ promiseDenied = true; }}
-                let callbackDenied = false;
-                fs.readFile(raw, 'utf8', (error) => {{ callbackDenied = !!error; }});
+                const callbackDenied = await new Promise(resolve => {{
+                    let returned = false;
+                    fs.readFile(raw, 'utf8', error => resolve(!!error && returned));
+                    returned = true;
+                }});
 
                 fs.mkdirSync(workspace, {{ recursive: true }});
                 fs.symlinkSync(raw, workspace + '/virtual-alias');
