@@ -1315,6 +1315,349 @@ mod tests {
         }
     }
 
+    struct PendingNativeTool {
+        started: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::tools::Tool for PendingNativeTool {
+        fn name(&self) -> &str {
+            "pending_native_tool"
+        }
+
+        fn label(&self) -> &str {
+            "Pending native tool"
+        }
+
+        fn description(&self) -> &str {
+            "Wait until the owning native turn is cancelled or dropped"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn effects(&self) -> crate::tools::ToolEffects {
+            crate::tools::ToolEffects::read()
+        }
+
+        async fn execute(
+            &self,
+            _id: &str,
+            _input: Value,
+            _update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            self.started.store(true, Ordering::SeqCst);
+            futures::future::pending().await
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum NativeEffectEntry {
+        Text,
+        Content,
+        Continue,
+        Custom,
+    }
+
+    async fn run_native_effect_turn(
+        session: &mut AgentSession,
+        entry: NativeEffectEntry,
+        abort: Option<AbortSignal>,
+        on_event: AgentEventHandler,
+    ) -> Result<AssistantMessage> {
+        match entry {
+            NativeEffectEntry::Text => {
+                session
+                    .run_text_with_abort("Write the file".to_string(), abort, move |event| {
+                        on_event(event);
+                    })
+                    .await
+            }
+            NativeEffectEntry::Content => {
+                session
+                    .run_with_content_with_abort(
+                        vec![ContentBlock::Text(TextContent::new("Write the file"))],
+                        abort,
+                        move |event| on_event(event),
+                    )
+                    .await
+            }
+            NativeEffectEntry::Continue => {
+                session
+                    .run_continue_with_abort(abort, move |event| on_event(event))
+                    .await
+            }
+            NativeEffectEntry::Custom => {
+                session
+                    .run_custom_message_with_abort(
+                        Message::Custom(CustomMessage {
+                            content: "Write the file".to_string(),
+                            custom_type: "native-drop-test".to_string(),
+                            display: true,
+                            details: None,
+                            timestamp: 0,
+                        }),
+                        abort,
+                        move |event| on_event(event),
+                    )
+                    .await
+            }
+        }
+    }
+
+    fn native_effect_session(
+        cwd: &Path,
+        save_enabled: bool,
+    ) -> (AgentSession, Arc<TerminalBatchProvider>, Arc<AtomicBool>) {
+        let started = Arc::new(AtomicBool::new(false));
+        let mut tools = ToolRegistry::new(&["write"], cwd, None);
+        tools.push(Box::new(PendingNativeTool {
+            started: Arc::clone(&started),
+        }));
+        let provider = prewalk_batch_provider(vec![
+            batch_write_call("completed-write", "native-effect.txt", "kept"),
+            ToolCall {
+                id: "pending-tool".to_string(),
+                name: "pending_native_tool".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            },
+        ]);
+        let mut saved = if save_enabled {
+            Session::create_with_dir(Some(cwd.join("sessions")))
+        } else {
+            Session::in_memory()
+        };
+        saved.append_model_message(user_message("Existing request"));
+        let session = AgentSession::new(
+            Agent::new(provider.clone(), tools, AgentConfig::default()),
+            Arc::new(Mutex::new(saved)),
+            save_enabled,
+            ResolvedCompactionSettings {
+                enabled: false,
+                ..ResolvedCompactionSettings::default()
+            },
+        );
+        (session, provider, started)
+    }
+
+    async fn wait_for_pending_native_tool(
+        mut run: Pin<&mut impl std::future::Future<Output = Result<AssistantMessage>>>,
+        started: &AtomicBool,
+    ) {
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(10),
+            futures::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(run.as_mut(), cx).is_pending());
+                if started.load(Ordering::SeqCst) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("the real write must finish before the second tool waits");
+    }
+
+    #[test]
+    fn dropped_native_tool_batches_fence_every_entry_before_history_replacement() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let entries = [
+                NativeEffectEntry::Text,
+                NativeEffectEntry::Content,
+                NativeEffectEntry::Continue,
+                NativeEffectEntry::Custom,
+            ];
+            for save_enabled in [false, true] {
+                for entry in entries {
+                    let temp = tempfile::tempdir().expect("workspace");
+                    let (mut session, provider, started) =
+                        native_effect_session(temp.path(), save_enabled);
+                    let mut run = Box::pin(run_native_effect_turn(
+                        &mut session,
+                        entry,
+                        None,
+                        Arc::new(|_| {}),
+                    ));
+                    wait_for_pending_native_tool(run.as_mut(), &started).await;
+                    assert_eq!(
+                        std::fs::read_to_string(temp.path().join("native-effect.txt")).unwrap(),
+                        "kept"
+                    );
+                    drop(run);
+                    assert!(session.agent.messages().iter().any(|message| matches!(
+                        message,
+                        Message::ToolResult(result) if result.tool_call_id == "completed-write"
+                    )));
+                    {
+                        let cx = AgentCx::for_current_or_request();
+                        let saved = session.session.lock(cx.cx()).await.unwrap();
+                        assert!(
+                            saved
+                                .to_messages_for_current_path()
+                                .iter()
+                                .all(|message| !matches!(message, Message::ToolResult(_)))
+                        );
+                    }
+                    let live = serde_json::to_value(session.agent.messages()).unwrap();
+                    for next in entries {
+                        let error = run_native_effect_turn(
+                            &mut session,
+                            next,
+                            None,
+                            Arc::new(|_| {}),
+                        )
+                        .await
+                        .expect_err("an abandoned effect must fence native re-entry");
+                        assert!(
+                            error.is_session_persistence(),
+                            "{entry:?} -> {next:?}: {error}"
+                        );
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("PI_NATIVE_TOOL_TURN_INTERRUPTED")
+                        );
+                        assert_eq!(
+                            serde_json::to_value(session.agent.messages()).unwrap(),
+                            live
+                        );
+                    }
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Exact quarters verify settlement after admission is fenced.
+    fn dropped_native_tool_turn_fences_retained_accounts_but_settles_owned_bills() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for separate_failure in [false, true] {
+                let temp = tempfile::tempdir().expect("workspace");
+                let (mut session, _, started) = native_effect_session(temp.path(), false);
+                let retained = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                let mut inflight = retained.start_attempt().unwrap();
+                session.agent.set_cost_budget(Some(retained.clone()));
+                let admission = session.provider_admission_gate();
+                let mut run = Box::pin(run_native_effect_turn(
+                    &mut session,
+                    NativeEffectEntry::Text,
+                    None,
+                    Arc::new(|_| {}),
+                ));
+                wait_for_pending_native_tool(run.as_mut(), &started).await;
+                retained
+                    .admit()
+                    .expect("active tools must not quarantine their account");
+                if separate_failure {
+                    admission.block("a separate transition failed".to_string());
+                }
+                drop(run);
+                assert!(
+                    admission
+                        .ensure_allowed()
+                        .unwrap_err()
+                        .is_session_persistence()
+                );
+                if separate_failure {
+                    assert_eq!(
+                        admission.reason().as_deref(),
+                        Some("a separate transition failed")
+                    );
+                }
+                assert!(matches!(retained.start_attempt(), Err(Error::Session(_))));
+                inflight.finish(0.75).expect("an owned bill must still settle");
+                assert_eq!(retained.spent(), 0.75);
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("native-effect.txt")).unwrap(),
+                    "kept"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn awaited_native_tool_abort_persists_results_and_allows_reentry() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for save_enabled in [false, true] {
+                let temp = tempfile::tempdir().expect("workspace");
+                let (mut session, provider, started) =
+                    native_effect_session(temp.path(), save_enabled);
+                let (handle, signal) = AbortHandle::new();
+                let mut run = Box::pin(run_native_effect_turn(
+                    &mut session,
+                    NativeEffectEntry::Text,
+                    Some(signal),
+                    Arc::new(|_| {}),
+                ));
+                wait_for_pending_native_tool(run.as_mut(), &started).await;
+                handle.abort();
+                assert_eq!(run.await.unwrap().stop_reason, StopReason::Aborted);
+                session.ensure_provider_reentry_allowed().unwrap();
+                {
+                    let cx = AgentCx::for_current_or_request();
+                    let saved = session.session.lock(cx.cx()).await.unwrap();
+                    let messages = saved.to_messages_for_current_path();
+                    assert!(messages.iter().any(|message| matches!(
+                        message,
+                        Message::ToolResult(result)
+                            if result.tool_call_id == "completed-write" && !result.is_error
+                    )));
+                    assert!(messages.iter().any(|message| matches!(
+                        message,
+                        Message::ToolResult(result)
+                            if result.tool_call_id == "pending-tool" && result.is_error
+                    )));
+                }
+                session
+                    .run_text("Continue".to_string(), |_| {})
+                    .await
+                    .unwrap();
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("native-effect.txt")).unwrap(),
+                    "kept"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn panicking_native_tool_start_callback_cannot_leave_admission_open() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("workspace");
+            let (mut session, provider, _) = native_effect_session(temp.path(), false);
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                run_native_effect_turn(
+                    &mut session,
+                    NativeEffectEntry::Text,
+                    None,
+                    Arc::new(|event| {
+                        if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                            panic!("host callback failed before tool dispatch");
+                        }
+                    }),
+                ),
+            ))
+            .await;
+            assert!(result.is_err());
+            let error = session.ensure_provider_reentry_allowed().unwrap_err();
+            assert!(error.is_session_persistence());
+            assert!(error.to_string().contains("PI_NATIVE_TOOL_TURN_INTERRUPTED"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert!(!temp.path().join("native-effect.txt").exists());
+        });
+    }
+
     struct RuleScriptProvider {
         scripts: Vec<Vec<StreamEvent>>,
         calls: std::sync::atomic::AtomicUsize,
@@ -1656,6 +1999,22 @@ mod tests {
                 ),
                 "{history:?}"
             ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            session
+                .ensure_provider_reentry_allowed()
+                .expect("a completed checkpoint leaves no unpersisted tool effects");
+            let provider = CapturingProvider::new("test-api");
+            let captured = provider.calls();
+            session.agent.set_provider(Arc::new(provider));
+            session
+                .run_continue_with_abort(None, |_| {})
+                .await
+                .expect("dropping a later provider request must preserve native reuse");
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert!(captured[0].messages.iter().any(|message| matches!(
+                message,
+                Message::ToolResult(result) if result.tool_call_id == "checkpointed"
+            )));
         });
     }
 

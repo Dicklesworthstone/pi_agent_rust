@@ -2152,6 +2152,11 @@ pub struct Agent {
     turn_checkpoint: Option<TurnCheckpoint>,
     turn_checkpoint_cursor: usize,
 
+    /// Tool dispatch may have effects before the owning Session receives the
+    /// complete result span. Shared with the native turn's drop guard so an
+    /// abandoned future cannot rehydrate an older history and replay the work.
+    unpersisted_tool_effects: Arc<AtomicBool>,
+
     /// Fetchers for queued steering messages (interrupts).
     steering_fetchers: Vec<RegisteredMessageFetcher>,
 
@@ -2427,6 +2432,7 @@ impl Agent {
             authored_queue_delivery_indices: Vec::new(),
             turn_checkpoint: None,
             turn_checkpoint_cursor: 0,
+            unpersisted_tool_effects: Arc::new(AtomicBool::new(false)),
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
@@ -2874,6 +2880,9 @@ impl Agent {
         self.turn_checkpoint_cursor = end;
         self.authored_queue_delivery_indices
             .retain(|index| *index >= end);
+        if end == self.messages.len() {
+            self.unpersisted_tool_effects.store(false, Ordering::Release);
+        }
     }
 
     /// Add a message to the history.
@@ -6502,6 +6511,11 @@ impl Agent {
         latency: SharedTurnLatencyAccumulator,
         parallelism: usize,
     ) -> Result<ToolExecutionOutcome> {
+        // Arm before callbacks as well as dispatch: either may unwind, and a
+        // later compatible-effect batch can be pending after an earlier write.
+        if !tool_calls.is_empty() {
+            self.unpersisted_tool_effects.store(true, Ordering::Release);
+        }
         // A cancelled/abandoned batch must never donate evidence to a later
         // request. Nested host calls contribute only while this batch runs.
         self.take_prewalk_evidence();
@@ -8146,6 +8160,9 @@ pub(crate) fn append_advisor_input_reset(
 struct AdvisorTurn {
     on_event: AgentEventHandler,
     terminal: Option<Arc<StdMutex<Option<AgentEvent>>>>,
+    unpersisted_tool_effects: Arc<AtomicBool>,
+    admission: ProviderAdmissionGate,
+    cost_budget: Option<crate::cost::CostBudget>,
     started: Instant,
     max_time: Option<Duration>,
 }
@@ -8158,6 +8175,9 @@ impl AdvisorTurn {
                 .advisor
                 .as_ref()
                 .map(|_| Arc::new(StdMutex::new(None))),
+            unpersisted_tool_effects: Arc::clone(&session.agent.unpersisted_tool_effects),
+            admission: session.provider_admission.clone(),
+            cost_budget: session.agent.cost_budget().cloned(),
             started: session
                 .agent
                 .run_budget
@@ -8247,6 +8267,21 @@ impl AdvisorTurn {
 
 impl Drop for AdvisorTurn {
     fn drop(&mut self) {
+        if self.unpersisted_tool_effects.load(Ordering::Acquire) {
+            let message = "PI_NATIVE_TOOL_TURN_INTERRUPTED: tool execution was interrupted before its results reached Session persistence";
+            let mut reason = self
+                .admission
+                .reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reason.get_or_insert_with(|| message.to_string());
+            drop(reason);
+            // Retained tools share the account without consulting Session
+            // admission. Existing owned requests may still settle their bills.
+            if let Some(budget) = &self.cost_budget {
+                budget.quarantine(message);
+            }
+        }
         let Some(terminal) = &self.terminal else {
             return;
         };
@@ -27839,6 +27874,9 @@ impl AgentSession {
                 budget.checkpoint(&mut session)?;
             }
         }
+        self.agent
+            .unpersisted_tool_effects
+            .store(false, Ordering::Release);
         Ok(())
     }
 }
