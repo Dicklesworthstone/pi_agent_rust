@@ -3077,16 +3077,29 @@ fn soak_detector_catches_deliberately_leaked_descriptor() {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let harness = TestHarness::new("soak_real_fd_leak_probe");
         let probe_path = harness.create_file("fd_leak_probe.tmp", "probe\n");
-        let before = sample_open_fds();
-        let mut leaked = Vec::with_capacity(24);
-        for _ in 0..24 {
-            leaked.push(std::fs::File::open(&probe_path).expect("open temp file"));
+        let mut last_sample = (0usize, 0usize);
+        let mut observed_leak = false;
+        for _ in 0..8 {
+            let before = sample_open_fds();
+            let mut leaked = Vec::with_capacity(24);
+            for _ in 0..24 {
+                leaked.push(std::fs::File::open(&probe_path).expect("open temp file"));
+            }
+            let after = sample_open_fds();
+            drop(leaked);
+            last_sample = (before, after);
+            if after >= before + 24 {
+                observed_leak = true;
+                break;
+            }
+            // Parallel tests outside PROCESS_SAMPLER_LOCK may close an unrelated FD
+            // during this microsecond window; retry without relaxing the +24 threshold.
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let after = sample_open_fds();
-        drop(leaked);
         assert!(
-            after >= before + 24,
-            "real /proc/self/fd sampler must observe +24 open descriptors (before={before}, after={after})"
+            observed_leak,
+            "real /proc/self/fd sampler must observe +24 open descriptors (before={}, after={})",
+            last_sample.0, last_sample.1
         );
     }
 }

@@ -554,6 +554,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/openai.rs` | OpenAI chat provider | Unit; `tests/provider_streaming/openai.rs`, provider error/path suites. |
 | `src/providers/openai_deepseek.rs` | Recovery of DeepSeek tool calls emitted in the text channel | No in-module tests; reached through `src/providers/openai.rs`. |
 | `src/providers/openai_deepseek_tests.rs` | Terminal and fragmented-stream regressions for DeepSeek text tool recovery | Test module (16 tests). |
+| `src/providers/openai_openrouter.rs` | OpenRouter structured reasoning continuation, replay fencing, and parse-error redaction | Unit (in-module wire-stream and session-roundtrip regressions). |
 | `src/providers/openai_terminal_safety_tests.rs` | OpenAI streamed tool argument validation and stream failure preservation | Unit (in-module, terminal safety tests). |
 | `src/providers/openai_responses.rs` | OpenAI Responses provider | Unit; `tests/provider_streaming/openai_responses.rs`, provider error/path suites. |
 | `src/providers/vertex.rs` | Vertex provider | Unit; provider native/contract suites. |

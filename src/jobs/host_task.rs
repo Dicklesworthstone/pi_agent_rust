@@ -1207,6 +1207,7 @@ mod tests {
     #[test]
     fn async_native_admission_keeps_the_current_thread_abort_loop_responsive() {
         let _guard = super::super::process_test_guard();
+        let _shutdown_isolation = super::super::ShutdownCapacityIsolationGuard::acquire();
         let root = tempfile::tempdir().expect("native admission root");
         let session = owner_id();
         let owner = AgentCx::for_request();
@@ -1329,12 +1330,14 @@ mod tests {
     #[test]
     fn async_native_admission_reserves_capacity_before_dispatch() {
         let _guard = super::super::process_test_guard();
+        let _shutdown_isolation = super::super::ShutdownCapacityIsolationGuard::acquire();
         let root = tempfile::tempdir().expect("native admission root");
         let session = owner_id();
         let lifecycle = lifecycle_lock().lock().expect("hold peer lifecycle lane");
         let mut task = Context::from_waker(futures::task::noop_waker_ref());
         let mut launches = Vec::new();
         let mut probes = Vec::new();
+        let mut all_pending = true;
         for _ in 0..super::super::MAX_CONCURRENT_JOBS {
             let probe = Arc::new(AdmissionProbe::default());
             let mut launch = Box::pin(spawn_owned_task_async(
@@ -1346,7 +1349,7 @@ mod tests {
                 privacy(),
                 QueuedWork(Arc::clone(&probe)),
             ));
-            assert!(launch.as_mut().poll(&mut task).is_pending());
+            all_pending &= launch.as_mut().poll(&mut task).is_pending();
             launches.push(launch);
             probes.push(probe);
         }
@@ -1367,6 +1370,7 @@ mod tests {
         drop(launches);
         drop(lifecycle);
         wait_for_native_admission_cleanup(&session);
+        assert!(all_pending);
         assert_eq!(reserved, super::super::MAX_CONCURRENT_JOBS);
         assert!(
             rejected,
@@ -1525,6 +1529,7 @@ mod tests {
     #[test]
     fn lifecycle_contention_respects_native_cancellation_deadline_and_shutdown() {
         let _guard = super::super::process_test_guard();
+        let _shutdown_isolation = super::super::ShutdownCapacityIsolationGuard::acquire();
         for reason in ["deadline", "owner", "session"] {
             let root = tempfile::tempdir().expect("native admission root");
             let session = owner_id();
@@ -1619,6 +1624,7 @@ mod tests {
     #[test]
     fn native_capacity_refusal_does_not_wait_for_the_lifecycle_lane() {
         let _guard = super::super::process_test_guard();
+        let _shutdown_isolation = super::super::ShutdownCapacityIsolationGuard::acquire();
         let root = tempfile::tempdir().expect("native admission root");
         let session = owner_id();
         let admission = admit_owned_task(&session).expect("capture native admission");
@@ -1949,6 +1955,7 @@ mod tests {
     #[allow(clippy::significant_drop_tightening)]
     fn owner_shutdown_timeout_still_cancels_native_work_and_fences_progress() {
         let _guard = super::super::process_test_guard();
+        let _shutdown_isolation = super::super::ShutdownCapacityIsolationGuard::acquire();
         let root = tempfile::tempdir().expect("artifact root");
         let owner = owner_id();
         let dropped = Arc::new(AtomicBool::new(false));

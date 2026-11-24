@@ -388,8 +388,12 @@ fn openai_invalid_json_event_fails_stream() {
         let err = stream.next().await.expect("expected one item").unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("JSON parse error"),
+            message.contains("Invalid OpenAI stream JSON"),
             "unexpected stream error: {message}"
+        );
+        assert!(
+            !message.contains("{not json}"),
+            "malformed OpenAI stream payload must not be echoed in error: {message}"
         );
     });
 }

@@ -4244,6 +4244,7 @@ impl Drop for SessionShutdownWorker {
     }
 }
 
+#[cfg_attr(test, allow(clippy::significant_drop_tightening))]
 async fn request_session_shutdown(
     owner_session_id: &str,
 ) -> Result<(SessionShutdownAttempt, Vec<JobWaitHandle>)> {
@@ -4253,41 +4254,46 @@ async fn request_session_shutdown(
             "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable",
         ));
     }
-    // The uncontended path only snapshots in-memory state. Do not allocate a
-    // thread or consume the bounded waiting lane for an immediately available
-    // fence, including ordinary empty-session teardown.
-    if let Ok(lifecycle) = lifecycle_lock().try_lock() {
+    let receiver = {
+        #[cfg(test)]
+        let _shutdown_isolation = acquire_shutdown_capacity_read_guard();
+        // The uncontended path only snapshots in-memory state. Do not allocate a
+        // thread or consume the bounded waiting lane for an immediately available
+        // fence, including ordinary empty-session teardown.
+        if let Ok(lifecycle) = lifecycle_lock().try_lock() {
+            let attempt = SessionShutdownAttempt::begin(owner_session_id)?;
+            let handles = session_shutdown_handles(owner_session_id)?;
+            drop(lifecycle);
+            return Ok((attempt, handles));
+        }
+        let worker = SessionShutdownWorker::reserve()?;
+        // Publish cancellation before the worker waits behind an unrelated launch.
+        // The attempt travels with the result: losing either the worker or its
+        // receiver leaves the same fail-closed fence as an interrupted settlement.
         let attempt = SessionShutdownAttempt::begin(owner_session_id)?;
-        let handles = session_shutdown_handles(owner_session_id)?;
-        drop(lifecycle);
-        return Ok((attempt, handles));
-    }
-    let worker = SessionShutdownWorker::reserve()?;
-    // Publish cancellation before the worker waits behind an unrelated launch.
-    // The attempt travels with the result: losing either the worker or its
-    // receiver leaves the same fail-closed fence as an interrupted settlement.
-    let attempt = SessionShutdownAttempt::begin(owner_session_id)?;
-    let started = Instant::now();
-    let (sender, receiver) = futures::channel::oneshot::channel();
-    // spawn_blocking runs inline without a runtime blocking pool. A dedicated,
-    // capacity-limited worker keeps this fence off even a current-thread
-    // executor; thread creation failure must never fall back to inline work.
-    std::thread::Builder::new()
-        .name("pi-jobs-session-shutdown".to_string())
-        .spawn(move || {
-            let result =
-                snapshot_session_shutdown(attempt, started, SESSION_SHUTDOWN_TIMEOUT, || {
-                    sender.is_canceled()
-                });
-            let _ = sender.send(result);
-            drop(worker);
-        })
-        .map_err(|error| {
-            Error::tool(
-                "jobs",
-                format!("PI_JOBS_SESSION_SHUTDOWN_WORKER: failed to start worker: {error}"),
-            )
-        })?;
+        let started = Instant::now();
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        // spawn_blocking runs inline without a runtime blocking pool. A dedicated,
+        // capacity-limited worker keeps this fence off even a current-thread
+        // executor; thread creation failure must never fall back to inline work.
+        std::thread::Builder::new()
+            .name("pi-jobs-session-shutdown".to_string())
+            .spawn(move || {
+                let result =
+                    snapshot_session_shutdown(attempt, started, SESSION_SHUTDOWN_TIMEOUT, || {
+                        sender.is_canceled()
+                    });
+                let _ = sender.send(result);
+                drop(worker);
+            })
+            .map_err(|error| {
+                Error::tool(
+                    "jobs",
+                    format!("PI_JOBS_SESSION_SHUTDOWN_WORKER: failed to start worker: {error}"),
+                )
+            })?;
+        receiver
+    };
     // Teardown remains usable after its invoking task has been cancelled.
     // Dropping this future still closes the receiver and retires a waiting
     // worker without clearing the cancellation fence prematurely.
@@ -4485,6 +4491,56 @@ pub fn kill_all() {
             TERMINATE_GRACE + OUTPUT_DRAIN_GRACE + Duration::from_secs(1),
         );
     }
+}
+
+#[cfg(test)]
+fn shutdown_capacity_isolation_lock() -> &'static std::sync::RwLock<()> {
+    static ISOLATION: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    &ISOLATION
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static HOLDS_SHUTDOWN_CAPACITY_ISOLATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ShutdownCapacityIsolationGuard {
+    _guard: std::sync::RwLockWriteGuard<'static, ()>,
+    previous: bool,
+}
+
+#[cfg(test)]
+impl ShutdownCapacityIsolationGuard {
+    pub(crate) fn acquire() -> Self {
+        let guard = shutdown_capacity_isolation_lock()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = HOLDS_SHUTDOWN_CAPACITY_ISOLATION.with(|flag| flag.replace(true));
+        Self {
+            _guard: guard,
+            previous,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShutdownCapacityIsolationGuard {
+    fn drop(&mut self) {
+        HOLDS_SHUTDOWN_CAPACITY_ISOLATION.with(|flag| flag.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+fn acquire_shutdown_capacity_read_guard() -> Option<std::sync::RwLockReadGuard<'static, ()>> {
+    if HOLDS_SHUTDOWN_CAPACITY_ISOLATION.with(std::cell::Cell::get) {
+        return None;
+    }
+    Some(
+        shutdown_capacity_isolation_lock()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 #[cfg(test)]
@@ -6756,23 +6812,29 @@ mod tests {
         record_final_shutdown_fixture_completion();
     }
 
-    fn wait_for_shutdown_workers_to_retire() {
-        let deadline = Instant::now() + Duration::from_secs(2);
+    fn wait_for_shutdown_workers_to_retire_within(timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
         loop {
             if registry()
                 .lock()
-                .expect("shutdown worker registry")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .shutdown_workers
                 == 0
             {
-                return;
+                return true;
             }
-            assert!(
-                Instant::now() < deadline,
-                "abandoned shutdown workers must retire without waiting for the lifecycle lock"
-            );
+            if Instant::now() >= deadline {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn wait_for_shutdown_workers_to_retire() {
+        assert!(
+            wait_for_shutdown_workers_to_retire_within(Duration::from_secs(5)),
+            "abandoned shutdown workers must retire without waiting for the lifecycle lock"
+        );
     }
 
     #[test]
@@ -6781,6 +6843,7 @@ mod tests {
         use std::task::{Context, Poll};
 
         let _guard = process_test_guard();
+        let _shutdown_isolation = ShutdownCapacityIsolationGuard::acquire();
         wait_for_shutdown_workers_to_retire();
         let workers = (0..MAX_SESSION_SHUTDOWN_WORKERS)
             .map(|_| SessionShutdownWorker::reserve().expect("reserve waiting lane"))
@@ -6808,6 +6871,7 @@ mod tests {
         use std::task::Context;
 
         let _guard = process_test_guard();
+        let _shutdown_isolation = ShutdownCapacityIsolationGuard::acquire();
         wait_for_shutdown_workers_to_retire();
         let root = temp_root();
         let owner = format!("shutdown-yield-{}", uuid::Uuid::new_v4().simple());
@@ -6830,27 +6894,44 @@ mod tests {
         // Poll on this thread without any runtime blocking pool. The old
         // spawn_blocking fallback waits here until the lifecycle timeout and
         // returns Ready(Err); this must yield while we still hold the lock.
+        let first_poll_pending = shutdown.as_mut().poll(&mut task).is_pending();
+        let (owner_closing, job_cancel_requested, peer_cancel_requested, peer_closing) = {
+            let reg = registry().lock().expect("observe shutdown fence");
+            (
+                reg.closing_owners.contains_key(&owner),
+                reg.jobs[&id].cancel_requested,
+                reg.jobs[&peer_id].cancel_requested,
+                reg.closing_owners.contains_key(&peer),
+            )
+        };
+        let admission_blocked = ensure_session_accepting_jobs(&owner).is_err();
+        settle_job_without_notice(&id, JobStatus::Killed, None, true);
+        // Release before assertions so any failure cannot poison lifecycle_lock().
+        drop(lifecycle);
+        let shutdown_result = futures::executor::block_on(shutdown);
+        wait_for_shutdown_workers_to_retire();
+        let (owner_cleared, peer_still_uncancelled) = {
+            let mut reg = registry().lock().expect("retire shutdown fixtures");
+            let state = (
+                !reg.closing_owners.contains_key(&owner),
+                !reg.jobs[&peer_id].cancel_requested,
+            );
+            reg.jobs.remove(&id);
+            reg.jobs.remove(&peer_id);
+            state
+        };
         assert!(
-            shutdown.as_mut().poll(&mut task).is_pending(),
+            first_poll_pending,
             "session teardown must yield before another task can release the lifecycle fence"
         );
-        {
-            let reg = registry().lock().expect("observe shutdown fence");
-            assert!(reg.closing_owners.contains_key(&owner));
-            assert!(reg.jobs[&id].cancel_requested);
-            assert!(!reg.jobs[&peer_id].cancel_requested);
-            assert!(!reg.closing_owners.contains_key(&peer));
-        }
-        assert!(ensure_session_accepting_jobs(&owner).is_err());
-        settle_job_without_notice(&id, JobStatus::Killed, None, true);
-        drop(lifecycle);
-        futures::executor::block_on(shutdown).expect("owner teardown completes after release");
-        wait_for_shutdown_workers_to_retire();
-        let mut reg = registry().lock().expect("retire shutdown fixtures");
-        assert!(!reg.closing_owners.contains_key(&owner));
-        assert!(!reg.jobs[&peer_id].cancel_requested);
-        reg.jobs.remove(&id);
-        reg.jobs.remove(&peer_id);
+        assert!(owner_closing);
+        assert!(job_cancel_requested);
+        assert!(!peer_cancel_requested);
+        assert!(!peer_closing);
+        assert!(admission_blocked);
+        shutdown_result.expect("owner teardown completes after release");
+        assert!(owner_cleared);
+        assert!(peer_still_uncancelled);
     }
 
     #[test]
@@ -6860,26 +6941,62 @@ mod tests {
         use std::task::{Context, Poll};
 
         let _guard = process_test_guard();
+        let _shutdown_isolation = ShutdownCapacityIsolationGuard::acquire();
         wait_for_shutdown_workers_to_retire();
         let owners = (0..MAX_SESSION_SHUTDOWN_WORKERS)
             .map(|_| format!("shutdown-drop-{}", uuid::Uuid::new_v4().simple()))
             .collect::<Vec<_>>();
+        let excess_owner = format!("shutdown-excess-{}", uuid::Uuid::new_v4().simple());
         let lifecycle = lifecycle_lock().lock().expect("pause admission");
         let mut shutdowns = owners
             .iter()
             .map(|owner| Box::pin(kill_session(owner)))
             .collect::<Vec<_>>();
         let mut task = Context::from_waker(futures::task::noop_waker_ref());
-        for shutdown in &mut shutdowns {
-            assert!(shutdown.as_mut().poll(&mut task).is_pending());
-        }
-        assert_eq!(
-            registry().lock().expect("worker capacity").shutdown_workers,
-            MAX_SESSION_SHUTDOWN_WORKERS
-        );
-        let excess_owner = format!("shutdown-excess-{}", uuid::Uuid::new_v4().simple());
+        let all_pending = shutdowns
+            .iter_mut()
+            .all(|shutdown| shutdown.as_mut().poll(&mut task).is_pending());
+        let workers_at_capacity = registry().lock().expect("worker capacity").shutdown_workers;
         let mut excess = Box::pin(kill_session(&excess_owner));
-        let Poll::Ready(Err(error)) = excess.as_mut().poll(&mut task) else {
+        let excess_poll = excess.as_mut().poll(&mut task);
+        let (excess_workers_count, excess_not_closing, excess_no_generation) = {
+            let reg = registry().lock().expect("capacity rejection state");
+            (
+                reg.shutdown_workers,
+                !reg.closing_owners.contains_key(&excess_owner),
+                !reg.owner_shutdown_generations.contains_key(&excess_owner),
+            )
+        };
+
+        drop(shutdowns);
+        // Keep the lock held: dropping the receivers, rather than lock release
+        // or the ten-second timeout, must be what retires all eight workers.
+        let workers_retired_before_release =
+            wait_for_shutdown_workers_to_retire_within(Duration::from_secs(5));
+        let abandoned_states = {
+            let reg = registry().lock().expect("abandoned shutdown fences");
+            owners
+                .iter()
+                .map(|owner| {
+                    (
+                        reg.closing_owners
+                            .get(owner)
+                            .map(|state| state.active_attempts),
+                        reg.owner_shutdown_generations.contains_key(owner),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let admissions_blocked = owners
+            .iter()
+            .map(|owner| ensure_session_accepting_jobs(owner).is_err())
+            .collect::<Vec<_>>();
+        // Release before assertions so any failure cannot poison lifecycle_lock().
+        drop(lifecycle);
+
+        assert!(all_pending);
+        assert_eq!(workers_at_capacity, MAX_SESSION_SHUTDOWN_WORKERS);
+        let Poll::Ready(Err(error)) = excess_poll else {
             panic!("a full worker lane must reject without allocating another thread");
         };
         assert!(
@@ -6887,28 +7004,20 @@ mod tests {
                 .to_string()
                 .contains("PI_JOBS_SESSION_SHUTDOWN_AT_CAPACITY")
         );
-        {
-            let reg = registry().lock().expect("capacity rejection state");
-            assert_eq!(reg.shutdown_workers, MAX_SESSION_SHUTDOWN_WORKERS);
-            assert!(!reg.closing_owners.contains_key(&excess_owner));
-            assert!(!reg.owner_shutdown_generations.contains_key(&excess_owner));
+        assert_eq!(excess_workers_count, MAX_SESSION_SHUTDOWN_WORKERS);
+        assert!(excess_not_closing);
+        assert!(excess_no_generation);
+        assert!(
+            workers_retired_before_release,
+            "abandoned shutdown workers must retire without waiting for the lifecycle lock"
+        );
+        for (active_attempts, has_generation) in abandoned_states {
+            assert_eq!(active_attempts, Some(0));
+            assert!(has_generation);
         }
-
-        drop(shutdowns);
-        // Keep the lock held: dropping the receivers, rather than lock release
-        // or the ten-second timeout, must be what retires all eight workers.
-        wait_for_shutdown_workers_to_retire();
-        {
-            let reg = registry().lock().expect("abandoned shutdown fences");
-            for owner in &owners {
-                assert_eq!(reg.closing_owners[owner].active_attempts, 0);
-                assert!(reg.owner_shutdown_generations.contains_key(owner));
-            }
+        for blocked in admissions_blocked {
+            assert!(blocked);
         }
-        for owner in &owners {
-            assert!(ensure_session_accepting_jobs(owner).is_err());
-        }
-        drop(lifecycle);
         for owner in &owners {
             ensure_session_accepting_jobs(owner).expect("safe abandoned-fence reconciliation");
         }
@@ -7391,6 +7500,7 @@ mod tests {
     #[test]
     fn session_shutdown_lifecycle_fence_acquisition_is_bounded() {
         let _guard = process_test_guard();
+        let _shutdown_isolation = ShutdownCapacityIsolationGuard::acquire();
         let owner = format!("shutdown-lock-{}", uuid::Uuid::new_v4().simple());
         let lifecycle_guard = lifecycle_lock()
             .lock()
@@ -7414,6 +7524,15 @@ mod tests {
                 panic!("shutdown fence acquisition did not remain bounded: {err}");
             }
         };
+        let closing_while_held = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closing_owners
+            .contains_key(&owner);
+        let admission_blocked_while_held = ensure_session_accepting_jobs(&owner).is_err();
+        // Release before assertions so any failure cannot poison lifecycle_lock().
+        drop(lifecycle_guard);
+        request.join().expect("shutdown-fence request thread");
         let error = match request_result {
             Err(error) => error,
             Ok((_attempt, _handles)) => {
@@ -7427,19 +7546,13 @@ mod tests {
             "unexpected lifecycle-timeout error: {error}"
         );
         assert!(
-            registry()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .closing_owners
-                .contains_key(&owner),
+            closing_while_held,
             "a timed-out fence must keep rejecting late owner spawns"
         );
         assert!(
-            ensure_session_accepting_jobs(&owner).is_err(),
+            admission_blocked_while_held,
             "an in-flight lifecycle owner must prevent premature fence reconciliation"
         );
-        drop(lifecycle_guard);
-        request.join().expect("shutdown-fence request thread");
         ensure_session_accepting_jobs(&owner).expect("safe stale-fence reconciliation");
         assert!(
             !registry()
@@ -7455,6 +7568,7 @@ mod tests {
     #[allow(clippy::significant_drop_tightening)]
     fn session_shutdown_timeout_still_reaps_owned_shell_and_preserves_peer() {
         let _guard = process_test_guard();
+        let _shutdown_isolation = ShutdownCapacityIsolationGuard::acquire();
         let root = temp_root();
         let owner = format!("shutdown-running-{}", uuid::Uuid::new_v4().simple());
         let peer_owner = format!("shutdown-peer-{}", uuid::Uuid::new_v4().simple());

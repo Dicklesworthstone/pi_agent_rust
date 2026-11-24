@@ -24,6 +24,7 @@ const PROVIDER_SUPPORT_MODULES: &[&str] = &[
     "openai_terminal_safety_tests",
     "openai_deepseek",
     "openai_deepseek_tests",
+    "openai_openrouter",
     "tool_schema",
 ];
 const REQUIRED_ARTIFACT_INVENTORY_AREAS: &[&str] = &[
