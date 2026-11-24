@@ -21,6 +21,9 @@ use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 
+#[path = "openai_responses_complete.rs"]
+mod complete;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -202,7 +205,11 @@ impl OpenAIResponsesProvider {
                 options.max_tokens.or(Some(DEFAULT_MAX_OUTPUT_TOKENS))
             },
             tools,
-            stream: true,
+            stream: self
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.supports_streaming)
+                .unwrap_or(true),
             store: false,
             tool_choice,
             parallel_tool_calls,
@@ -471,7 +478,7 @@ impl Provider for OpenAIResponsesProvider {
                         payload: original,
                     };
                     if let Some(mutated) = hook.rewrite(event).await {
-                        match validate_rewritten_responses_request(mutated) {
+                        match validate_rewritten_responses_request(mutated, request_body.stream) {
                             Ok(validated) => rewritten_body = Some(validated),
                             Err(reason) => {
                                 tracing::warn!(
@@ -493,7 +500,7 @@ impl Provider for OpenAIResponsesProvider {
         // produces a duplicate header that OpenAI's server rejects.
         let mut request = self.client.post(&self.base_url).header(
             "Accept",
-            "text/event-stream, application/x-ndjson, application/ndjson",
+            "text/event-stream, application/x-ndjson, application/ndjson, application/json",
         );
 
         if let Some(ref auth_value) = auth_value {
@@ -566,8 +573,8 @@ impl Provider for OpenAIResponsesProvider {
         // Validate Content-Type when present. For standard OpenAI Responses
         // endpoints we fail closed if the header is missing; for Codex we allow
         // it because some endpoints omit the header while still streaming SSE.
-        // If the header IS present and indicates a non-SSE type, reject early
-        // so we fail closed instead of silently dropping events in the SSE parser.
+        // A completed JSON response uses the same output/terminal validation
+        // through its own bounded framing adapter, never the SSE parser.
         let content_type = response
             .headers()
             .iter()
@@ -575,16 +582,26 @@ impl Provider for OpenAIResponsesProvider {
             .map(|(_, value)| value.to_ascii_lowercase());
         if content_type.is_none() && !self.codex_mode {
             return Err(Error::api(format!(
-                "OpenAI API protocol error (HTTP {status}): missing content-type header (expected text/event-stream or application/x-ndjson)"
+                "OpenAI API protocol error (HTTP {status}): missing content-type header (expected text/event-stream, application/x-ndjson or application/json)"
             )));
         }
         let mut use_ndjson = false;
         if let Some(ref ct) = content_type {
+            let media_type = ct.split(';').next().unwrap_or(ct).trim();
+            if media_type == "application/json" || media_type.ends_with("+json") {
+                return Ok(complete::wire_response(
+                    response,
+                    self.model.clone(),
+                    self.api().to_string(),
+                    self.name().to_string(),
+                    options.usage_observer.clone(),
+                ));
+            }
             if ct.contains("application/x-ndjson") || ct.contains("application/ndjson") {
                 use_ndjson = true;
             } else if !ct.contains("text/event-stream") {
                 return Err(Error::api(format!(
-                    "OpenAI API protocol error (HTTP {status}): unexpected Content-Type {ct} (expected text/event-stream or application/x-ndjson)"
+                    "OpenAI API protocol error (HTTP {status}): unexpected Content-Type {ct} (expected text/event-stream, application/x-ndjson or application/json)"
                 )));
             }
         }
@@ -1083,6 +1100,7 @@ enum TerminalContentSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResponseOutcome {
     Completed,
+    Refusal,
     Incomplete(Option<String>),
 }
 
@@ -1963,9 +1981,16 @@ where
         // Completed argument JSON alone cannot authorize execution. In
         // particular, the shared Agent accepts calls on Length as well as
         // ToolUse, so preserve partial content as an Error on this boundary.
-        if matches!(&outcome, ResponseOutcome::Incomplete(_)) && self.partial_has_tool_call() {
+        if matches!(&outcome, ResponseOutcome::Incomplete(_) | ResponseOutcome::Refusal)
+            && self.partial_has_tool_call()
+        {
             self.reject_tool_response(
-                "OpenAI Responses output is incomplete; local tool calls withheld".to_string(),
+                if matches!(&outcome, ResponseOutcome::Refusal) {
+                    "OpenAI Responses refused the request; local tool calls withheld"
+                } else {
+                    "OpenAI Responses output is incomplete; local tool calls withheld"
+                }
+                .to_string(),
             );
             return;
         }
@@ -2025,6 +2050,7 @@ where
         self.partial.stop_reason = match outcome {
             ResponseOutcome::Completed if self.partial_has_tool_call() => StopReason::ToolUse,
             ResponseOutcome::Completed => StopReason::Stop,
+            ResponseOutcome::Refusal => StopReason::Refusal,
             ResponseOutcome::Incomplete(Some(reason))
                 if matches!(reason.as_str(), "max_output_tokens" | "max_messages") =>
             {
@@ -2087,10 +2113,11 @@ fn extract_chatgpt_account_id(token: &str) -> Option<String> {
 /// The typed request struct cannot round-trip through `Deserialize` (it holds
 /// `&'static str` fields), so validation is structural: the rewrite must be a
 /// JSON object that still names a model and carries an `input` array, and it
-/// must not disable streaming — the SSE reader depends on `stream: true`, so
-/// that invariant is re-imposed on the accepted value.
+/// must preserve the route's selected streaming or complete-JSON policy.
+/// That transport choice is re-imposed on the accepted value.
 fn validate_rewritten_responses_request(
     mut value: serde_json::Value,
+    stream: bool,
 ) -> std::result::Result<serde_json::Value, String> {
     let Some(object) = value.as_object_mut() else {
         return Err("rewrite is not a JSON object".to_string());
@@ -2102,7 +2129,7 @@ fn validate_rewritten_responses_request(
     if !object.get("input").is_some_and(serde_json::Value::is_array) {
         return Err("rewrite is missing an `input` array".to_string());
     }
-    object.insert("stream".to_string(), serde_json::Value::Bool(true));
+    object.insert("stream".to_string(), serde_json::Value::Bool(stream));
     Ok(value)
 }
 
@@ -2997,7 +3024,7 @@ mod tests {
     }
 
     /// bd-1q31s: a `before_provider_request` rewrite must survive validated
-    /// re-ingest — objects keeping `model` + `input` pass (with `stream: true`
+    /// re-ingest — objects keeping `model` + `input` pass (with the route's stream
     /// re-imposed and extension-added fields preserved), everything else is
     /// rejected so the provider falls back to its original body.
     #[test]
@@ -3008,12 +3035,19 @@ mod tests {
             "stream": false,
             "custom_extension_field": {"kept": true},
         });
-        let accepted = validate_rewritten_responses_request(valid).expect("valid rewrite accepted");
+        let accepted = validate_rewritten_responses_request(valid.clone(), true)
+            .expect("valid rewrite accepted");
         assert_eq!(
             accepted["stream"],
             serde_json::Value::Bool(true),
             "stream: true must be re-imposed on accepted rewrites"
         );
+        assert_eq!(accepted["custom_extension_field"]["kept"], true);
+        let mut streaming_rewrite = valid;
+        streaming_rewrite["stream"] = serde_json::Value::Bool(true);
+        let accepted = validate_rewritten_responses_request(streaming_rewrite, false)
+            .expect("nonstreaming rewrite accepted");
+        assert_eq!(accepted["stream"], serde_json::Value::Bool(false));
         assert_eq!(accepted["custom_extension_field"]["kept"], true);
 
         let missing_stream = serde_json::json!({
@@ -3021,7 +3055,8 @@ mod tests {
             "input": [],
         });
         let accepted =
-            validate_rewritten_responses_request(missing_stream).expect("missing stream accepted");
+            validate_rewritten_responses_request(missing_stream, true)
+                .expect("missing stream accepted");
         assert_eq!(accepted["stream"], serde_json::Value::Bool(true));
 
         for (label, invalid) in [
@@ -3038,7 +3073,7 @@ mod tests {
             ),
         ] {
             assert!(
-                validate_rewritten_responses_request(invalid).is_err(),
+                validate_rewritten_responses_request(invalid, true).is_err(),
                 "rewrite must be rejected: {label}"
             );
         }
@@ -6416,7 +6451,7 @@ mod tests {
         );
         assert_eq!(
             captured.headers.get("accept").map(String::as_str),
-            Some("text/event-stream, application/x-ndjson, application/ndjson")
+            Some("text/event-stream, application/x-ndjson, application/ndjson, application/json")
         );
 
         let body: Value = serde_json::from_str(&captured.body).expect("request body json");
@@ -6530,6 +6565,151 @@ mod tests {
             assert!(message.contains("HTTP 500"), "unexpected error: {message}");
             assert!(message.contains("boom"), "unexpected error: {message}");
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn json_only_route_preserves_transport_policy_and_response_identity() {
+        let body = json!({
+            "id": "resp_json_only",
+            "object": "response",
+            "status": "completed",
+            "model": "backend-model",
+            "error": null,
+            "incomplete_details": null,
+            "output": [{
+                "id": "msg_json_only",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": "JSON route reply",
+                    "annotations": [],
+                }],
+            }],
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18,
+            },
+        })
+        .to_string();
+
+        for content_type in [
+            "application/json",
+            "application/vnd.pi.responses+json; charset=utf-8",
+        ] {
+            let (base_url, request_rx) = spawn_test_server(200, content_type, &body);
+            let provider = OpenAIResponsesProvider::new("route-model")
+                .with_base_url(base_url.clone())
+                .with_provider_name("route-provider")
+                .with_api_name("route-api")
+                .with_compat(Some(CompatConfig {
+                    supports_streaming: Some(false),
+                    ..Default::default()
+                }));
+            let context = Context::owned(
+                None,
+                vec![Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("ping".to_string()),
+                    timestamp: 0,
+                })],
+                Vec::new(),
+            );
+            let (hook_tx, hook_rx) = mpsc::channel();
+            let options = StreamOptions {
+                api_key: Some("test-openai-key".to_string()),
+                before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                    move |mut event| {
+                        hook_tx.send(event.clone()).expect("capture hook request");
+                        event.payload["stream"] = json!(true);
+                        event.payload["metadata"] = json!({ "rewrite_marker": "accepted" });
+                        Box::pin(async move { Some(event.payload) })
+                    },
+                )),
+                ..Default::default()
+            };
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime build");
+            let events = runtime.block_on(async {
+                let mut output = provider
+                    .stream(&context, &options)
+                    .await
+                    .expect("JSON-only HTTP response");
+                let mut events = Vec::new();
+                while let Some(event) = output.next().await {
+                    events.push(event.expect("JSON response event"));
+                }
+                events
+            });
+
+            let hook_request = hook_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("request hook ran");
+            assert_eq!(hook_request.provider, "route-provider");
+            assert_eq!(hook_request.api, "route-api");
+            assert_eq!(hook_request.model, "route-model");
+            assert_eq!(hook_request.base_url, base_url);
+            assert_eq!(hook_request.payload["stream"], false);
+            assert!(hook_rx.try_recv().is_err(), "one hook call per request");
+
+            let captured = request_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("captured JSON-only request");
+            let request: Value = serde_json::from_str(&captured.body).expect("request JSON");
+            assert_eq!(request["model"], "route-model");
+            assert_eq!(request["stream"], false);
+            assert_eq!(request["metadata"]["rewrite_marker"], "accepted");
+            assert!(
+                captured.headers["accept"]
+                    .split(',')
+                    .any(|media_type| media_type.trim() == "application/json")
+            );
+
+            let Some(StreamEvent::Start { partial }) = events.first() else {
+                panic!("missing start event for {content_type}");
+            };
+            assert_eq!(partial.model, "route-model");
+            assert_eq!(partial.api, "route-api");
+            assert_eq!(partial.provider, "route-provider");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::Start { .. }))
+                    .count(),
+                1
+            );
+            assert!(events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta { delta, .. } if delta == "JSON route reply"
+            )));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. })
+                    })
+                    .count(),
+                1
+            );
+            let Some(StreamEvent::Done { reason, message }) = events.last() else {
+                panic!("missing successful completion for {content_type}");
+            };
+            assert_eq!(reason, &StopReason::Stop);
+            assert_eq!(message.model, "route-model");
+            assert_eq!(message.api, "route-api");
+            assert_eq!(message.provider, "route-provider");
+            assert_eq!(message.content.len(), 1);
+            let ContentBlock::Text(text) = &message.content[0] else {
+                panic!("missing text content for {content_type}");
+            };
+            assert_eq!(text.text, "JSON route reply");
+            assert_eq!(message.usage.input, 11);
+            assert_eq!(message.usage.output, 7);
+            assert_eq!(message.usage.total_tokens, 18);
+        }
     }
 
     #[test]

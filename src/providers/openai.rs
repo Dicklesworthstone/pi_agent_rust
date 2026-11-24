@@ -2244,7 +2244,7 @@ pub(super) fn parse_final_tool_arguments(
 
 /// Validation-only JSON traversal that rejects duplicate decoded object keys
 /// before serde_json::Value can silently keep the last occurrence.
-struct UniqueToolArgumentKeys;
+pub(super) struct UniqueToolArgumentKeys;
 
 impl<'de> Deserialize<'de> for UniqueToolArgumentKeys {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
