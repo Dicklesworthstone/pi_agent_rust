@@ -3416,6 +3416,19 @@ fn record_job_settlement(
     job.process_live = false;
     job.output_complete = output_complete;
     job.settled_sequence = Some(settled_sequence);
+    if !output_complete {
+        // A pump can still own the sink after its drain deadline. Its file
+        // must stay locked until that writer releases it, but a retained
+        // terminal descriptor must not extend the full live-job reservation.
+        // Keep only the artifact state observed at publication for snapshots.
+        job.artifact = Arc::new(Mutex::new(ArtifactSink {
+            file: None,
+            bytes_written: 0,
+            cap: 0,
+            truncated: snapshot.artifact_truncated,
+            write_error: snapshot.artifact_error.clone(),
+        }));
+    }
     // The monitor may have captured a foreground-sized snapshot before
     // promotion won the registry lock. The final delivery mode is decisive.
     if job.delivery == JobDelivery::Background {
@@ -7354,9 +7367,9 @@ mod tests {
     #[test]
     fn settlement_is_bounded_when_artifact_state_is_busy() {
         let _guard = process_test_guard();
-        let root = temp_root();
+        let root = tempfile::tempdir().expect("isolated budget");
         let id = format!("job-busy-artifact-{}", uuid::Uuid::new_v4().simple());
-        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        let entry = synthetic_entry(&id, root.path().join(format!("{id}.log")), 0, false);
         let artifact = Arc::clone(&entry.artifact);
         let handle = JobWaitHandle {
             owner_session_id: TEST_SESSION_ID.to_string(),
@@ -7372,6 +7385,8 @@ mod tests {
             .insert(id.clone(), entry);
 
         let artifact_guard = artifact.lock().expect("artifact lock");
+        fs4::FileExt::lock(artifact_guard.file.as_ref().expect("live artifact"))
+            .expect("reserve artifact for the outstanding writer");
         settle_job_and_enqueue_notice(&id, JobStatus::Exited, Some(0), false);
         let snapshot = settled_snapshot(&handle).expect("terminal snapshot");
         assert_eq!(snapshot.status, "exited");
@@ -7384,6 +7399,20 @@ mod tests {
             Some("artifact state unavailable while snapshotting")
         );
         drop(artifact_guard);
+        let budget = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        assert!(
+            ensure_artifact_budget(root.path(), budget, 2).is_err(),
+            "the outstanding writer must keep its reservation after publication"
+        );
+        drop(artifact);
+        ensure_artifact_budget(root.path(), budget, 2)
+            .expect("releasing the last writer must admit the next job while history is retained");
+        assert_eq!(
+            wait(TEST_SESSION_ID, &id, Duration::ZERO)
+                .expect("settled job still visible")
+                .artifact_error,
+            snapshot.artifact_error
+        );
 
         registry()
             .lock()
