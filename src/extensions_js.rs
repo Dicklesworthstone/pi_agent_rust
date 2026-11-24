@@ -14535,7 +14535,30 @@ export function existsSync(path) {
   }
 }
 
+function bulkFdEncoding(opts) {
+  const encoding = typeof opts === "string" ? opts : opts?.encoding;
+  if (encoding == null) return undefined;
+  if (typeof encoding !== "string" || !Buffer.isEncoding(encoding)) {
+    throw new TypeError("file encoding must be a supported Buffer encoding");
+  }
+  return encoding;
+}
+
 export function readFileSync(path, encoding) {
+  if (typeof path === "number") {
+    const selected = bulkFdEncoding(encoding);
+    const entry = readableFdEntry(path);
+    const source = entry.file.bytes;
+    // Copy only the unread suffix. Extension code may retain or mutate its
+    // Buffer after another descriptor modifies the same virtual file.
+    const copy = new Uint8Array(source.subarray(entry.position));
+    if (copy.byteLength > 0) {
+      entry.position += copy.byteLength;
+      __pi_vfs.touchFileAccess(entry.file);
+    }
+    const bytes = Buffer.from(copy.buffer);
+    return selected === undefined ? bytes : bytes.toString(selected);
+  }
   const resolved = __pi_vfs.resolvePathForRead(path, true);
   let bytes = __pi_vfs.isPersistentPath(resolved) ? undefined : __pi_vfs.files.get(resolved)?.bytes;
   let hostError = "";
@@ -14557,6 +14580,9 @@ export function readFileSync(path, encoding) {
 }
 
 export function appendFileSync(path, data, opts) {
+  // A borrowed fd retains its opening flags. Only an append-mode descriptor
+  // forces writes to EOF; an ordinary writable fd uses its current cursor.
+  if (typeof path === "number") return writeFileSync(path, data, opts);
   const persistentPath = __pi_vfs.resolvePathForWrite(path, true);
   if (__pi_vfs.isPersistentPath(persistentPath)) {
     const bytes = __pi_vfs.toBytes(data, opts);
@@ -14580,6 +14606,13 @@ export function appendFileSync(path, data, opts) {
 }
 
 export function writeFileSync(path, data, opts) {
+  if (typeof path === "number") {
+    const encoding = bulkFdEncoding(opts);
+    const bytes = typeof data === "string"
+      ? Buffer.from(data, encoding) : __pi_vfs.toWritableView(data);
+    writeSync(path, bytes, 0, bytes.byteLength, null);
+    return;
+  }
   const resolved = __pi_vfs.resolvePathForWrite(path, true);
   if (__pi_vfs.isPersistentPath(resolved)) {
     const bytes = __pi_vfs.toBytes(data, opts);
@@ -15023,12 +15056,16 @@ export function closeSync(fd) {
   __pi_vfs.assertFdOwner(entry, entry.readable ? "read" : "write");
   __pi_vfs.fds.delete(fd);
 }
-export function readSync(fd, buffer, offset = 0, length, position = null) {
+function readableFdEntry(fd) {
   const entry = __pi_vfs.getFdEntry(fd);
   if (!entry.readable) {
     throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
   __pi_vfs.authorizeFdRead(entry);
+  return entry;
+}
+export function readSync(fd, buffer, offset = 0, length, position = null) {
+  const entry = readableFdEntry(fd);
   const out = __pi_vfs.toWritableView(buffer);
   const start = Number.isInteger(offset) && offset >= 0 ? offset : 0;
   const maxLen =
@@ -15750,6 +15787,19 @@ export function access(_path, modeOrCb, cb) {
     }
   }
 }
+// Promise file APIs accept genuine FileHandles, never the mutable public fd
+// field. The private lookup also checks the original entry after a close/reset.
+const fileHandleDescriptors = new WeakMap();
+const getFileHandle = fileHandleDescriptors.get.bind(fileHandleDescriptors);
+const setFileHandle = fileHandleDescriptors.set.bind(fileHandleDescriptors);
+function promiseFileTarget(path) {
+  const descriptor = getFileHandle(path);
+  if (descriptor) return descriptor();
+  if (typeof path === "number" || (path && typeof path === "object" && "fd" in path)) {
+    throw new TypeError("expected a file path or an open FileHandle");
+  }
+  return path;
+}
 function makeFileHandle(fd) {
   const fdEntry = __pi_vfs.getFdEntry(fd);
   let closed = false;
@@ -15759,8 +15809,11 @@ function makeFileHandle(fd) {
     }
     return fdEntry;
   };
-  return {
+  const handle = {
     fd,
+    async readFile(opts) { requireOpen(); return readFileSync(fd, opts); },
+    async writeFile(data, opts) { requireOpen(); writeFileSync(fd, data, opts); },
+    async appendFile(data, opts) { requireOpen(); appendFileSync(fd, data, opts); },
     async read(buffer, offset = 0, length, position = null) {
       requireOpen();
       const bytesRead = readSync(fd, buffer, offset, length, position);
@@ -15782,6 +15835,8 @@ function makeFileHandle(fd) {
       closed = true;
     },
   };
+  setFileHandle(handle, () => { requireOpen(); return fd; });
+  return handle;
 }
 
 export const promises = {
@@ -15790,8 +15845,8 @@ export const promises = {
   mkdtemp: async (prefix, _opts) => {
     return mkdtempSync(prefix, _opts);
   },
-  readFile: async (path, opts) => readFileSync(path, opts),
-  writeFile: async (path, data, opts) => writeFileSync(path, data, opts),
+  readFile: async (path, opts) => readFileSync(promiseFileTarget(path), opts),
+  writeFile: async (path, data, opts) => writeFileSync(promiseFileTarget(path), data, opts),
   unlink: async (path) => unlinkSync(path),
   readlink: async (path, opts) => readlinkSync(path, opts),
   symlink: async (target, path, type) => symlinkSync(target, path, type),
@@ -15809,7 +15864,7 @@ export const promises = {
     }
     return copyFileSync(src, dest);
   },
-  appendFile: async (path, data, opts) => appendFileSync(path, data, opts),
+  appendFile: async (path, data, opts) => appendFileSync(promiseFileTarget(path), data, opts),
   open: async (path, flags = "r", mode) => makeFileHandle(openSync(path, flags, mode)),
   truncate: async (path, len = 0) => truncateSync(path, len),
   chmod: async (path, mode) => chmodSync(path, mode),
@@ -31586,8 +31641,8 @@ mod tests {
         // The existing bounded whole-file host snapshot is unchanged.
         (
             "node:fs",
-            93_895,
-            "2f584e06a06272daf6ef92cc781880122d3546ddd0a2fbe13245260b348850a9",
+            96_436,
+            "757617008d1d616913132e7b37fb602cf3802b15567ff9aedb7c3b9b50d2110e",
         ),
         (
             "@mariozechner/pi-ai",
@@ -47827,6 +47882,98 @@ globalThis.fsWriteProgress = { done: false };
             assert_eq!(result["failedOpenDenied"], json!(true));
             assert_eq!(result["failedOpenDidNotCreate"], json!(true));
             assert_eq!(result["failedOpenEvents"], json!(1));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_bulk_io_borrows_descriptors_and_file_handles() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let script = r#"
+globalThis.fsBulkFd = { done: false };
+(async () => {
+    const fs = await import("node:fs");
+    const result = {};
+    const denied = async (operation, message) => {
+        try { await operation(); return false; }
+        catch (err) { return String(err).includes(message); }
+    };
+    let handle;
+    const a = f => __pi_with_extension_async(__pi_test_secret, "ext.bulk.a", f);
+    const b = f => __pi_with_extension_async(__pi_test_secret, "ext.bulk.b", f);
+    await a(async () => {
+        const path = "/tmp/bulk-fd";
+        fs.writeFileSync(path, "abcdef");
+        handle = await fs.promises.open(path, "r+");
+        const fd = handle.fd;
+        const byte = Buffer.alloc(1);
+        fs.readSync(fd, byte);
+        fs.writeFileSync(fd, "5859", { encoding: "hex", flag: "wx" });
+        fs.appendFileSync(fd, "Z");
+        const suffix = fs.readFileSync(fd);
+        result.suffix = suffix.toString();
+        suffix[0] = 0;
+        result.copy = fs.readFileSync(path, "utf8");
+        result.eof = await handle.readFile("utf8");
+        // Both handle methods and fs.promises must retain the private identity.
+        handle.fd = -1;
+        await handle.writeFile("Ω", "utf16le");
+        await fs.promises.appendFile(handle, new Uint8Array([33]));
+        result.encoded = fs.readFileSync(path, "hex");
+        await fs.promises.writeFile(handle, "!");
+        result.handleEof = await fs.promises.readFile(handle, "utf8");
+        const extra = fs.openSync(path, "a");
+        fs.writeFileSync(path, "new");
+        fs.writeFileSync(extra, "1");
+        fs.appendFileSync(extra, "2");
+        fs.closeSync(extra);
+        result.append = fs.readFileSync(path, "utf8");
+        const reader = fs.openSync(path, "r");
+        const get = () => new Promise((resolve, reject) =>
+            fs.readFile(reader, "utf8", (err, data) => err ? reject(err) : resolve(data)));
+        result.callback = await get();
+        result.readOnly = await denied(() => fs.writeFileSync(reader, ""), "EBADF");
+        fs.closeSync(reader);
+        result.closed = await denied(() => fs.appendFileSync(reader, "lost"), "EBADF");
+        result.numericPath = fs.existsSync(String(reader));
+        const writer = fs.openSync(path, "a");
+        result.writeOnly = await denied(() => fs.readFileSync(writer), "EBADF");
+        fs.closeSync(writer);
+        result.invalid = await denied(() => fs.promises.writeFile(fd, "!"), "file path")
+            && await denied(() => fs.promises.readFile({ fd }), "file path");
+    });
+    await b(async () => {
+        result.foreignRead = await denied(() => handle.readFile(), "host read denied");
+        result.foreignWrite = await denied(() => fs.promises.appendFile(handle, "!"), "host write denied");
+    });
+    await a(async () => {
+        await handle.appendFile("!");
+        await handle.close();
+        result.closedHandle = await denied(() => fs.promises.readFile(handle), "EBADF")
+            && await denied(() => handle.writeFile("!"), "EBADF");
+    });
+    globalThis.fsBulkFd = { done: true, ...result };
+})().catch(error => { globalThis.fsBulkFd.error = String(error); });
+"#;
+            runtime
+                .eval(&privileged_test_script(&runtime, script))
+                .await
+                .expect("evaluate descriptor-backed bulk I/O");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsBulkFd").await;
+            assert_eq!(
+                result,
+                json!({
+                    "done": true, "suffix": "ef", "copy": "aXYZef", "eof": "",
+                    "encoded": "6158595a6566a90321", "handleEof": "", "append": "new12",
+                    "callback": "new12", "readOnly": true, "closed": true, "numericPath": false,
+                    "writeOnly": true, "invalid": true, "foreignRead": true, "foreignWrite": true,
+                    "closedHandle": true
+                })
+            );
         });
     }
 
