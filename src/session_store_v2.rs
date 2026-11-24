@@ -2313,7 +2313,7 @@ fn validate_indexed_frame(
     expected_frame_seq: &mut u64,
     expected_byte_offset: &mut u64,
     parent_by_entry: &mut std::collections::HashMap<String, Option<String>>,
-) -> Result<()> {
+) -> Result<SegmentFrame> {
     if row.frame_seq != *expected_frame_seq {
         return Err(Error::session(format!(
             "frame sequence is not contiguous in segment {segment_seq} at entry_seq={}: expected={} actual={}",
@@ -2355,7 +2355,7 @@ fn validate_indexed_frame(
         .checked_add(1)
         .ok_or_else(|| Error::session("frame sequence overflow during validation"))?;
     *expected_byte_offset = end;
-    Ok(())
+    Ok(frame)
 }
 
 fn validate_segment_index_rows(
@@ -3157,14 +3157,28 @@ impl SessionStoreV2 {
         Ok(frames)
     }
 
-    /// Fork the session at a given checkpoint sequence to a new destination root.
-    /// Uses snapshot-consistent read and does not block background appends.
-    pub fn fork_at_checkpoint(&self, target_dir: &Path, checkpoint_seq: u64) -> Result<PathBuf> {
+    /// Materialize the exact prefix authenticated by the checkpoint before a
+    /// caller creates or replaces any output. Keep the frames whose hashes
+    /// were checked: rereading after validation could observe a concurrent
+    /// rollback and a different history at the same entry sequences.
+    fn read_checkpoint_snapshot(&self, checkpoint_seq: u64) -> Result<Vec<SegmentFrame>> {
         let checkpoint = self
             .read_checkpoint(checkpoint_seq)?
             .ok_or_else(|| Error::session(format!("checkpoint {checkpoint_seq} not found")))?;
+        let index_rows: Vec<_> = self
+            .read_index()?
+            .into_iter()
+            .filter(|row| row.entry_seq <= checkpoint.head_entry_seq)
+            .collect();
+        let mut frames = Vec::with_capacity(index_rows.len());
+        self.visit_checkpoint_prefix(&checkpoint, &index_rows, |frame| frames.push(frame))?;
+        Ok(frames)
+    }
 
-        let frames = self.read_entries_up_to_seq(checkpoint.head_entry_seq)?;
+    /// Fork the session at a given checkpoint sequence to a new destination root.
+    /// Uses snapshot-consistent read and does not block background appends.
+    pub fn fork_at_checkpoint(&self, target_dir: &Path, checkpoint_seq: u64) -> Result<PathBuf> {
+        let frames = self.read_checkpoint_snapshot(checkpoint_seq)?;
         let mut target_store = Self::create(target_dir, self.max_segment_bytes)?;
         for frame in frames {
             let payload_value: Value = serde_json::from_str(frame.payload.get())?;
@@ -3181,11 +3195,7 @@ impl SessionStoreV2 {
 
     /// Export session snapshot frames up to `checkpoint_seq` as JSONL.
     pub fn export_snapshot(&self, target_file: &Path, checkpoint_seq: u64) -> Result<()> {
-        let checkpoint = self
-            .read_checkpoint(checkpoint_seq)?
-            .ok_or_else(|| Error::session(format!("checkpoint {checkpoint_seq} not found")))?;
-
-        let frames = self.read_entries_up_to_seq(checkpoint.head_entry_seq)?;
+        let frames = self.read_checkpoint_snapshot(checkpoint_seq)?;
         let mut file = open_regular_file_for_write(target_file, true, ArtifactWriteMode::Replace)?;
         for frame in &frames {
             let serialized = serde_json::to_string(frame)?;
@@ -3360,7 +3370,7 @@ impl SessionStoreV2 {
             .into_iter()
             .filter(|row| row.entry_seq <= checkpoint.head_entry_seq)
             .collect();
-        self.validate_rollback_prefix(&checkpoint, &retained_index_rows)?;
+        self.visit_checkpoint_prefix(&checkpoint, &retained_index_rows, |_| {})?;
 
         let mut keep_len_by_segment = std::collections::HashMap::new();
         for row in &retained_index_rows {
@@ -3400,10 +3410,11 @@ impl SessionStoreV2 {
         })
     }
 
-    fn validate_rollback_prefix(
+    fn visit_checkpoint_prefix(
         &self,
         checkpoint: &Checkpoint,
         retained_index_rows: &[OffsetIndexEntry],
+        mut visit: impl FnMut(SegmentFrame),
     ) -> Result<()> {
         let expected_count = usize::try_from(checkpoint.head_entry_seq)
             .map_err(|_| Error::session("checkpoint head sequence exceeds usize"))?;
@@ -3415,12 +3426,12 @@ impl SessionStoreV2 {
         }
         for (offset, row) in retained_index_rows.iter().enumerate() {
             let expected_entry_seq = u64::try_from(offset)
-                .map_err(|_| Error::session("rollback prefix length exceeds u64"))?
+                .map_err(|_| Error::session("checkpoint prefix length exceeds u64"))?
                 .checked_add(1)
-                .ok_or_else(|| Error::session("rollback prefix sequence overflow"))?;
+                .ok_or_else(|| Error::session("checkpoint prefix sequence overflow"))?;
             if row.entry_seq != expected_entry_seq {
                 return Err(Error::session(format!(
-                    "rollback prefix is not contiguous at entry_seq={}",
+                    "checkpoint prefix is not contiguous at entry_seq={}",
                     row.entry_seq
                 )));
             }
@@ -3428,27 +3439,40 @@ impl SessionStoreV2 {
 
         let rows_by_segment = group_validated_index_rows(retained_index_rows)?;
         let mut parent_by_entry = std::collections::HashMap::new();
+        let mut chain_hash = GENESIS_CHAIN_HASH.to_string();
+        let mut actual_head_id = String::new();
         for (segment_seq, rows) in rows_by_segment {
-            validate_segment_index_rows(
-                &self.segment_file_path(segment_seq),
-                segment_seq,
-                &rows,
-                &mut parent_by_entry,
-            )?;
+            let path = self.segment_file_path(segment_seq);
+            let mut file = open_regular_file_for_read(&path)?
+                .ok_or_else(|| Error::session(format!("missing segment: {}", path.display())))?;
+            let segment_len = file.metadata()?.len();
+            if segment_len > self.max_segment_bytes {
+                return Err(Error::session(format!(
+                    "segment {} length {segment_len} exceeds configured segment limit {}",
+                    path.display(),
+                    self.max_segment_bytes
+                )));
+            }
+            let mut expected_frame_seq = 1;
+            let mut expected_byte_offset = 0;
+            for row in rows {
+                validate_encoded_frame_length(row.byte_length, self.max_segment_bytes)?;
+                let frame = validate_indexed_frame(
+                    &mut file,
+                    segment_seq,
+                    segment_len,
+                    row,
+                    &mut expected_frame_seq,
+                    &mut expected_byte_offset,
+                    &mut parent_by_entry,
+                )?;
+                chain_hash = chain_hash_step(&chain_hash, &frame.payload_sha256);
+                actual_head_id.clone_from(&frame.entry_id);
+                visit(frame);
+            }
         }
         validate_parent_graph_links(&parent_by_entry)?;
         validate_parent_graph_acyclic(&parent_by_entry)?;
-
-        let mut chain_hash = GENESIS_CHAIN_HASH.to_string();
-        let mut actual_head_id = String::new();
-        let mut reader = SegmentFileReader::new(self);
-        for row in retained_index_rows {
-            let frame = reader
-                .read_frame(row)?
-                .ok_or_else(|| Error::session("rollback prefix references a missing frame"))?;
-            chain_hash = chain_hash_step(&chain_hash, &frame.payload_sha256);
-            actual_head_id = frame.entry_id;
-        }
         if checkpoint.head_entry_id != actual_head_id {
             return Err(Error::session(format!(
                 "checkpoint head id does not match retained prefix at entry_seq={}",
@@ -5257,6 +5281,49 @@ mod proptests {
         serde_json::to_vec_pretty(&document).expect("serialize mutated checkpoint")
     }
 
+    fn assert_checkpoint_snapshot_rejected_without_output(
+        store: &SessionStoreV2,
+        destination_root: &Path,
+        expected_error: &str,
+    ) {
+        let before = snapshot_artifacts(store.root_dir());
+        let existing_export = destination_root.join("existing-export.jsonl");
+        let mut file =
+            open_regular_file_for_write(&existing_export, true, ArtifactWriteMode::CreateNew)
+                .expect("create existing export");
+        file.write_all(b"previous verified snapshot\n")
+            .expect("write existing export");
+        file.sync_all().expect("sync existing export");
+        drop(file);
+
+        let new_export = destination_root.join("new-export.jsonl");
+        for target in [&existing_export, &new_export] {
+            let error = store
+                .export_snapshot(target, 1)
+                .expect_err("an unverified checkpoint must not be exported");
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected export rejection: {error}"
+            );
+        }
+        assert_eq!(
+            fs::read(&existing_export).expect("read preserved export"),
+            b"previous verified snapshot\n"
+        );
+        assert!(!new_export.exists(), "rejected export created an output");
+
+        let fork = destination_root.join("rejected-fork");
+        let error = store
+            .fork_at_checkpoint(&fork, 1)
+            .expect_err("an unverified checkpoint must not be forked");
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected fork rejection: {error}"
+        );
+        assert!(!fork.exists(), "rejected fork created a partial store");
+        assert_eq!(snapshot_artifacts(store.root_dir()), before);
+    }
+
     fn stage_durable_rollback_intent(
         store: &SessionStoreV2,
         checkpoint_seq: u64,
@@ -5761,6 +5828,137 @@ mod proptests {
             "chainHash",
             json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
         ));
+    }
+
+    #[test]
+    fn checkpoint_fork_and_export_reject_mismatched_history_without_mutation() {
+        for (field, value, expected_error) in [
+            (
+                "headEntryId",
+                json!("different-history-head"),
+                "checkpoint head id does not match",
+            ),
+            (
+                "chainHash",
+                json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+                "checkpoint chain hash does not match",
+            ),
+            (
+                "headEntrySeq",
+                json!(500),
+                "outside the contiguous index prefix",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path().join("store");
+            let mut store = SessionStoreV2::create(&root, 4096).expect("create store");
+            append_test_entries(&mut store, 1, 3);
+            let checkpoint = store.create_checkpoint(1, "manual").expect("checkpoint");
+            append_test_entries(&mut store, 4, 5);
+            let mut document = serde_json::to_value(checkpoint).expect("checkpoint document");
+            document[field] = value;
+            fs::write(
+                store.checkpoint_path(1),
+                serde_json::to_vec(&document).expect("encode invalid checkpoint"),
+            )
+            .expect("replace checkpoint fixture");
+
+            assert_checkpoint_snapshot_rejected_without_output(&store, tmp.path(), expected_error);
+        }
+    }
+
+    #[test]
+    fn checkpoint_fork_and_export_reject_truncated_prefix_without_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("store");
+        let mut store = SessionStoreV2::create(&root, 4096).expect("create store");
+        append_test_entries(&mut store, 1, 3);
+        store.create_checkpoint(1, "manual").expect("checkpoint");
+        let rows = store.read_index().expect("read index");
+        write_jsonl_lines(&store.index_file_path(), &rows[..2]).expect("truncate fixture index");
+
+        assert_checkpoint_snapshot_rejected_without_output(
+            &store,
+            tmp.path(),
+            "outside the contiguous index prefix",
+        );
+    }
+
+    #[test]
+    fn checkpoint_fork_and_export_require_parents_inside_checkpoint_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("store");
+        let mut store = SessionStoreV2::create(&root, 4096).expect("create store");
+        store
+            .append_entry(
+                "child",
+                Some("later-parent".to_string()),
+                "message",
+                json!({"text": "child with a forward parent"}),
+            )
+            .expect("append child");
+        store
+            .append_entry("later-parent", None, "message", json!({"text": "parent"}))
+            .expect("append parent outside checkpoint");
+        store
+            .validate_integrity()
+            .expect("the complete history has a valid forward parent");
+        let frames = store.read_all_entries().expect("read complete history");
+        let mut checkpoint = store.create_checkpoint(1, "manual").expect("checkpoint");
+        checkpoint.head_entry_seq = 1;
+        checkpoint.head_entry_id = "child".to_string();
+        checkpoint.chain_hash = chain_hash_step(GENESIS_CHAIN_HASH, &frames[0].payload_sha256);
+        fs::write(
+            store.checkpoint_path(1),
+            serde_json::to_vec(&checkpoint).expect("encode shortened checkpoint"),
+        )
+        .expect("replace checkpoint fixture");
+
+        assert_checkpoint_snapshot_rejected_without_output(
+            &store,
+            tmp.path(),
+            "missing parent entry detected",
+        );
+    }
+
+    #[test]
+    fn checkpoint_fork_and_export_preserve_verified_prefix_after_new_appends() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("store");
+        let mut store = SessionStoreV2::create(&root, 512).expect("create store");
+        append_test_entries(&mut store, 1, 3);
+        let checkpoint = store.create_checkpoint(1, "manual").expect("checkpoint");
+        append_test_entries(&mut store, 4, 6);
+        let before = snapshot_artifacts(&root);
+
+        let export = tmp.path().join("verified-export.jsonl");
+        store
+            .export_snapshot(&export, 1)
+            .expect("export verified prefix");
+        let frames: Vec<SegmentFrame> = read_jsonl(&export).expect("read exported frames");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].entry_id, checkpoint.head_entry_id);
+        let chain_hash = frames
+            .iter()
+            .fold(GENESIS_CHAIN_HASH.to_string(), |chain, frame| {
+                chain_hash_step(&chain, &frame.payload_sha256)
+            });
+        assert_eq!(chain_hash, checkpoint.chain_hash);
+
+        let fork = tmp.path().join("verified-fork");
+        store
+            .fork_at_checkpoint(&fork, 1)
+            .expect("fork verified prefix");
+        let forked = SessionStoreV2::open_for_inspection(&fork, 512).expect("open fork");
+        forked.validate_integrity().expect("fork remains valid");
+        let forked_frames = forked.read_all_entries().expect("read fork");
+        assert_eq!(forked_frames.len(), frames.len());
+        for (forked_frame, frame) in forked_frames.iter().zip(&frames) {
+            assert_eq!(forked_frame.entry_id, frame.entry_id);
+            assert_eq!(forked_frame.parent_entry_id, frame.parent_entry_id);
+            assert_eq!(forked_frame.payload_sha256, frame.payload_sha256);
+        }
+        assert_eq!(snapshot_artifacts(&root), before);
     }
 
     #[test]
