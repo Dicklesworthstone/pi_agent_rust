@@ -32,6 +32,8 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::pin::Pin;
 
+#[path = "openai_completion.rs"]
+mod completion;
 #[path = "openai_deepseek.rs"]
 mod deepseek;
 #[path = "openai_openrouter.rs"]
@@ -503,10 +505,11 @@ impl OpenAIProvider {
         }
         if budget.blocks > 0 {
             self.require_audio_pricing()?;
-            if body
-                .pointer("/stream_options/include_usage")
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
+            if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
+                && body
+                    .pointer("/stream_options/include_usage")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
             {
                 return Err(Error::validation(
                     "Native OpenAI audio requires stream_options.include_usage",
@@ -582,7 +585,8 @@ impl OpenAIProvider {
             .and_then(|c| c.supports_usage_in_streaming)
             .unwrap_or(true);
 
-        let stream_options = Some(OpenAIStreamOptions { include_usage });
+        let stream = self.streams_responses();
+        let stream_options = stream.then_some(OpenAIStreamOptions { include_usage });
         // OpenRouter usage accounting (gh #221): `usage.include` makes the
         // final usage chunk carry the billed `cost`, which is the only cost
         // source for models the local catalog has no pricing for.
@@ -652,7 +656,7 @@ impl OpenAIProvider {
             max_completion_tokens,
             temperature: options.temperature,
             tools,
-            stream: true,
+            stream,
             stream_options,
             usage,
             thinking,
@@ -730,7 +734,31 @@ impl OpenAIProvider {
         let mut value = serde_json::to_value(request)
             .map_err(|e| Error::api(format!("Failed to serialize OpenAI request: {e}")))?;
         self.apply_openrouter_routing_overrides(&mut value)?;
+        self.validate_response_mode(&value)?;
         Ok(value)
+    }
+
+    fn streams_responses(&self) -> bool {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.supports_streaming)
+            .unwrap_or(true)
+    }
+
+    fn validate_response_mode(&self, body: &serde_json::Value) -> Result<()> {
+        if body.get("stream").and_then(serde_json::Value::as_bool)
+            != Some(self.streams_responses())
+        {
+            return Err(Error::validation(
+                "OpenAI request must preserve the configured streaming mode",
+            ));
+        }
+        if !self.streams_responses() && body.get("stream_options").is_some() {
+            return Err(Error::validation(
+                "OpenAI non-streaming requests must omit stream_options",
+            ));
+        }
+        Ok(())
     }
 
     fn apply_openrouter_routing_overrides(&self, request: &mut serde_json::Value) -> Result<()> {
@@ -931,10 +959,15 @@ impl Provider for OpenAIProvider {
 
         // Note: Content-Type is set by .json() below; setting it here too
         // produces a duplicate header that OpenAI's server rejects.
-        let mut request = self
-            .client
-            .post(&self.base_url)
-            .header("Accept", "text/event-stream");
+        let streaming = self.streams_responses();
+        let mut request = self.client.post(&self.base_url).header(
+            "Accept",
+            if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        );
 
         if let Some(auth_value) = auth_value.as_deref() {
             request = request.header("Authorization", format!("Bearer {auth_value}"));
@@ -990,8 +1023,10 @@ impl Provider for OpenAIProvider {
                     value,
                     &["model"],
                     &["messages"],
-                    &[("stream", serde_json::Value::Bool(true))],
+                    &[("stream", serde_json::Value::Bool(streaming))],
                 )?;
+                self.validate_response_mode(&value)
+                    .map_err(|error| error.to_string())?;
                 self.validate_audio_request(&value)
                     .map_err(|error| error.to_string())?;
                 Ok(value)
@@ -1063,23 +1098,46 @@ impl Provider for OpenAIProvider {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
             .map(|(_, value)| value.to_ascii_lowercase());
-        if !content_type
-            .as_deref()
-            .is_some_and(|value| value.contains("text/event-stream"))
-        {
+        let expected_type = if streaming {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        let valid_type = content_type.as_deref().is_some_and(|value| {
+            let media_type = value.split(';').next().unwrap_or_default().trim();
+            media_type == expected_type
+                || (!streaming
+                    && media_type.starts_with("application/")
+                    && media_type.ends_with("+json"))
+        });
+        if !valid_type {
             let message = content_type.map_or_else(
                 || {
                     format!(
-                        "OpenAI API protocol error (HTTP {status}): missing Content-Type (expected text/event-stream)"
+                        "OpenAI API protocol error (HTTP {status}): missing Content-Type (expected {expected_type})"
                     )
                 },
                 |value| {
                     format!(
-                        "OpenAI API protocol error (HTTP {status}): unexpected Content-Type {value} (expected text/event-stream)"
+                        "OpenAI API protocol error (HTTP {status}): unexpected Content-Type {value} (expected {expected_type})"
                     )
                 },
             );
             return Err(Error::api(message));
+        }
+
+        if !streaming {
+            return Ok(completion::wire_response(
+                response,
+                self.model.clone(),
+                self.api().to_string(),
+                self.name().to_string(),
+                native_audio,
+                options.usage_observer.clone(),
+                self.is_openrouter()
+                    .then(|| openrouter::origin(&self.base_url))
+                    .flatten(),
+            ));
         }
 
         Ok(wire_stream(
@@ -1255,7 +1313,7 @@ where
         {
             let usage = Usage {
                 billing: Some(BillingUsage::Unavailable {
-                    reason: "The native audio stream closed without complete billing evidence"
+                    reason: "The native audio response closed without complete billing evidence"
                         .to_string(),
                 }),
                 ..Default::default()
@@ -1482,8 +1540,13 @@ where
                 error.column()
             ))
         })?;
+        self.process_chunk(chunk, false)
+    }
+
+    fn process_chunk(&mut self, chunk: OpenAIStreamChunk, response_complete: bool) -> Result<()> {
         let selected = select_primary_choice(chunk.choices, |choice| choice.index);
-        let authoritative_usage = self.finalized
+        let authoritative_usage = response_complete
+            || self.finalized
             || matches!(&selected, Ok(Some(choice)) if choice.finish_reason.is_some());
 
         // Handle usage in final chunk
@@ -1792,9 +1855,8 @@ where
         if self.done {
             return;
         }
-        // [DONE] closes the transport; only a choice's finish_reason can
-        // complete model generation. Otherwise complete-looking tool prefixes
-        // would become executable simply because the gateway closed its SSE.
+        // A closed transport is not sufficient: both a complete JSON body and
+        // an SSE [DONE] need a choice's finish_reason before tools can execute.
         if !self.finalized
             && matches!(
                 self.partial.stop_reason,
@@ -1802,7 +1864,7 @@ where
             )
         {
             self.record_error(
-                "OpenAI stream ended with [DONE] before a finish reason; local tool calls withheld"
+                "OpenAI response ended before a finish reason; local tool calls withheld"
                     .to_string(),
             );
         }
@@ -6259,6 +6321,288 @@ mod tests {
             value["max_completion_tokens"].is_null(),
             "max_completion_tokens should be absent by default"
         );
+    }
+
+    fn spawn_completion_test_response(
+        body: String,
+        declared_length: usize,
+        peer_may_close: bool,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("fixture connection");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("fixture read timeout");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(30)))
+                .expect("fixture write timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut buffer).expect("fixture request");
+                assert!(count > 0, "client closed before the request completed");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(boundary) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = parse_headers(&String::from_utf8_lossy(&request[..boundary]));
+                    let length = headers
+                        .get("content-length")
+                        .and_then(|length| length.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= boundary + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n{body}"
+            );
+            if let Err(error) = socket.write_all(response.as_bytes()) {
+                assert!(
+                    peer_may_close
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ),
+                    "unexpected fixture write failure: {error}"
+                );
+            }
+        });
+        (format!("http://{address}/v1/chat/completions"), server)
+    }
+
+    #[test]
+    fn compat_non_streaming_uses_json_transport_and_preserves_tool_usage() {
+        for content_type in ["application/json; charset=utf-8", "application/vnd.api+json"] {
+            let body = json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Searching now.",
+                        "tool_calls": [{
+                            "id": "search-1", "type": "function",
+                            "function": {"name": "search", "arguments": "{\"query\":\"Rust\"}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            });
+            let (base_url, rx) = spawn_test_server(200, content_type, &body.to_string());
+            let provider = OpenAIProvider::new("json-only-model")
+                .with_base_url(base_url)
+                .with_compat(Some(CompatConfig {
+                    supports_streaming: Some(false),
+                    supports_usage_in_streaming: Some(false),
+                    ..Default::default()
+                }));
+            let context = context_with_tools();
+            let options = StreamOptions {
+                api_key: Some("fixture-api-key".to_string()),
+                ..default_stream_options()
+            };
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            let events = runtime.block_on(async {
+                provider
+                    .stream(&context, &options)
+                    .await
+                    .expect("JSON response accepted")
+                    .collect::<Vec<_>>()
+                    .await
+            });
+            let events = events
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .expect("complete JSON response");
+            assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
+            let Some(StreamEvent::Done { reason, message }) = events.last() else {
+                panic!("JSON response never completed");
+            };
+            assert_eq!(*reason, StopReason::ToolUse);
+            assert_eq!(message.usage.input, 10);
+            assert_eq!(message.usage.output, 5);
+            assert!(matches!(message.content.as_slice(),
+                [ContentBlock::Text(text), ContentBlock::ToolCall(call)]
+                    if text.text == "Searching now."
+                        && call.id == "search-1"
+                        && call.arguments == json!({"query": "Rust"})));
+            let request = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+            assert_eq!(request.headers.get("accept").map(String::as_str), Some("application/json"));
+            let request: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+            assert_eq!(request["stream"], false);
+            assert!(request.get("stream_options").is_none());
+            assert!(request["tools"].is_array());
+        }
+    }
+
+    #[test]
+    fn compat_non_streaming_does_not_publish_tools_from_incomplete_or_oversized_json() {
+        let complete = json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "tool_calls": [{
+                    "id": "unsafe-prefix", "type": "function",
+                    "function": {"name": "search", "arguments": "{}"}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let mut truncated = complete.to_string();
+        truncated.pop();
+        let mut oversized = complete;
+        oversized["padding"] = json!("x".repeat(8 * 1024 * 1024));
+        for body in [truncated, oversized.to_string()] {
+            let length = body.len();
+            let (base_url, server) =
+                spawn_completion_test_response(body, length, length > 8 * 1024 * 1024);
+            let provider = OpenAIProvider::new("json-only-model")
+                .with_base_url(base_url)
+                .with_compat(Some(CompatConfig {
+                    supports_streaming: Some(false),
+                    ..Default::default()
+                }));
+            let context = context_with_tools();
+            let options = StreamOptions {
+                api_key: Some("fixture-api-key".to_string()),
+                ..default_stream_options()
+            };
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            let events = runtime.block_on(async {
+                provider
+                    .stream(&context, &options)
+                    .await
+                    .expect("HTTP response accepted")
+                    .collect::<Vec<_>>()
+                    .await
+            });
+            server.join().expect("fixture server");
+            assert!(events.iter().any(|event| event.is_err()));
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                Ok(StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. })
+            )));
+        }
+    }
+
+    #[test]
+    fn compat_non_streaming_audio_uses_normal_completion_billing() {
+        let provider = audio_test_provider().with_compat(Some(CompatConfig {
+            supports_streaming: Some(false),
+            ..Default::default()
+        }));
+        let context = audio_test_context(vec![audio_test_media("YQ==", "audio/wav")]);
+        let body = provider
+            .build_request_json(&context, &default_stream_options())
+            .expect("non-streaming audio body");
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
+        assert!(provider.validate_audio_request(&body).expect("priced audio"));
+
+        let mut rewritten = body;
+        rewritten["stream"] = json!(true);
+        assert!(provider.validate_response_mode(&rewritten).is_err());
+        rewritten["stream"] = json!(false);
+        rewritten["stream_options"] = json!({"include_usage": true});
+        assert!(provider.validate_response_mode(&rewritten).is_err());
+    }
+
+    #[test]
+    fn compat_non_streaming_requires_complete_http_body_before_tool_publication() {
+        let body = json!({"choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "tool_calls": [{
+                "id": "truncated-http", "type": "function",
+                "function": {"name": "search", "arguments": "{}"}
+            }]},
+            "finish_reason": "tool_calls"
+        }]})
+        .to_string();
+        // The JSON itself is valid. The declared HTTP body is incomplete,
+        // so a parser that ignores transport framing would authorize tools.
+        let declared_length = body.len() + 1;
+        let (base_url, server) = spawn_completion_test_response(body, declared_length, false);
+        let provider = OpenAIProvider::new("json-only-model")
+            .with_base_url(base_url)
+            .with_compat(Some(CompatConfig {
+                supports_streaming: Some(false),
+                ..Default::default()
+            }));
+        let context = context_with_tools();
+        let options = StreamOptions {
+            api_key: Some("fixture-api-key".to_string()),
+            ..default_stream_options()
+        };
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let events = runtime.block_on(async {
+            provider
+                .stream(&context, &options)
+                .await
+                .expect("response headers")
+                .collect::<Vec<_>>()
+                .await
+        });
+        server.join().expect("fixture server");
+        assert!(events.iter().any(|event| event.is_err()));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Ok(StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. })
+        )));
+    }
+
+    #[test]
+    fn compat_non_streaming_audio_drop_preserves_the_billing_fence() {
+        for read_first_event in [false, true] {
+            let body = json!({
+                "choices": [{"index": 0, "message": {
+                    "role": "assistant", "content": "Heard the audio."
+                }, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                    "total_tokens": 2, "cost": 0.125}
+            });
+            let body = body.to_string();
+            let length = body.len();
+            let (base_url, server) = spawn_completion_test_response(body, length, true);
+            let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let provider = crate::provider::guard_with_cost_budget(
+                std::sync::Arc::new(
+                    audio_test_provider()
+                        .with_base_url(base_url)
+                        .with_compat(Some(CompatConfig {
+                            supports_streaming: Some(false),
+                            ..Default::default()
+                        })),
+                ),
+                budget.clone(),
+            );
+            let context = audio_test_context(vec![audio_test_media("YQ==", "audio/wav")]);
+            let options = StreamOptions {
+                api_key: Some("fixture-api-key".to_string()),
+                ..default_stream_options()
+            };
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            runtime.block_on(async {
+                let mut events = provider.stream(&context, &options).await.unwrap();
+                if read_first_event {
+                    assert!(matches!(events.next().await, Some(Ok(StreamEvent::Start { .. }))));
+                }
+                drop(events);
+            });
+            server.join().expect("fixture server");
+            if read_first_event {
+                assert!(
+                    (budget.spent() - 0.125).abs() < f64::EPSILON,
+                    "the complete JSON bill must survive dropping before public Done"
+                );
+                assert!(budget.admit().is_ok());
+            } else {
+                assert!(
+                    budget.admit().is_err(),
+                    "dropping an accepted audio response before its first poll leaves billing unknown"
+                );
+            }
+        }
     }
 
     #[test]
