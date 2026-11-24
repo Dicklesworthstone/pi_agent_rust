@@ -13383,7 +13383,7 @@ export default { createRequire };
         compressed_js_literal!(r#"
 import { Readable, Writable } from "node:stream";
 
-export const constants = {
+export const constants = Object.freeze({
   R_OK: 4,
   W_OK: 2,
   X_OK: 1,
@@ -13395,7 +13395,7 @@ export const constants = {
   O_EXCL: 128,
   O_TRUNC: 512,
   O_APPEND: 1024,
-};
+});
 let __pi_reset_file_watchers = () => {};
 let __pi_file_watcher_count = () => 0;
 const __pi_fs_date = globalThis.__pi_fs_watch_runtime?.Date ?? Date;
@@ -13911,7 +13911,9 @@ const __pi_vfs = (() => {
     if (normalized === "ascii") {
       return oneByteBytesToString(bytes, true);
     }
-    return new TextDecoder().decode(bytes);
+    if (normalized === "utf8") return new TextDecoder().decode(bytes);
+    if (!Buffer.isEncoding(normalized)) throw new TypeError("unsupported file encoding: " + normalized);
+    return Buffer.from(bytes).toString(normalized);
   }
 
   function readHostBytes(resolved, snapshot = false) {
@@ -14070,8 +14072,13 @@ const __pi_vfs = (() => {
   }
 
   function parseOpenFlags(rawFlags) {
-    if (typeof rawFlags === "number" && Number.isFinite(rawFlags)) {
-      const flags = rawFlags | 0;
+    if (typeof rawFlags === "number") {
+      const supported = 3 | constants.O_APPEND | constants.O_CREAT | constants.O_TRUNC | constants.O_EXCL;
+      if (!Number.isSafeInteger(rawFlags) || rawFlags < 0 || rawFlags > supported ||
+          (rawFlags & ~supported) !== 0 || (rawFlags & 3) === 3) {
+        throw new RangeError("EINVAL: unsupported numeric file flags");
+      }
+      const flags = rawFlags;
       const accessMode = flags & 3;
       const readable = accessMode === constants.O_RDONLY || accessMode === constants.O_RDWR;
       const writable = accessMode === constants.O_WRONLY || accessMode === constants.O_RDWR;
@@ -14579,30 +14586,68 @@ export function readFileSync(path, encoding) {
   return __pi_vfs.decodeBytes(bytes, encoding);
 }
 
-export function appendFileSync(path, data, opts) {
-  // A borrowed fd retains its opening flags. Only an append-mode descriptor
-  // forces writes to EOF; an ordinary writable fd uses its current cursor.
-  if (typeof path === "number") return writeFileSync(path, data, opts);
-  const persistentPath = __pi_vfs.resolvePathForWrite(path, true);
-  if (__pi_vfs.isPersistentPath(persistentPath)) {
-    const bytes = __pi_vfs.toBytes(data, opts);
-    __pi_vfs.persistentMutation("append", persistentPath, {
+function writePathFile(path, data, opts, defaultFlag) {
+  const flag = opts?.flag ?? defaultFlag;
+  if (typeof flag !== "string" && typeof flag !== "number") {
+    throw new TypeError("file flag must be a string or a nonnegative integer");
+  }
+  const flags = __pi_vfs.parseOpenFlags(flag);
+  if (!flags.writable) {
+    const error = new Error("EBADF: file must be opened for writing");
+    error.code = "EBADF";
+    throw error;
+  }
+  // Validate and copy user input before an open that might truncate a file.
+  const encoding = bulkFdEncoding(opts);
+  const bytes = typeof data === "string" ? Buffer.from(data, encoding)
+    : data instanceof ArrayBuffer || ArrayBuffer.isView(data)
+      ? new Uint8Array(__pi_vfs.toWritableView(data))
+      : __pi_vfs.toBytes(data, encoding);
+  const input = String(path ?? "");
+  const resolved = __pi_vfs.resolvePathForWrite(input, !(flags.create && flags.exclusive));
+  if (__pi_vfs.isPersistentPath(resolved)) {
+    // The protected host bridge supports exactly these atomic write modes.
+    // Pass an explicit string: an unknown numeric mode must never become "w".
+    const { O_WRONLY, O_CREAT, O_TRUNC, O_APPEND, O_EXCL } = constants;
+    let hostFlag = flag;
+    if (typeof flag === "number") {
+      switch (flag) {
+        case O_WRONLY | O_CREAT | O_TRUNC: hostFlag = "w"; break;
+        case O_WRONLY | O_CREAT | O_TRUNC | O_EXCL: hostFlag = "wx"; break;
+        case O_WRONLY | O_CREAT | O_APPEND: hostFlag = "a"; break;
+        case O_WRONLY | O_CREAT | O_APPEND | O_EXCL: hostFlag = "ax"; break;
+        default: throw new Error("unsupported persistent write flags");
+      }
+    }
+    __pi_vfs.persistentMutation(defaultFlag === "a" ? "append" : "write", resolved, {
       data: Buffer.from(bytes).toString("base64"),
-      flag: opts && typeof opts === "object" ? opts.flag : undefined,
+      flag: hostFlag,
     });
     return;
   }
-  const flags =
-    opts && typeof opts === "object" && typeof opts.flag === "string"
-      ? opts.flag
-      : "a";
-  const fd = openSync(path, flags);
-  try {
-    const next = __pi_vfs.toBytes(data, opts);
-    writeSync(fd, next, 0, next.byteLength, null);
-  } finally {
-    closeSync(fd);
+  if (flag === "w") {
+    // A replacement needs metadata only. Avoid snapshotting the old host file
+    // or growing an intermediate descriptor buffer for this common case.
+    const hostStat = __pi_vfs.files.has(resolved) || __pi_vfs.dirs.has(resolved)
+      ? undefined : __pi_vfs.readHostStat(resolved, true);
+    if (__pi_vfs.dirs.has(resolved) || hostStat?.kind === "dir") {
+      throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
+    }
+    __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
+    __pi_vfs.setFile(resolved, bytes, hostStat);
+    __pi_vfs.touchMetadata(resolved, "file", hostStat);
+    return;
   }
+  // Preserve the authored path for descriptor-level authorization. The same
+  // open and write logic serves append, exclusive create and in-place updates.
+  const fd = openSync(input, flag);
+  try { writeSync(fd, bytes, 0, bytes.byteLength, null); }
+  finally { closeSync(fd); }
+}
+
+export function appendFileSync(path, data, opts) {
+  if (typeof path === "number") return writeFileSync(path, data, opts);
+  writePathFile(path, data, opts, "a");
 }
 
 export function writeFileSync(path, data, opts) {
@@ -14613,23 +14658,7 @@ export function writeFileSync(path, data, opts) {
     writeSync(path, bytes, 0, bytes.byteLength, null);
     return;
   }
-  const resolved = __pi_vfs.resolvePathForWrite(path, true);
-  if (__pi_vfs.isPersistentPath(resolved)) {
-    const bytes = __pi_vfs.toBytes(data, opts);
-    __pi_vfs.persistentMutation("write", resolved, {
-      data: Buffer.from(bytes).toString("base64"),
-      flag: opts && typeof opts === "object" ? opts.flag : undefined,
-    });
-    return;
-  }
-  const hostStat = __pi_vfs.files.has(resolved) || __pi_vfs.dirs.has(resolved)
-    ? undefined : __pi_vfs.readHostStat(resolved, true);
-  if (__pi_vfs.dirs.has(resolved) || hostStat?.kind === "dir") {
-    throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
-  }
-  __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
-  __pi_vfs.setFile(resolved, __pi_vfs.toBytes(data, opts), hostStat);
-  __pi_vfs.touchMetadata(resolved, "file", hostStat);
+  writePathFile(path, data, opts, "w");
 }
 
 export function readdirSync(path, opts) {
@@ -14971,7 +15000,8 @@ export function symlinkSync(target, path, _type) {
 export function openSync(path, flags = "r", _mode) {
   const opts = __pi_vfs.parseOpenFlags(flags);
   const needsWriteAccess = opts.writable || opts.create || opts.append || opts.truncate;
-  const resolution = __pi_vfs.resolvePathDetails(path, true);
+  const exclusiveCreate = opts.create && opts.exclusive;
+  const resolution = __pi_vfs.resolvePathDetails(path, !exclusiveCreate);
 
   if (opts.readable) {
     __pi_vfs.authorizeReadResolution(resolution);
@@ -14985,21 +15015,24 @@ export function openSync(path, flags = "r", _mode) {
     throw new Error("PiJS persistent file descriptors are unsupported; use writeFileSync or appendFileSync");
   }
 
-  const hostStat = __pi_vfs.readHostStat(resolved, true);
+  const existsInVfs = __pi_vfs.files.has(resolved);
+  const hostStat = __pi_vfs.readHostStat(resolved, !exclusiveCreate);
+  if (exclusiveCreate && (existsInVfs || __pi_vfs.dirs.has(resolved) || __pi_vfs.symlinks.has(resolved) || hostStat)) {
+    const error = new Error(`EEXIST: file already exists, open '${String(path ?? "")}'`);
+    error.code = "EEXIST";
+    throw error;
+  }
   if (__pi_vfs.dirs.has(resolved) || hostStat?.kind === "dir") {
     throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
   }
 
-  const existsInVfs = __pi_vfs.files.has(resolved);
-  const host = existsInVfs ? { bytes: undefined, error: "" } : __pi_vfs.readHostBytes(resolved, true);
+  const host = existsInVfs || (opts.truncate && opts.writable)
+    ? { bytes: undefined, error: "" } : __pi_vfs.readHostBytes(resolved, true);
   const existsOnHost = hostStat !== undefined;
   const exists = existsInVfs || existsOnHost;
   if (!exists && !opts.create) {
     const detail = host.error ? ` (host: ${host.error})` : "";
     throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
-  }
-  if (exists && opts.create && opts.exclusive) {
-    throw new Error(`EEXIST: file already exists, open '${String(path ?? "")}'`);
   }
   if (existsOnHost && hostStat.kind !== "file") {
     throw new Error(`EINVAL: unsupported host file type, open '${String(path ?? "")}'`);
@@ -31641,8 +31674,8 @@ mod tests {
         // The existing bounded whole-file host snapshot is unchanged.
         (
             "node:fs",
-            96_436,
-            "757617008d1d616913132e7b37fb602cf3802b15567ff9aedb7c3b9b50d2110e",
+            98_380,
+            "99cd6b0eb69fe8ab07d30178775293cca06d3bbd4fe4fe1636c0dd4c7a30fb1c",
         ),
         (
             "@mariozechner/pi-ai",
@@ -47882,6 +47915,92 @@ globalThis.fsWriteProgress = { done: false };
             assert_eq!(result["failedOpenDenied"], json!(true));
             assert_eq!(result["failedOpenDidNotCreate"], json!(true));
             assert_eq!(result["failedOpenEvents"], json!(1));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_path_bulk_writes_honor_open_flags() {
+        futures::executor::block_on(async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let large = workspace.path().join("large-host-file");
+            let size = 64 * 1024 * 1024 + 1;
+            std::fs::File::create(&large)
+                .expect("create host file")
+                .set_len(size)
+                .expect("extend host file beyond the snapshot limit");
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.path().display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+globalThis.fsWriteFlags = { done: false };
+(async () => {
+    const fs = await import('node:fs');
+    const result = {};
+    const read = p => fs.readFileSync(p, 'utf8');
+    const rejects = (fn, reason) => {
+        try { fn(); return false; }
+        catch (e) { return String(e).includes(reason); }
+    };
+    fs.writeFileSync('file', 'abcdef');
+    const bytes = new Uint8Array([0, 88, 89, 0]).subarray(1, 3);
+    fs.writeFileSync('file', bytes, { flag: 'r+' });
+    bytes[0] = 0;
+    result.overwrite = read('file');
+    fs.writeFileSync('wide', 'Ω', 'utf16le');
+    result.wide = fs.readFileSync('wide', 'utf16le');
+    result.wideBytes = fs.readFileSync('wide', 'hex');
+    await new Promise((resolve, reject) =>
+        fs.writeFile('file', '5a', { encoding: 'hex', flag: 'a' },
+            e => e ? reject(e) : resolve()));
+    result.append = read('file');
+    result.missing = rejects(() => fs.writeFileSync('absent', 'x', { flag: 'r+' }), 'ENOENT')
+        && !fs.existsSync('absent');
+    await fs.promises.writeFile('exclusive', 'first', { flag: 'wx' });
+    result.existing = rejects(() => fs.writeFileSync('exclusive', 'lost', { flag: 'ax' }), 'EEXIST')
+        && read('exclusive') === 'first';
+    fs.symlinkSync('missing-target', 'dangling');
+    result.dangling = rejects(() => fs.writeFileSync('dangling', 'lost', { flag: 'wx' }), 'EEXIST')
+        && !fs.existsSync('missing-target');
+    const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND;
+    await fs.promises.writeFile('file', '!', { flag: flags });
+    result.numeric = read('file');
+    try { fs.writeFileSync('file', 'lost', { flag: 0x40000000 | fs.constants.O_WRONLY | fs.constants.O_TRUNC }); }
+    catch (_) { result.invalidFlag = true; }
+    try { fs.writeFileSync('file', 'lost', { flag: 'w', encoding: 'bogus' }); }
+    catch (_) { result.invalidEncoding = true; }
+    result.preserved = read('file');
+    fs.writeFileSync('large-host-file', 'overlay', { flag: 'w' });
+    result.truncateHost = read('large-host-file');
+    globalThis.fsWriteFlags = { done: true, ...result };
+})().catch(error => { globalThis.fsWriteFlags.error = String(error); });
+",
+                )
+                .await
+                .expect("exercise path write flags");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsWriteFlags").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["overwrite"], json!("XYcdef"));
+            assert_eq!(result["wide"], json!("Ω"));
+            assert_eq!(result["wideBytes"], json!("a903"));
+            assert_eq!(result["append"], json!("XYcdefZ"));
+            assert_eq!(result["missing"], json!(true));
+            assert_eq!(result["existing"], json!(true));
+            assert_eq!(result["dangling"], json!(true));
+            assert_eq!(result["numeric"], json!("XYcdefZ!"));
+            assert_eq!(result["invalidFlag"], json!(true));
+            assert_eq!(result["invalidEncoding"], json!(true));
+            assert_eq!(result["preserved"], json!("XYcdefZ!"));
+            assert_eq!(result["truncateHost"], json!("overlay"));
+            assert_eq!(std::fs::metadata(&large).expect("host metadata").len(), size);
         });
     }
 
