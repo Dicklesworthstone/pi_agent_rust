@@ -768,10 +768,10 @@ where
 
         let selected = super::openai::select_primary_choice(chunk.choices, |choice| choice.index)
             .map_err(|message| {
-                let message = format!("Azure OpenAI stream choice error: {message}");
-                self.record_error(message.clone());
-                Error::api(message)
-            })?;
+            let message = format!("Azure OpenAI stream choice error: {message}");
+            self.record_error(message.clone());
+            Error::api(message)
+        })?;
         if !self.started {
             let delta_is_empty = selected.as_ref().is_some_and(|choice| {
                 choice.finish_reason.is_none()

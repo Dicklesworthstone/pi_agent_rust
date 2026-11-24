@@ -45136,7 +45136,7 @@ globalThis.__spawn_abort_result = result;
                 .expect("create runtime");
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.readablePull = { done: false };
                     (async () => {
                         const { Readable } = await import('node:stream');
@@ -45198,7 +45198,7 @@ globalThis.__spawn_abort_result = result;
                             pendingClosed: pending.closed, failureText, failureClosed: failure.closed,
                         };
                     })().catch(error => { globalThis.readablePull.error = String(error); });
-                    "#,
+                    ",
                 )
                 .await
                 .expect("evaluate readable pull hooks");
@@ -45232,7 +45232,7 @@ globalThis.__spawn_abort_result = result;
                 .expect("create runtime");
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.readableCapacity = { done: false };
                     (async () => {
                         const { Readable } = await import('node:stream');
@@ -45286,7 +45286,7 @@ globalThis.__spawn_abort_result = result;
                             objects, objectMode: iterable.readableObjectMode, zeroText, zeroCalls,
                         };
                     })().catch(error => { globalThis.readableCapacity.error = String(error); });
-                    "#,
+                    ",
                 )
                 .await
                 .expect("evaluate readable capacity and empty pulls");
@@ -45322,7 +45322,7 @@ globalThis.__spawn_abort_result = result;
                 .expect("create runtime");
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.transformPressure = { done: false };
                     (async () => {
                         const { Readable, PassThrough } = await import('node:stream');
@@ -45375,7 +45375,7 @@ globalThis.__spawn_abort_result = result;
                             cancelledLength: held.readableLength, cancelledClosed: held.closed,
                         };
                     })().catch(error => { globalThis.transformPressure.error = String(error); });
-                    "#,
+                    ",
                 )
                 .await
                 .expect("evaluate transform readable pressure");
@@ -47155,7 +47155,7 @@ globalThis.__spawn_abort_result = result;
                 .expect("create runtime");
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.fsReadDemand = { done: false };
                     (async () => {
                         const fs = await import('node:fs');
@@ -47217,7 +47217,7 @@ globalThis.__spawn_abort_result = result;
                             shorthand, largeMark, invalidOptions,
                         };
                     })().catch(error => { globalThis.fsReadDemand.error = String(error); });
-                    "#,
+                    ",
                 )
                 .await
                 .expect("evaluate file stream demand and ranges");
@@ -47256,7 +47256,7 @@ globalThis.__spawn_abort_result = result;
                 .expect("create runtime");
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.fsReadCleanup = { done: false };
                     (async () => {
                         const fs = await import('node:fs');
@@ -47330,7 +47330,7 @@ globalThis.__spawn_abort_result = result;
                             protectedFields,
                         };
                     })().catch(error => { globalThis.fsReadCleanup.error = String(error); });
-                    "#,
+                    ",
                 )
                 .await
                 .expect("evaluate file stream cancellation and errors");
@@ -47366,7 +47366,7 @@ globalThis.__spawn_abort_result = result;
             let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
                 .await
                 .expect("create runtime");
-            let script = r#"
+            let script = r"
                 globalThis.fsReadOwner = { done: false };
                 (async () => {
                     const fs = await import('node:fs');
@@ -47404,7 +47404,7 @@ globalThis.__spawn_abort_result = result;
                         activeBytes: active.bytesRead, activeClosed: active.closed, activeFd: active.fd,
                     };
                 })().catch(error => { globalThis.fsReadOwner.error = String(error); });
-            "#;
+            ";
             runtime
                 .eval(&privileged_test_script(&runtime, script))
                 .await

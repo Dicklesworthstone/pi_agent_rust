@@ -261,7 +261,10 @@ pub(super) fn replay(
     if assistant.api != "openai-completions"
         || assistant.provider != provider
         || assistant.model != model
-        || !matches!(assistant.stop_reason, StopReason::Stop | StopReason::ToolUse)
+        || !matches!(
+            assistant.stop_reason,
+            StopReason::Stop | StopReason::ToolUse
+        )
     {
         return None;
     }
@@ -294,7 +297,9 @@ pub(super) fn replay(
             return None;
         };
         if details.len() > MAX_REASONING_ITEMS
-            || details.iter().any(|detail| validate_detail(detail).is_err())
+            || details
+                .iter()
+                .any(|detail| validate_detail(detail).is_err())
         {
             return None;
         }
@@ -426,30 +431,48 @@ mod tests {
         });
         let summary = json!({"type": "reasoning.summary", "summary": "Then read.", "index": 1});
         let output = events([
-            choice(json!({
-                "reasoning": "Inspect ",
-                "reasoning_details": [{
-                    "type": "reasoning.text", "id": "thought-a", "index": 0,
-                    "format": "anthropic-claude-v1", "text": "Inspect ", "signature": null
-                }]
-            }), None),
-            choice(json!({"reasoning_details": [{
-                "type": "reasoning.text", "text": "inputs"
-            }]}), None),
-            choice(json!({"reasoning_details": [
-                {"type": "reasoning.text", "signature": signature},
-                encrypted, summary
-            ]}), None),
+            choice(
+                json!({
+                    "reasoning": "Inspect ",
+                    "reasoning_details": [{
+                        "type": "reasoning.text", "id": "thought-a", "index": 0,
+                        "format": "anthropic-claude-v1", "text": "Inspect ", "signature": null
+                    }]
+                }),
+                None,
+            ),
+            choice(
+                json!({"reasoning_details": [{
+                    "type": "reasoning.text", "text": "inputs"
+                }]}),
+                None,
+            ),
+            choice(
+                json!({"reasoning_details": [
+                    {"type": "reasoning.text", "signature": signature},
+                    encrypted, summary
+                ]}),
+                None,
+            ),
             choice(tool_delta(), Some("tool_calls")),
         ]);
         let message = done(&output);
         assert_eq!(message.stop_reason, StopReason::ToolUse);
         assert_eq!(thinking_text(message), "Inspect inputsThen read.");
-        assert_eq!(output.iter().filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. })).count(), 2);
-        let visible = output.iter().filter_map(|event| match event {
-            StreamEvent::ThinkingDelta { delta, .. } => Some(delta.as_str()),
-            _ => None,
-        }).collect::<String>();
+        assert_eq!(
+            output
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                .count(),
+            2
+        );
+        let visible = output
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
         assert_eq!(visible, "Inspect inputsThen read.");
         assert!(!visible.contains(signature));
         assert!(!visible.contains("CIPHERTEXT"));
@@ -469,15 +492,24 @@ mod tests {
                 timestamp: 0,
             }));
         }
-        let context = Context::owned(Some("system".to_string()), history, vec![ToolDef {
-            name: "read".to_string(),
-            description: "Read a file".to_string(),
-            parameters: json!({"type": "object"}),
-        }]);
-        let request = provider().build_request_json(&context, &StreamOptions {
-            thinking_level: Some(ThinkingLevel::Off),
-            ..StreamOptions::default()
-        }).unwrap();
+        let context = Context::owned(
+            Some("system".to_string()),
+            history,
+            vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({"type": "object"}),
+            }],
+        );
+        let request = provider()
+            .build_request_json(
+                &context,
+                &StreamOptions {
+                    thinking_level: Some(ThinkingLevel::Off),
+                    ..StreamOptions::default()
+                },
+            )
+            .unwrap();
         let expected = json!([
             {"type": "reasoning.text", "id": "thought-a", "index": 0,
              "format": "anthropic-claude-v1", "text": "Inspect inputs", "signature": signature},
@@ -489,7 +521,11 @@ mod tests {
         assert_eq!(request["messages"][2]["tool_call_id"], "read-a");
         assert_eq!(request["messages"][3]["tool_call_id"], "read-b");
         for index in [0, 2, 3] {
-            assert!(request["messages"][index].get("reasoning_details").is_none());
+            assert!(
+                request["messages"][index]
+                    .get("reasoning_details")
+                    .is_none()
+            );
         }
         assert!(request["messages"][1].get("reasoning_content").is_none());
     }
@@ -512,16 +548,19 @@ mod tests {
             capture.extend(delta).unwrap();
         }
         let envelope: Value = serde_json::from_str(&capture.signature().unwrap()).unwrap();
-        assert_eq!(envelope["details"], json!([
-            {"type": "reasoning.text", "index": 0, "text": "first", "signature": "sig-first", "provider_extension": null},
-            {"type": "reasoning.text", "index": 0, "text": "second", "signature": "sig-second"},
-            {"type": "reasoning.summary", "index": 0, "id": "summary-a", "summary": "summary"},
-            {"type": "reasoning.summary", "index": 0, "id": "summary-b", "summary": "new"},
-            {"type": "reasoning.encrypted", "index": 0, "data": "cipher-one"},
-            {"type": "reasoning.encrypted", "index": 0, "data": "cipher-two"},
-            {"type": "reasoning.text", "index": 1, "text": "third"},
-            {"type": "reasoning.text", "index": 2, "text": "fourth"}
-        ]));
+        assert_eq!(
+            envelope["details"],
+            json!([
+                {"type": "reasoning.text", "index": 0, "text": "first", "signature": "sig-first", "provider_extension": null},
+                {"type": "reasoning.text", "index": 0, "text": "second", "signature": "sig-second"},
+                {"type": "reasoning.summary", "index": 0, "id": "summary-a", "summary": "summary"},
+                {"type": "reasoning.summary", "index": 0, "id": "summary-b", "summary": "new"},
+                {"type": "reasoning.encrypted", "index": 0, "data": "cipher-one"},
+                {"type": "reasoning.encrypted", "index": 0, "data": "cipher-two"},
+                {"type": "reasoning.text", "index": 1, "text": "third"},
+                {"type": "reasoning.text", "index": 2, "text": "fourth"}
+            ])
+        );
     }
 
     #[test]
@@ -538,9 +577,16 @@ mod tests {
             let message = done(&output);
             assert_eq!(message.stop_reason, StopReason::ToolUse);
             assert!(thinking_text(message).is_empty());
-            assert!(!output.iter().any(|event| matches!(event, StreamEvent::ThinkingDelta { .. })));
-            let context = Context::owned(None, vec![Message::assistant(message.clone())], Vec::new());
-            let request = provider().build_request_json(&context, &StreamOptions::default()).unwrap();
+            assert!(
+                !output
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::ThinkingDelta { .. }))
+            );
+            let context =
+                Context::owned(None, vec![Message::assistant(message.clone())], Vec::new());
+            let request = provider()
+                .build_request_json(&context, &StreamOptions::default())
+                .unwrap();
             assert_eq!(request["messages"][0]["reasoning_details"], details);
             assert!(request["messages"][0].get("content").is_none());
         }
@@ -557,14 +603,22 @@ mod tests {
     fn replay_is_fenced_by_transport_provider_api_model_and_completion() {
         let details = json!([{"type": "reasoning.encrypted", "data": "opaque-state"}]);
         let original = captured(details.clone());
-        assert_eq!(replay(&original, "openrouter", MODEL, ORIGIN), details.as_array().cloned());
+        assert_eq!(
+            replay(&original, "openrouter", MODEL, ORIGIN),
+            details.as_array().cloned()
+        );
         assert!(replay(&original, "another-provider", MODEL, ORIGIN).is_none());
         assert!(replay(&original, "openrouter", "another-model", ORIGIN).is_none());
         assert!(replay(&original, "openrouter", MODEL, "https://proxy.example").is_none());
         let mut foreign_api = original.clone();
         foreign_api.api = "anthropic-messages".to_string();
         assert!(replay(&foreign_api, "openrouter", MODEL, ORIGIN).is_none());
-        for reason in [StopReason::Error, StopReason::Aborted, StopReason::Length, StopReason::Refusal] {
+        for reason in [
+            StopReason::Error,
+            StopReason::Aborted,
+            StopReason::Length,
+            StopReason::Refusal,
+        ] {
             let mut failed = original.clone();
             failed.stop_reason = reason;
             assert!(replay(&failed, "openrouter", MODEL, ORIGIN).is_none());
@@ -576,11 +630,16 @@ mod tests {
             "http://openrouter.ai/api/v1/chat/completions",
             "https://openrouter.ai:8443/api/v1/chat/completions",
         ] {
-            let request = provider().with_base_url(endpoint)
-                .build_request_json(&context, &StreamOptions::default()).unwrap();
+            let request = provider()
+                .with_base_url(endpoint)
+                .build_request_json(&context, &StreamOptions::default())
+                .unwrap();
             assert!(request["messages"][0].get("reasoning_details").is_none());
         }
-        assert_eq!(origin("https://user:password@openrouter.ai:443/path?key=secret"), Some(ORIGIN.to_string()));
+        assert_eq!(
+            origin("https://user:password@openrouter.ai:443/path?key=secret"),
+            Some(ORIGIN.to_string())
+        );
         assert_eq!(origin("data:text/plain,secret"), None);
     }
 
@@ -592,17 +651,27 @@ mod tests {
             "https://evil.example/?target=openrouter.ai",
             "https://openrouter.ai@evil.example/chat/completions",
         ] {
-            assert!(!OpenAIProvider::new(MODEL).with_base_url(endpoint).is_openrouter());
+            assert!(
+                !OpenAIProvider::new(MODEL)
+                    .with_base_url(endpoint)
+                    .is_openrouter()
+            );
         }
-        assert!(OpenAIProvider::new(MODEL).with_base_url(ENDPOINT).is_openrouter());
+        assert!(
+            OpenAIProvider::new(MODEL)
+                .with_base_url(ENDPOINT)
+                .is_openrouter()
+        );
         let proxy = "https://proxy.example";
         let mut capture = ReasoningDetails::new(proxy.to_string());
         capture.extend(json!([])).unwrap();
         let mut message = captured(json!([]));
         *signature_mut(&mut message) = capture.signature();
         let context = Context::owned(None, vec![Message::assistant(message)], Vec::new());
-        let request = provider().with_base_url(format!("{proxy}/v1/chat/completions"))
-            .build_request_json(&context, &StreamOptions::default()).unwrap();
+        let request = provider()
+            .with_base_url(format!("{proxy}/v1/chat/completions"))
+            .build_request_json(&context, &StreamOptions::default())
+            .unwrap();
         assert_eq!(request["messages"][0]["reasoning_details"], json!([]));
     }
 
@@ -626,8 +695,18 @@ mod tests {
             ]);
             let message = done(&output);
             assert_eq!(message.stop_reason, StopReason::Error);
-            assert!(!output.iter().any(|event| matches!(event, StreamEvent::ToolCallEnd { .. })));
-            assert!(!message.error_message.as_deref().unwrap().contains("DO-NOT-ECHO"));
+            assert!(
+                !output
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+            );
+            assert!(
+                !message
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("DO-NOT-ECHO")
+            );
             assert!(replay(message, "openrouter", MODEL, ORIGIN).is_none());
         }
     }
@@ -648,19 +727,30 @@ mod tests {
 
         let mut capture = ReasoningDetails::new(ORIGIN.to_string());
         for _ in 0..MAX_REASONING_ITEMS {
-            capture.extend(json!([{"type": "reasoning.encrypted", "data": "opaque"}])).unwrap();
+            capture
+                .extend(json!([{"type": "reasoning.encrypted", "data": "opaque"}]))
+                .unwrap();
         }
-        assert!(capture.extend(json!([{"type": "reasoning.encrypted", "data": "overflow"}])).is_err());
+        assert!(
+            capture
+                .extend(json!([{"type": "reasoning.encrypted", "data": "overflow"}]))
+                .is_err()
+        );
         assert!(capture.signature().is_none());
 
         // A single oversize array must also prevent completed local calls.
-        let too_many = vec![json!({"type": "reasoning.encrypted", "data": "opaque"}); MAX_REASONING_ITEMS + 1];
+        let too_many =
+            vec![json!({"type": "reasoning.encrypted", "data": "opaque"}); MAX_REASONING_ITEMS + 1];
         let output = events([
             choice(tool_delta(), None),
             choice(json!({"reasoning_details": too_many}), Some("tool_calls")),
         ]);
         assert_eq!(done(&output).stop_reason, StopReason::Error);
-        assert!(!output.iter().any(|event| matches!(event, StreamEvent::ToolCallEnd { .. })));
+        assert!(
+            !output
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+        );
     }
 
     #[test]
@@ -685,18 +775,24 @@ mod tests {
     fn late_reasoning_invalidates_completion_and_bad_json_never_echoes_opaque_data() {
         let output = events([
             choice(tool_delta(), Some("tool_calls")),
-            choice(json!({"reasoning_details": [
-                {"type": "reasoning.encrypted", "data": "late-cipher"}
-            ]}), None),
+            choice(
+                json!({"reasoning_details": [
+                    {"type": "reasoning.encrypted", "data": "late-cipher"}
+                ]}),
+                None,
+            ),
         ]);
         assert_eq!(done(&output).stop_reason, StopReason::Error);
         assert!(replay(done(&output), "openrouter", MODEL, ORIGIN).is_none());
 
         // Serde normally includes the invalid typed field's value in its error.
-        let bytes = wire_bytes([choice(json!({
-            "reasoning_details": [{"type": "reasoning.encrypted", "data": "PRIVATE-CIPHER"}],
-            "tool_calls": [{"index": "PRIVATE-INDEX"}]
-        }), None)]);
+        let bytes = wire_bytes([choice(
+            json!({
+                "reasoning_details": [{"type": "reasoning.encrypted", "data": "PRIVATE-CIPHER"}],
+                "tool_calls": [{"index": "PRIVATE-INDEX"}]
+            }),
+            None,
+        )]);
         let output = raw_events(&bytes, true);
         let error = output.last().unwrap().as_ref().unwrap_err().to_string();
         assert!(error.contains("Invalid OpenAI stream JSON"));
@@ -773,11 +869,16 @@ mod tests {
     #[test]
     fn native_dialects_ignore_gateway_metadata_and_keep_plain_reasoning() {
         let bytes = wire_bytes([
-            choice(json!({"reasoning_content": "native thought", "reasoning_details": {"bad": true}}), None),
+            choice(
+                json!({"reasoning_content": "native thought", "reasoning_details": {"bad": true}}),
+                None,
+            ),
             choice(json!({"content": "answer"}), Some("stop")),
         ]);
-        let output = raw_events(&bytes, false).into_iter()
-            .collect::<crate::error::Result<Vec<_>>>().unwrap();
+        let output = raw_events(&bytes, false)
+            .into_iter()
+            .collect::<crate::error::Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(done(&output).stop_reason, StopReason::Stop);
         assert_eq!(thinking_text(done(&output)), "native thought");
         assert!(done(&output).content.iter().all(|block| match block {
@@ -789,16 +890,21 @@ mod tests {
         native.provider = "deepseek".to_string();
         native.model = "deepseek-reasoner".to_string();
         *signature_mut(&mut native) = None;
-        let context = Context::owned(None, vec![Message::assistant(native)], vec![ToolDef {
-            name: "read".to_string(),
-            description: "Read".to_string(),
-            parameters: json!({"type": "object"}),
-        }]);
+        let context = Context::owned(
+            None,
+            vec![Message::assistant(native)],
+            vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type": "object"}),
+            }],
+        );
         let request = OpenAIProvider::new("deepseek-reasoner")
             .with_provider_name("deepseek")
             .with_base_url("https://api.deepseek.com/v1/chat/completions")
             .with_reasoning(true)
-            .build_request_json(&context, &StreamOptions::default()).unwrap();
+            .build_request_json(&context, &StreamOptions::default())
+            .unwrap();
         assert_eq!(request["messages"][0]["reasoning_content"], "display text");
         assert!(request["messages"][0].get("reasoning_details").is_none());
     }

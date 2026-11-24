@@ -1890,10 +1890,9 @@ where
                     .tool_calls
                     .as_ref()
                     .is_some_and(|calls| !calls.is_empty())
-                || delta
-                    .reasoning_details
-                    .as_ref()
-                    .is_some_and(|details| details.as_array().is_none_or(|items| !items.is_empty()));
+                || delta.reasoning_details.as_ref().is_some_and(|details| {
+                    details.as_array().is_none_or(|items| !items.is_empty())
+                });
             if has_content {
                 self.record_error("OpenAI sent content after a terminal finish reason".to_string());
             }
@@ -2120,7 +2119,9 @@ pub(super) fn select_primary_choice<T>(
     index: impl Fn(&T) -> Option<u32>,
 ) -> std::result::Result<Option<T>, &'static str> {
     if choices.len() <= 1 {
-        return Ok(choices.pop().filter(|choice| index(choice).unwrap_or(0) == 0));
+        return Ok(choices
+            .pop()
+            .filter(|choice| index(choice).unwrap_or(0) == 0));
     }
     let mut indices = HashSet::with_capacity(choices.len());
     let mut selected = None;
