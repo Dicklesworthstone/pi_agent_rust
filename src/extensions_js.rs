@@ -15345,46 +15345,84 @@ function __queueMicrotaskPolyfill(fn) {
   Promise.resolve().then(fn);
 }
 export function createReadStream(path, opts) {
-  const options = opts && typeof opts === "object" ? opts : {};
+  const options = typeof opts === "string" ? { encoding: opts }
+    : opts && typeof opts === "object" ? opts : {};
   const encoding = typeof options.encoding === "string" ? options.encoding : null;
-  const highWaterMark =
-    Number.isInteger(options.highWaterMark) && options.highWaterMark > 0
-      ? options.highWaterMark
-      : 64 * 1024;
+  const highWaterMark = options.highWaterMark ?? 64 * 1024;
+  const start = options.start === undefined ? 0 : options.start;
+  const end = options.end === undefined ? Infinity : options.end;
+  if (!Number.isSafeInteger(start) || start < 0) {
+    throw new RangeError("read stream start must be a nonnegative safe integer");
+  }
+  if ((end !== Infinity && (!Number.isSafeInteger(end) || end < 0)) || end < start) {
+    throw new RangeError("read stream end must be at least start or Infinity");
+  }
 
-  const stream = new Readable({ encoding: encoding || undefined, autoDestroy: false });
-  stream.path = __pi_vfs.normalizePath(path);
-
-  __queueMicrotaskPolyfill(() => {
+  // Capture authority and the uncollapsed path before deferred demand. The
+  // descriptor still rechecks owner/path authority on every subsequent read.
+  const owner = { extensionId: __pi_vfs.currentExtensionId() };
+  const sourcePath = __pi_vfs.absoluteInputPath(String(path ?? ""));
+  let ownedFd = null;
+  let fdEntry = null;
+  let position = start;
+  const closeOwnedFd = () => {
+    const fd = ownedFd;
+    const entry = fdEntry;
+    ownedFd = null;
+    fdEntry = null;
     try {
-      const bytes = readFileSync(path, "buffer");
-      const source =
-        bytes instanceof Uint8Array
-          ? bytes
-          : (typeof Buffer !== "undefined" && Buffer.from
-              ? Buffer.from(bytes)
-              : __pi_vfs.toBytes(bytes));
-
-      if (source.byteLength === 0) {
-        stream.push(null);
+      if (fd === null || __pi_vfs.fds.get(fd) !== entry) return;
+      try { closeSync(fd); }
+      finally {
+        // Cleanup may run under a different principal or after lifecycle
+        // scrubbing. Release only this stream's exact descriptor entry.
+        if (__pi_vfs.fds.get(fd) === entry) __pi_vfs.fds.delete(fd);
+      }
+    } finally {
+      // A frozen or throwing public field cannot prevent private cleanup.
+      try { stream.fd = null; } catch (_) {}
+    }
+  };
+  const stream = new Readable({
+    encoding: encoding || undefined,
+    highWaterMark,
+    read() {
+      if (this.destroyed || this._readableState.ended) return;
+      __pi_vfs.assertFdOwner(owner, "read");
+      if (ownedFd === null) {
+        // The existing host bridge captures a bounded whole-file snapshot;
+        // demand controls when it is opened and how much reaches the queue.
+        ownedFd = openSync(sourcePath, "r");
+        fdEntry = __pi_vfs.getFdEntry(ownedFd);
+        this.fd = ownedFd;
+      }
+      if (__pi_vfs.fds.get(ownedFd) !== fdEntry) {
+        throw new Error(`EBADF: bad file descriptor, fd ${String(ownedFd)}`);
+      }
+      const remaining = Math.max(0, fstatSync(ownedFd).size - position);
+      const length = Math.min(highWaterMark, end - position + 1, remaining);
+      if (length <= 0) {
+        this.push(null);
         return;
       }
-
-      let offset = 0;
-      while (offset < source.byteLength) {
-        const nextOffset = Math.min(source.byteLength, offset + highWaterMark);
-        const slice = source.subarray(offset, nextOffset);
-        // Readable owns decoding so a multibyte character split by the
-        // high-water mark is retained until the next chunk arrives.
-        stream.push(slice);
-        offset = nextOffset;
-      }
-      stream.push(null);
-    } catch (err) {
-      stream.emit("error", err instanceof Error ? err : new Error(String(err)));
-    }
+      const bytes = Buffer.alloc(length);
+      const count = readSync(ownedFd, bytes, 0, length, position);
+      position += count;
+      this.bytesRead += count;
+      // Readable owns cross-chunk decoding, pressure and the next pull.
+      if (count > 0) this.push(bytes.subarray(0, count));
+      if (count === 0 || position > end || count === remaining) this.push(null);
+    },
+    destroy(error, callback) {
+      // Teardown only releases an already owned virtual handle. A changed
+      // principal must not turn successful cleanup into a new read error.
+      try { closeOwnedFd(); } catch (_) {}
+      callback(error);
+    },
   });
-
+  stream.path = __pi_vfs.normalizePath(sourcePath);
+  stream.fd = null;
+  stream.bytesRead = 0;
   return stream;
 }
 export function createWriteStream(path, opts) {
@@ -31367,10 +31405,12 @@ mod tests {
             271_442,
             "1d90f2b0398f5cb6ab4ccc060c48cf6d87df9bddaf37d01c92606f805fd34c22",
         ),
+        // Demand-driven file reads add byte ranges and owned descriptor cleanup.
+        // The existing bounded whole-file host snapshot is unchanged.
         (
             "node:fs",
-            87_607,
-            "7299410bd52caed7a72dc60e09dbcde4c5938a55f2f181badc1ef0629faed4bb",
+            89_521,
+            "9100f9eed9f9732c8d444444781b34b8969155a95ef455f62bfa1880f7afa323",
         ),
         (
             "@mariozechner/pi-ai",
@@ -46957,6 +46997,282 @@ globalThis.__spawn_abort_result = result;
             let result = get_global_json(&runtime, "streamInterop").await;
             assert_eq!(result["done"], serde_json::json!(true));
             assert_eq!(result["value"], serde_json::json!("alpha-omega"));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_read_stream_waits_for_demand_and_honors_byte_ranges() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.fsReadDemand = { done: false };
+                    (async () => {
+                        const fs = await import('node:fs');
+                        const settle = async () => {
+                            for (let i = 0; i < 30; i++) await Promise.resolve();
+                        };
+                        const collect = async stream => {
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(chunk);
+                            return chunks;
+                        };
+                        const data = Buffer.from(Array.from({ length: 4096 }, (_, i) => i % 256));
+                        fs.writeFileSync('/tmp/read-demand.bin', data);
+                        const source = fs.createReadStream('/tmp/read-demand.bin', { highWaterMark: 16 });
+                        await settle();
+                        const before = { bytes: source.bytesRead, length: source.readableLength, fd: source.fd };
+                        source.read(0);
+                        await settle();
+                        const buffered = { bytes: source.bytesRead, length: source.readableLength };
+                        await settle();
+                        const stillBuffered = source.bytesRead === buffered.bytes;
+                        const copied = Buffer.concat(await collect(source));
+                        await settle();
+
+                        fs.writeFileSync('/tmp/read-range.txt', '0Aé中😀Z9');
+                        fs.writeFileSync('/tmp/read-empty.txt', '');
+                        const range = fs.createReadStream('/tmp/read-range.txt', {
+                            start: 2, end: 10, highWaterMark: 1, encoding: 'utf8',
+                        });
+                        const rangeText = (await collect(range)).join('');
+                        const single = (await collect(fs.createReadStream('/tmp/read-range.txt', {
+                            start: 11, end: 11, encoding: 'utf8',
+                        }))).join('');
+                        const partial = (await collect(fs.createReadStream('/tmp/read-range.txt', {
+                            start: 2, end: 2, encoding: 'utf8',
+                        }))).join('');
+                        const beyond = await collect(fs.createReadStream('/tmp/read-range.txt', { start: 99 }));
+                        const empty = await collect(fs.createReadStream('/tmp/read-empty.txt'));
+                        const zero = await collect(fs.createReadStream('/tmp/read-range.txt', { highWaterMark: 0 }));
+                        const shorthand = (await collect(fs.createReadStream('/tmp/read-range.txt', 'utf8'))).join('');
+                        const largeMark = Buffer.concat(await collect(fs.createReadStream('/tmp/read-range.txt', {
+                            highWaterMark: Number.MAX_SAFE_INTEGER,
+                        }))).toString();
+                        let invalidOptions = 0;
+                        for (const options of [
+                            { start: -1 }, { start: 1.5 }, { start: Infinity },
+                            { end: -1 }, { end: NaN }, { start: 3, end: 2 },
+                            { highWaterMark: -1 }, { highWaterMark: 1.5 },
+                        ]) {
+                            try { fs.createReadStream('/tmp/read-range.txt', options); }
+                            catch (error) { if (error instanceof RangeError) invalidOptions++; }
+                        }
+                        globalThis.fsReadDemand = {
+                            done: true, before, buffered, stillBuffered,
+                            copied: copied.length === data.length && copied.every((value, i) => value === data[i]),
+                            bytesRead: source.bytesRead, closed: source.closed, fd: source.fd,
+                            rangeText, rangeBytes: range.bytesRead, single, partial,
+                            beyond: beyond.length, empty: empty.length, zero: zero.length,
+                            shorthand, largeMark, invalidOptions,
+                        };
+                    })().catch(error => { globalThis.fsReadDemand.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate file stream demand and ranges");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsReadDemand").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["before"], json!({ "bytes": 0, "length": 0, "fd": null }));
+            assert_eq!(result["buffered"], json!({ "bytes": 16, "length": 16 }));
+            assert_eq!(result["stillBuffered"], json!(true));
+            assert_eq!(result["copied"], json!(true));
+            assert_eq!(result["bytesRead"], json!(4096));
+            assert_eq!(result["closed"], json!(true));
+            assert_eq!(result["fd"], Value::Null);
+            assert_eq!(result["rangeText"], json!("é中😀"));
+            assert_eq!(result["rangeBytes"], json!(9));
+            assert_eq!(result["single"], json!("Z"));
+            assert_eq!(result["partial"], json!("�"));
+            assert_eq!(result["beyond"], json!(0));
+            assert_eq!(result["empty"], json!(0));
+            assert_eq!(result["zero"], json!(0));
+            assert_eq!(result["shorthand"], json!("0Aé中😀Z9"));
+            assert_eq!(result["largeMark"], json!("0Aé中😀Z9"));
+            assert_eq!(result["invalidOptions"], json!(8));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_read_stream_cancellation_and_errors_release_owned_descriptors() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.fsReadCleanup = { done: false };
+                    (async () => {
+                        const fs = await import('node:fs');
+                        const settle = async () => {
+                            for (let i = 0; i < 30; i++) await Promise.resolve();
+                        };
+                        const released = fd => {
+                            try { fs.fstatSync(fd); return false; }
+                            catch (error) { return String(error).includes('EBADF'); }
+                        };
+                        const unopened = fs.createReadStream('/tmp/read-never-opened.txt');
+                        const unopenedEvents = [];
+                        unopened.on('error', () => unopenedEvents.push('error'));
+                        unopened.on('close', () => unopenedEvents.push('close'));
+                        unopened.destroy();
+                        unopened.resume();
+                        await settle();
+
+                        fs.writeFileSync('/tmp/read-cancel.txt', 'abcdefghi');
+                        const cancelled = fs.createReadStream('/tmp/read-cancel.txt', { highWaterMark: 3 });
+                        let first = '', cancelledFd;
+                        for await (const chunk of cancelled) {
+                            first = String(chunk);
+                            cancelledFd = cancelled.fd;
+                            break;
+                        }
+                        cancelled.read(0);
+                        cancelled.resume();
+                        await settle();
+
+                        const missing = fs.createReadStream('/tmp/read-does-not-exist.txt');
+                        const missingEvents = [];
+                        missing.on('error', () => missingEvents.push('error'));
+                        missing.on('end', () => missingEvents.push('end'));
+                        missing.on('close', () => missingEvents.push('close'));
+                        let missingError = '';
+                        try { await missing[Symbol.asyncIterator]().next(); }
+                        catch (error) { missingError = String(error); }
+                        missing.destroy();
+                        await settle();
+                        const protectedFields = [];
+                        for (const mode of ['frozen', 'throwing']) {
+                            const protectedStream = fs.createReadStream('/tmp/read-cancel.txt', {
+                                highWaterMark: 3,
+                            });
+                            const protectedIterator = protectedStream[Symbol.asyncIterator]();
+                            await protectedIterator.next();
+                            const owned = protectedStream.fd;
+                            if (mode === 'frozen') {
+                                Object.defineProperty(protectedStream, 'fd', { writable: false });
+                            } else {
+                                Object.defineProperty(protectedStream, 'fd', {
+                                    get() { return owned; },
+                                    set() { throw new Error('public descriptor is unavailable'); },
+                                });
+                            }
+                            const events = [];
+                            protectedStream.on('error', () => events.push('error'));
+                            protectedStream.on('close', () => events.push('close'));
+                            protectedStream.destroy();
+                            await settle();
+                            protectedFields.push({ mode, released: released(owned), events });
+                        }
+                        globalThis.fsReadCleanup = {
+                            done: true, unopenedEvents, unopenedFd: unopened.fd,
+                            unopenedBytes: unopened.bytesRead, first,
+                            cancelledBytes: cancelled.bytesRead, cancelledClosed: cancelled.closed,
+                            cancelledFd: cancelled.fd, cancelledReleased: released(cancelledFd),
+                            missingEvents, missingError: missingError.includes('ENOENT'),
+                            missingClosed: missing.closed, missingFd: missing.fd,
+                            protectedFields,
+                        };
+                    })().catch(error => { globalThis.fsReadCleanup.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate file stream cancellation and errors");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsReadCleanup").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["unopenedEvents"], json!(["close"]));
+            assert_eq!(result["unopenedFd"], Value::Null);
+            assert_eq!(result["unopenedBytes"], json!(0));
+            assert_eq!(result["first"], json!("abc"));
+            assert_eq!(result["cancelledBytes"], json!(3));
+            assert_eq!(result["cancelledClosed"], json!(true));
+            assert_eq!(result["cancelledFd"], Value::Null);
+            assert_eq!(result["cancelledReleased"], json!(true));
+            assert_eq!(result["missingEvents"], json!(["error", "close"]));
+            assert_eq!(result["missingError"], json!(true));
+            assert_eq!(result["missingClosed"], json!(true));
+            assert_eq!(result["missingFd"], Value::Null);
+            assert_eq!(
+                result["protectedFields"],
+                json!([
+                    { "mode": "frozen", "released": true, "events": ["close"] },
+                    { "mode": "throwing", "released": true, "events": ["close"] }
+                ])
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_fs_read_stream_rechecks_owner_before_open_and_later_pulls() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let script = r#"
+                globalThis.fsReadOwner = { done: false };
+                (async () => {
+                    const fs = await import('node:fs');
+                    let unopened, active, iterator, activeFd, first;
+                    await __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {
+                        fs.writeFileSync('/tmp/read-owner.txt', 'owner-secret');
+                        unopened = fs.createReadStream('/tmp/read-owner.txt');
+                        active = fs.createReadStream('/tmp/read-owner.txt', { highWaterMark: 3 });
+                        iterator = active[Symbol.asyncIterator]();
+                        first = String((await iterator.next()).value);
+                        activeFd = active.fd;
+                    });
+                    let beforeOpenDenied = false, laterPullDenied = false, unrelatedKept = false;
+                    await __pi_with_extension_async(__pi_test_secret, 'ext.b', async () => {
+                        fs.writeFileSync('/tmp/read-owner.txt', 'other');
+                        const unrelated = fs.openSync('/tmp/read-owner.txt', 'r');
+                        // The public descriptor field cannot redirect owned cleanup.
+                        active.fd = unrelated;
+                        try { await unopened[Symbol.asyncIterator]().next(); }
+                        catch (error) { beforeOpenDenied = String(error).includes('host read denied'); }
+                        try { await iterator.next(); }
+                        catch (error) { laterPullDenied = String(error).includes('host read denied'); }
+                        const bytes = Buffer.alloc(5);
+                        unrelatedKept = fs.readSync(unrelated, bytes, 0, 5, 0) === 5 && String(bytes) === 'other';
+                        fs.closeSync(unrelated);
+                    });
+                    let released = false;
+                    await __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {
+                        try { fs.closeSync(activeFd); }
+                        catch (error) { released = String(error).includes('EBADF'); }
+                    });
+                    globalThis.fsReadOwner = {
+                        done: true, first, beforeOpenDenied, laterPullDenied, unrelatedKept, released,
+                        unopenedBytes: unopened.bytesRead, unopenedClosed: unopened.closed,
+                        activeBytes: active.bytesRead, activeClosed: active.closed, activeFd: active.fd,
+                    };
+                })().catch(error => { globalThis.fsReadOwner.error = String(error); });
+            "#;
+            runtime
+                .eval(&privileged_test_script(&runtime, script))
+                .await
+                .expect("evaluate file stream owner handoff");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsReadOwner").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["first"], json!("own"));
+            assert_eq!(result["beforeOpenDenied"], json!(true));
+            assert_eq!(result["laterPullDenied"], json!(true));
+            assert_eq!(result["unrelatedKept"], json!(true));
+            assert_eq!(result["released"], json!(true));
+            assert_eq!(result["unopenedBytes"], json!(0));
+            assert_eq!(result["unopenedClosed"], json!(true));
+            assert_eq!(result["activeBytes"], json!(3));
+            assert_eq!(result["activeClosed"], json!(true));
+            assert_eq!(result["activeFd"], Value::Null);
         });
     }
 
