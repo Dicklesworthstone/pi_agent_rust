@@ -1192,8 +1192,8 @@ From:
 
 - Historical strict drop-in result: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the Git-pinned historical verdict blob above; it neither describes the live verdict file nor certifies `v0.3.0`)*
 - Unified evidence bundle, as regenerated `2026-11-21`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
-- Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed — the May 2026 `123/123` snapshot predates the expanded corpus *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
-- Extension health delta, as regenerated `2026-08-17`: `226` extensions tested at `95.6%` pass rate with `0` regressions vs the 2026-02-07 baseline *(from tests/ext_conformance/reports/health_delta/health_delta_report.json; historical snapshot)*
+- Extension must-pass gate, as regenerated `2026-11-24`: `207/208` must-pass extensions passed (`1` failure: `community/nicobailon-subagents` calling unsupported `fs.watch` per `bd-moo7a`); informational stretch set `17/19` passed — the May 2026 `123/123` snapshot predates the expanded corpus *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
+- Extension health delta, as regenerated `2026-11-24`: `226` extensions tested at `99.1%` pass rate (`224/226`) with `0` regressions vs the 2026-02-07 baseline *(from tests/ext_conformance/reports/health_delta/health_delta_report.json; historical snapshot)*
 - Extension journey coverage, as regenerated `2026-08-17`: `125/125` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json; historical snapshot)*
 - Historical stress-triage evidence is retained under `tests/perf/reports/`; it is not current enough to support a release-facing performance claim.
 
@@ -2832,10 +2832,10 @@ Current checked-in performance evidence state:
 - Regenerate the perf evidence bundle before adding release-facing speed,
   throughput, memory, or startup numbers to this README.
 
-- Full-suite gate at its latest regeneration (`2026-08-04`): `17/20` gates passed with `12/14` blocking gates. The `ext_must_pass` blocker is now substantive rather than staleness-only: the `2026-08-17` regeneration recorded `206/208` with two marckrenn-pi-sub family failures (tracked for remediation), alongside the practical-finish checkpoint *(from tests/full_suite_gate/full_suite_verdict.json; historical snapshot)*
+- Full-suite gate at its latest regeneration (`2026-08-04`): `17/20` gates passed with `12/14` blocking gates. The `ext_must_pass` blocker is substantive rather than staleness-only: the `2026-11-24` regeneration recorded `207/208` (both `marckrenn-pi-sub` entries now pass; the sole failure is `community/nicobailon-subagents` calling `fs.watch`, which intentionally fails with `ERR_FEATURE_UNAVAILABLE` per `bd-moo7a`), alongside the practical-finish checkpoint *(from tests/full_suite_gate/full_suite_verdict.json; historical snapshot)*
 - Unified evidence bundle, as regenerated `2026-11-21`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
 - Historical drop-in result: `22/22` certification gates passed, overall verdict `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the verdict blob stored at Git revision `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91`, not from the live verdict file)*
-- Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
+- Extension must-pass gate, as regenerated `2026-11-24`: `207/208` must-pass extensions passed (`1` failure); informational stretch set `17/19` passed *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
 - Context-intelligence closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, redaction posture, perf-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/context-intelligence-closeout-gate.json; historical snapshot)*
 - Progress SLO closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, source-boundary checks, stress-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/swarm-progress-slo-closeout-gate.json; historical snapshot)*
 - Runtime-intelligence closeout gate: `pass`, with child Beads mapped to compaction admission, tool-output artifacts, provider routing, scheduler fairness, frame-budget telemetry, cancellation cleanup, extension safety provenance, docs/evidence, source-boundary checks, pushed commits, staged UBS, and Beads ledger reconciliation *(from docs/evidence/runtime-intelligence-closeout-gate.json; historical snapshot)*
@@ -3800,7 +3800,7 @@ summary:
 
 | Gate | Status | Notes |
 |---|---|---|
-| `ext_must_pass` | fail | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); tracked for audited inclusion-list adjudication and refresh in `bd-reality-check-2026-11-19-bridge-yxf43.9` (superseding closed deferral `bd-marckrenn-pi-sub-triage-xd3gh`) |
+| `ext_must_pass` | fail | 207/208 must-pass extensions pass (both `marckrenn-pi-sub` entries now pass; sole failure is `community/nicobailon-subagents` calling `fs.watch` at load time, intentionally unsupported with `ERR_FEATURE_UNAVAILABLE` per `bd-moo7a`); tracked in `bd-reality-check-2026-11-19-bridge-yxf43.9` |
 | `evidence_bundle` | partial | 0 invalid sections; 18 present, 12 missing (all optional) |
 
 Thresholds, categories, methodology and failing data contracts for every
