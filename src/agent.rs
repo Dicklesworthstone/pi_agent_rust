@@ -8383,6 +8383,13 @@ impl Drop for AdvisorTurn {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // A host callback may have caused this unwind. Retire the held
+        // terminal without calling host code again: a second callback panic
+        // would abort the process instead of letting the caller recover. The
+        // tool-effects fence above must still run during unwinding.
+        if std::thread::panicking() {
+            return;
+        }
         if let Some(mut event) = held {
             // The native attempt already produced this terminal, but its
             // owning future was abandoned during review or publication.

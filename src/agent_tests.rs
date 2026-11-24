@@ -13733,6 +13733,114 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn advisor_callback_unwind_does_not_reenter_observers_or_lose_durable_work() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for panic_during_continuation in [false, true] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let (mut session, doer, advisor) = advisor_lifecycle_session(
+                    temp.path(),
+                    vec![
+                        Ok(advisor_lifecycle_tool_call()),
+                        Ok(advisor_lifecycle_reply(StopReason::Stop)),
+                        Ok(advisor_lifecycle_tool_call()),
+                    ],
+                    None,
+                );
+                *advisor.verdict.lock().expect("advisor script") =
+                    Some("BLOCKER: the completed change still needs a correction");
+                let saw_note = Arc::new(AtomicBool::new(false));
+                let note_observed = Arc::clone(&saw_note);
+                let terminals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let terminal_observed = Arc::clone(&terminals);
+                let outcome = std::panic::AssertUnwindSafe(session.run_text(
+                    "check the fixture".to_string(),
+                    move |event| {
+                        if matches!(event, AgentEvent::AgentEnd { .. }) {
+                            // Deliberately do not panic here: on the broken
+                            // path the assertion below reports re-entry
+                            // instead of aborting the entire test process.
+                            terminal_observed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if matches!(event, AgentEvent::AdvisorNote { .. }) {
+                            note_observed.store(true, Ordering::SeqCst);
+                            assert!(
+                                panic_during_continuation,
+                                "host callback failed while displaying advisor note"
+                            );
+                        }
+                        assert!(
+                            !(panic_during_continuation
+                                && note_observed.load(Ordering::SeqCst)
+                                && matches!(event, AgentEvent::ToolExecutionStart { .. })),
+                            "host callback failed during advisor continuation"
+                        );
+                    },
+                ))
+                .catch_unwind()
+                .await;
+                assert!(outcome.is_err(), "the host must receive its original panic");
+                assert!(saw_note.load(Ordering::SeqCst));
+                assert_eq!(
+                    terminals.load(Ordering::SeqCst),
+                    0,
+                    "unwinding must never invoke a potentially failing observer again"
+                );
+                assert_eq!(
+                    doer.calls.load(Ordering::SeqCst),
+                    2 + usize::from(panic_during_continuation)
+                );
+                assert_eq!(advisor.calls.load(Ordering::SeqCst), 1);
+                assert!(!session.extensions_turn_active.load(Ordering::SeqCst));
+                if panic_during_continuation {
+                    let error = session
+                        .ensure_provider_reentry_allowed()
+                        .expect_err("unwinding must still fence an admitted tool batch");
+                    assert!(error.is_session_persistence());
+                    assert!(error.to_string().contains("PI_NATIVE_TOOL_TURN_INTERRUPTED"));
+                } else {
+                    session
+                        .ensure_provider_reentry_allowed()
+                        .expect("the completed saved turn has no unresolved tool effects");
+                }
+
+                let path = {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    session
+                        .session
+                        .lock(cx.cx())
+                        .await
+                        .unwrap()
+                        .path
+                        .clone()
+                        .unwrap()
+                };
+                let reopened = Session::open(path.to_string_lossy().as_ref()).await.unwrap();
+                let durable = reopened.to_messages_for_current_path();
+                assert_eq!(
+                    durable
+                        .iter()
+                        .filter(|message| matches!(
+                            message,
+                            Message::ToolResult(result)
+                                if result.tool_call_id == "advisor-read" && !result.is_error
+                        ))
+                        .count(),
+                    1,
+                    "the completed real read remains saved exactly once"
+                );
+                assert!(durable.iter().any(|message| matches!(
+                    message,
+                    Message::Assistant(assistant)
+                        if assistant.stop_reason == StopReason::Stop
+                            && assistant_text_content(&assistant.content) == "durable doer completion"
+                )));
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn advisor_note_is_visible_before_next_turn_only_after_durable_publication() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
