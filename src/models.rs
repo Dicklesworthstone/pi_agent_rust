@@ -1910,29 +1910,35 @@ pub(crate) fn resolve_model_key_after_rate_limit(
     Ok(normalize_api_key_opt(resolved).or_else(|| normalize_api_key_opt(entry.api_key.clone())))
 }
 
-pub fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
-    let provider = entry.model.provider.as_str();
-    let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+/// These adapters resolve structured credentials at request time. Being admitted
+/// without a catalog key does not establish that their credential chain will succeed.
+pub(crate) fn model_uses_request_time_credentials(entry: &ModelEntry) -> bool {
+    matches!(
+        canonical_provider_id(&entry.model.provider),
+        Some("amazon-bedrock" | "sap-ai-core")
+    )
+}
 
-    // These native adapters resolve structured credentials at request time. Requiring a generic
-    // `api_key` here would either reject valid AWS/SAP credential chains before the provider can
-    // consume them or tempt callers to flatten one component into a bogus bearer token.
-    if matches!(canonical_provider, "amazon-bedrock" | "sap-ai-core") {
+pub fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
+    if model_uses_request_time_credentials(entry) {
         return false;
     }
 
     entry.auth_header
-        || crate::provider_metadata::provider_metadata(provider)
+        || crate::provider_metadata::provider_metadata(&entry.model.provider)
             .is_some_and(|meta| !meta.auth_env_keys.is_empty())
         || entry.oauth_config.is_some()
 }
 
+pub(crate) fn model_has_resolved_key(entry: &ModelEntry) -> bool {
+    entry
+        .api_key
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 pub(crate) fn model_entry_is_ready(entry: &ModelEntry) -> bool {
-    !model_requires_configured_credential(entry)
-        || entry
-            .api_key
-            .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
+    !model_requires_configured_credential(entry) || model_has_resolved_key(entry)
 }
 
 pub(crate) fn refresh_entries_stored_credentials(

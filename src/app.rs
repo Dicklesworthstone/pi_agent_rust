@@ -17,7 +17,8 @@ use crate::config::Config;
 use crate::model::{self, AssistantMessage, ContentBlock, TextContent};
 use crate::models::{
     ModelEntry, ModelRegistry, ModelRole, default_models_path, model_entry_is_ready,
-    model_requires_configured_credential,
+    model_has_resolved_key, model_requires_configured_credential,
+    model_uses_request_time_credentials,
 };
 use crate::provider::{CacheRetention, StreamOptions, ThinkingBudgets};
 use crate::provider_metadata::{
@@ -1739,7 +1740,19 @@ fn restore_model_from_session(
 }
 
 fn default_model_from_available(available: &[ModelEntry]) -> ModelEntry {
-    default_model_from_candidates(available)
+    let preferred = default_model_from_candidates(available);
+    if model_uses_request_time_credentials(&preferred) && !model_has_resolved_key(&preferred) {
+        // A request-time adapter is always admitted, even on a machine with no
+        // credentials for it. Prefer a detected key for automatic startup.
+        // Keep the existing order when only request-time or keyless routes exist.
+        let keyed = available
+            .iter()
+            .filter(|entry| model_has_resolved_key(entry));
+        if let Some(first) = keyed.clone().next() {
+            return ranked_default_model(keyed).unwrap_or(first).clone();
+        }
+    }
+    preferred
 }
 
 fn default_model_from_catalog(models: &[ModelEntry]) -> ModelEntry {
@@ -1813,11 +1826,8 @@ pub const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
     // Fall back to Anthropic API when configured.
     ("anthropic", "claude-sonnet-4-6"),
     ("anthropic", "claude-opus-4-5"),
-    // Bedrock is credential-exempt (structured AWS credentials resolve at
-    // request time, so it always counts as "available"). Rank it BELOW
-    // providers whose availability proves a configured key — otherwise a
-    // user holding only an Anthropic key gets defaulted onto Bedrock and
-    // fails at the first request (66fdd46f regression).
+    // With a resolved bearer key Bedrock participates at this rank. Automatic
+    // selection defers its request-time credential chain behind detected keys.
     ("amazon-bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"),
     ("azure-openai-responses", "gpt-5.2"),
     ("google", "gemini-2.5-pro"),
@@ -1888,14 +1898,21 @@ fn provider_default_model_id(provider: &str) -> Option<&'static str> {
 }
 
 fn default_model_from_candidates(candidates: &[ModelEntry]) -> ModelEntry {
+    ranked_default_model(candidates.iter())
+        .unwrap_or(&candidates[0])
+        .clone()
+}
+
+fn ranked_default_model<'a>(
+    candidates: impl Iterator<Item = &'a ModelEntry> + Clone,
+) -> Option<&'a ModelEntry> {
     for (provider, model_id) in PROVIDER_DEFAULT_MODELS {
         let matches = provider_default_matches(provider, model_id);
-        if let Some(found) = candidates.iter().find(|&m| matches(m)) {
-            return found.clone();
+        if let Some(found) = candidates.clone().find(|entry| matches(entry)) {
+            return Some(found);
         }
     }
-
-    candidates[0].clone()
+    None
 }
 
 pub fn resolve_api_key(
@@ -3020,6 +3037,44 @@ mod tests {
             parse_models_arg("gpt-4*, claude* ,,"),
             vec!["gpt-4*".to_string(), "claude*".to_string()]
         );
+    }
+
+    #[test]
+    fn startup_prefers_resolved_credentials_over_unverified_request_time_auth() {
+        let mut bedrock = test_model_entry(
+            "us.anthropic.claude-opus-4-20250514-v1:0",
+            "amazon-bedrock",
+            true,
+        );
+        bedrock.api_key = None;
+        let custom = test_model_entry("custom-chat", "my-provider", false);
+        let google = test_model_entry("gemini-2.5-pro", "google", true);
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+        let dir = tempdir().expect("tempdir");
+        for (others, expected_provider) in [
+            (vec![custom.clone(), google.clone()], "google"),
+            (vec![custom], "my-provider"),
+            (vec![], "amazon-bedrock"),
+        ] {
+            let entries = std::iter::once(bedrock.clone()).chain(others).collect();
+            let registry = registry_with_entries(entries);
+            let selected =
+                select_model_and_thinking(&cli, &config, &session, &registry, &[], dir.path())
+                    .expect("automatic startup");
+            assert_eq!(selected.model_entry.model.provider, expected_provider);
+
+            let pinned = cli::Cli::parse_from(["pi", "--provider", "amazon-bedrock"]);
+            let selected =
+                select_model_and_thinking(&pinned, &config, &session, &registry, &[], dir.path())
+                    .expect("explicit Bedrock can use its AWS chain");
+            assert_eq!(selected.model_entry.model.provider, "amazon-bedrock");
+        }
+
+        bedrock.api_key = Some("bedrock-bearer".to_owned());
+        let selected = default_model_from_available(&[google, bedrock]);
+        assert_eq!(selected.model.provider, "amazon-bedrock");
     }
 
     #[test]
