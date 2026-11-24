@@ -535,46 +535,57 @@ impl<'a> RequestBuilder<'a> {
 
             let send_fut = send_parts(client, method, &url, &headers, &body);
             let resolved_timeout = resolve_timeout(timeout, &url);
-
-            let (status, response_headers, stream, timeout_info) = if let Some(duration) =
-                resolved_timeout
-            {
-                use asupersync::time::{sleep, wall_now};
-                use futures::future::{Either, FutureExt, select};
-
-                let asupersync_now = asupersync::Cx::current()
-                    .and_then(|cx| cx.timer_driver())
-                    .map_or_else(wall_now, |timer| timer.now());
-
-                let sleep_fut = sleep(asupersync_now, duration).fuse();
-                let send_fut = send_fut.fuse();
-                futures::pin_mut!(sleep_fut, send_fut);
-
-                let (status, response_headers, stream) = match select(send_fut, sleep_fut).await {
-                    Either::Left((res, _)) => res?,
-                    Either::Right(_) => {
-                        return Err(Error::api(timeout_error_message(&url, duration)));
-                    }
-                };
-                (
-                    status,
-                    response_headers,
-                    stream,
-                    Some((asupersync_now, duration)),
-                )
-            } else {
-                let (status, response_headers, stream) = send_fut.await?;
-                (status, response_headers, stream, None)
-            };
-
-            Ok(Response {
-                status,
-                headers: response_headers,
-                stream,
-                timeout_info,
-            })
+            response_with_timeout(send_fut, &url, resolved_timeout).await
         })
     }
+}
+
+/// Apply the request-header bound, then start a fresh body-idle interval.
+/// Native and extension transports use the same handoff.
+async fn response_with_timeout<F>(
+    send_fut: F,
+    url: &str,
+    resolved_timeout: Option<std::time::Duration>,
+) -> Result<Response>
+where
+    F: std::future::Future<Output = Result<TransportResponse>> + Send,
+{
+    let (status, response_headers, stream) = if let Some(duration) = resolved_timeout {
+        use asupersync::time::{sleep, wall_now};
+        use futures::future::{Either, FutureExt, select};
+
+        let request_started = asupersync::Cx::current()
+            .and_then(|cx| cx.timer_driver())
+            .map_or_else(wall_now, |timer| timer.now());
+        let sleep_fut = sleep(request_started, duration).fuse();
+        let send_fut = send_fut.fuse();
+        futures::pin_mut!(sleep_fut, send_fut);
+
+        match select(send_fut, sleep_fut).await {
+            Either::Left((res, _)) => res?,
+            Either::Right(_) => {
+                return Err(Error::api(timeout_error_message(url, duration)));
+            }
+        }
+    } else {
+        send_fut.await?
+    };
+    let timeout_info = resolved_timeout.map(|duration| {
+        // Connect/write/header latency belongs to the completed phase.
+        // Reusing request_started here would prematurely time out a live
+        // body after a slow but successful response head.
+        let body_started = asupersync::Cx::current()
+            .and_then(|cx| cx.timer_driver())
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        (body_started, duration)
+    });
+
+    Ok(Response {
+        status,
+        headers: response_headers,
+        stream,
+        timeout_info,
+    })
 }
 
 /// Like `write_all`, but retries on `Ok(0)` with exponential backoff instead
@@ -3397,6 +3408,123 @@ mod tests {
         asupersync::Cx::current()
             .and_then(|cx| cx.timer_driver())
             .map_or_else(asupersync::time::wall_now, |timer| timer.now())
+    }
+
+    fn run_http_phase_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
+        use asupersync::lab::{LabConfig, LabRuntime};
+        use asupersync::types::Budget;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut lab = LabRuntime::new(LabConfig::new(0x4854_5450).max_steps(10_000));
+        let region = lab.state.create_root_region(Budget::INFINITE);
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_completed = Arc::clone(&completed);
+        let (task_id, _handle) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                future.await;
+                task_completed.store(true, Ordering::SeqCst);
+            })
+            .expect("create HTTP timing task");
+        lab.scheduler.lock().schedule(task_id, 0);
+        let report = lab.run_with_auto_advance();
+        // A panic captured by the lab or a stranded timer must fail the test,
+        // rather than quietly returning without executing its assertions.
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "HTTP timing task did not finish: {report:?}"
+        );
+        assert!(lab.is_quiescent());
+    }
+
+    #[test]
+    fn first_body_idle_interval_starts_after_successful_headers() {
+        run_http_phase_test(async {
+            let body: ByteStream = Box::pin(futures::stream::once(async {
+                asupersync::time::sleep(now(), std::time::Duration::from_secs(8)).await;
+                Ok(b"hello".to_vec())
+            }));
+            let head = async {
+                asupersync::time::sleep(now(), std::time::Duration::from_secs(8)).await;
+                Ok((200, Vec::new(), body))
+            };
+            let response = response_with_timeout(
+                head,
+                "https://provider.example/stream",
+                Some(std::time::Duration::from_secs(10)),
+            )
+            .await
+            .expect("headers arrived within their budget");
+            assert_eq!(now(), asupersync::Time::from_millis(8_000));
+            assert_eq!(response.status(), 200);
+            // Both phases take eight seconds. Starting body idle time at the
+            // request start incorrectly fails at t=10 instead of reading t=16.
+            assert_eq!(response.text_limited(5).await.expect("live body"), "hello");
+            assert_eq!(now(), asupersync::Time::from_millis(16_000));
+        });
+    }
+
+    #[test]
+    fn header_stall_keeps_the_original_request_deadline() {
+        run_http_phase_test(async {
+            let error = response_with_timeout(
+                futures::future::pending(),
+                "https://provider.example/stream",
+                Some(std::time::Duration::from_secs(10)),
+            )
+            .await
+            .err()
+            .expect("stalled headers time out");
+            assert!(error.to_string().contains("Request timed out after 10s"));
+            assert_eq!(now(), asupersync::Time::from_millis(10_000));
+        });
+    }
+
+    #[test]
+    fn body_stall_is_bounded_from_successful_headers() {
+        run_http_phase_test(async {
+            let body: ByteStream = Box::pin(futures::stream::pending());
+            let head = async {
+                asupersync::time::sleep(now(), std::time::Duration::from_secs(8)).await;
+                Ok((200, Vec::new(), body))
+            };
+            let response = response_with_timeout(
+                head,
+                "https://provider.example/stream",
+                Some(std::time::Duration::from_secs(10)),
+            )
+            .await
+            .expect("headers");
+            let mut stream = response.bytes_stream();
+            let error = stream
+                .next()
+                .await
+                .expect("terminal item")
+                .expect_err("stalled body times out");
+            assert_eq!(error.to_string(), "Request timed out reading body stream");
+            assert_eq!(now(), asupersync::Time::from_millis(18_000));
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn disabled_timeout_preserves_unbounded_header_and_body_phases() {
+        run_http_phase_test(async {
+            let body: ByteStream = Box::pin(futures::stream::once(async {
+                asupersync::time::sleep(now(), std::time::Duration::from_secs(12)).await;
+                Ok(b"hello".to_vec())
+            }));
+            let head = async {
+                asupersync::time::sleep(now(), std::time::Duration::from_secs(12)).await;
+                Ok((200, Vec::new(), body))
+            };
+            let response = response_with_timeout(head, "https://provider.example/stream", None)
+                .await
+                .expect("unbounded headers");
+            assert!(response.timeout_info.is_none());
+            assert_eq!(response.text().await.expect("unbounded body"), "hello");
+            assert_eq!(now(), asupersync::Time::from_millis(24_000));
+        });
     }
 
     #[derive(Default)]
