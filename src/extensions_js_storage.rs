@@ -993,10 +993,17 @@ fn mutate(
             if bytes.len() > MAX_STORAGE_WRITE_BYTES {
                 return Err(denied("persistent storage write exceeds 64 MiB"));
             }
-            let flag = args
-                .get("flag")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(if op == "append" { "a" } else { "w" });
+            let flag = match args.get("flag") {
+                None if op == "append" => "a",
+                None => "w",
+                Some(serde_json::Value::String(flag)) => flag.as_str(),
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "persistent write flag must be a string",
+                    ));
+                }
+            };
             if !matches!(flag, "w" | "wx" | "a" | "ax") {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -1454,6 +1461,22 @@ mod tests {
             open_file(&parent, false, true).is_err(),
             "exclusive create must fail"
         );
+    }
+
+    #[test]
+    fn malformed_persistent_flags_preserve_existing_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::extensions::safe_canonicalize(temp.path());
+        let file = root.join("session.json");
+        std::fs::write(&file, b"retained history").unwrap();
+        for op in ["write", "append"] {
+            for flag in [serde_json::json!(1), serde_json::Value::Null] {
+                let args = serde_json::json!({ "data": BASE64.encode("update"), "flag": flag });
+                let error = mutate(op, &file, &args, None).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(std::fs::read(&file).unwrap(), b"retained history");
+            }
+        }
     }
 
     #[cfg(unix)]
