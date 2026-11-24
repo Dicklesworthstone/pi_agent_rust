@@ -1242,7 +1242,7 @@ mod tests {
             let probe = Arc::new(AdmissionProbe::default());
             let gate = Arc::new(super::super::tests::SpawnHookGate::default());
             let hook_gate = Arc::clone(&gate);
-            let _hooks = super::super::install_spawn_background_test_hooks(
+            let _hooks = super::super::tests::install_spawn_background_test_hooks(
                 super::super::SpawnBackgroundTestHooks {
                     owner_session_id: Some(session.clone()),
                     before_native_registry_publication: Some(Arc::new(move || {
@@ -1369,7 +1369,7 @@ mod tests {
         let probe = Arc::new(AdmissionProbe::default());
         let gate = Arc::new(super::super::tests::SpawnHookGate::default());
         let hook_gate = Arc::clone(&gate);
-        let _hooks = super::super::install_spawn_background_test_hooks(
+        let _hooks = super::super::tests::install_spawn_background_test_hooks(
             super::super::SpawnBackgroundTestHooks {
                 owner_session_id: Some(session.clone()),
                 after_registry_publication: Some(Arc::new(move |_| hook_gate.enter_and_wait())),
@@ -1477,10 +1477,7 @@ mod tests {
                 assert!(sender.send_blocking(launch).is_ok());
                 drop(receiver);
             } else {
-                let error = launch
-                    .publish()
-                    .err()
-                    .expect("stale handoff must be refused");
+                let error = launch.publish().expect_err("stale handoff must be refused");
                 let expected = match action {
                     "owner" => "PI_JOBS_TASK_CANCELLED",
                     "deadline" => "PI_JOBS_TASK_TIMEOUT",

@@ -2503,7 +2503,8 @@ done
                 let session = session.clone();
                 Box::pin(async move {
                     if pending_ack {
-                        if let Some(entered) = entered.lock().expect("ack gate").take() {
+                        let ack = entered.lock().expect("ack gate").take();
+                        if let Some(entered) = ack {
                             let _ = entered.send(());
                         }
                         futures::future::pending::<Option<String>>().await
