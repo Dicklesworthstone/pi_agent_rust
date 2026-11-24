@@ -8,7 +8,7 @@ single-shot mode against a fixture prompt, captures stdout/stderr, and
 records per-provider pass / skip-with-reason / fail with measured
 latency.
 
-Skips providers whose env-var credentials are not set. Documents
+Skips providers without a detected credential source. Documents
 the skip reason in the runpack so reviewers know what was and was
 not exercised.
 
@@ -33,102 +33,193 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve()
 ROOT = SCRIPT.parents[2]  # scripts/perf/ → scripts/ → <repo>
 
-# (provider_id, env_var_for_creds, fixture_prompt)
-PROVIDERS = [
-    ("openai-codex", "OPENAI_CODEX_AUTH_FILE", "What is 2+2? Answer in one word."),
-    ("anthropic", "ANTHROPIC_API_KEY", "What is 2+2? Answer in one word."),
-    ("openai", "OPENAI_API_KEY", "What is 2+2? Answer in one word."),
-    ("openai_responses", "OPENAI_API_KEY", "What is 2+2? Answer in one word."),
-    ("gemini", "GOOGLE_API_KEY", "What is 2+2? Answer in one word."),
-    ("cohere", "COHERE_API_KEY", "What is 2+2? Answer in one word."),
-    ("azure", "AZURE_OPENAI_API_KEY", "What is 2+2? Answer in one word."),
-    ("bedrock", "AWS_ACCESS_KEY_ID", "What is 2+2? Answer in one word."),
-    ("vertex", "GOOGLE_APPLICATION_CREDENTIALS", "What is 2+2? Answer in one word."),
-    ("copilot", "GITHUB_COPILOT_TOKEN", "What is 2+2? Answer in one word."),
-    ("gitlab", "GITLAB_TOKEN", "What is 2+2? Answer in one word."),
-    ("cursor", "CURSOR_API_KEY", "What is 2+2? Answer in one word."),
-]
-
+# Runpack IDs stay stable. The command always uses the canonical provider ID.
+PROVIDERS = {
+    "openai-codex": "openai-codex",
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "gemini": "google",
+    "cohere": "cohere",
+    "azure": "azure-openai",
+    "bedrock": "amazon-bedrock",
+    "vertex": "google-vertex",
+    "copilot": "github-copilot",
+    "gitlab": "gitlab",
+    "cursor": "cursor",
+}
 
 HTTP_ERROR_RE = re.compile(r"\bHTTP\s+([45]\d\d)\b")
 
 
-def has_credentials(prov_id: str, env_var: str) -> tuple[bool, str]:
-    """Return whether credentials appear available for `prov_id` without printing secrets."""
-    if os.environ.get(env_var):
-        return True, f"env:{env_var}"
-    if prov_id == "openai-codex":
-        for candidate in (
-            Path.home() / ".codex" / "auth.json",
-            Path.home() / ".pi" / "agent" / "auth.json",
-        ):
-            if candidate.is_file():
-                try:
-                    data = json.loads(candidate.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if isinstance(data, dict) and (
-                    bool(data.get("tokens"))
-                    or bool(data.get("openai-codex"))
-                    or bool(data.get("OPENAI_API_KEY"))
-                ):
-                    return True, f"file:{candidate.name}"
-    return False, f"{env_var} not set"
+def provider_inventory(binary: Path, timeout: float) -> tuple[dict, set[str]]:
+    """Ask the same pi binary which providers and credential-backed models it knows."""
+    def query(*args: str) -> str:
+        return subprocess.run(
+            [str(binary), *args], capture_output=True, text=True, check=True, timeout=timeout
+        ).stdout
+
+    rows = json.loads(query("--list-providers", "--mode", "json"))["providers"]
+    metadata = {row["id"]: row for row in rows}
+    missing = set(PROVIDERS.values()) - metadata.keys()
+    if missing:
+        raise ValueError("unregistered provider selectors: " + ", ".join(sorted(missing)))
+    # --list-models uses the registry's actual credential resolver, including
+    # stored OAuth, external logins, configured keys and custom models.json.
+    listed = {parts[0] for line in query("--list-models").splitlines() if (parts := line.split())}
+    return metadata, listed
 
 
-def parse_default_probe_response(stdout: str, stderr: str, returncode: int) -> dict[str, object]:
-    """Extract selected model, HTTP status, and error code from `--mode json` output."""
-    selected_model: str | None = None
-    error_code: str | None = None
-    http_status: int | None = None
-
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
+def bedrock_credentials_configured(names: set[str]) -> bool:
+    # Bedrock is admitted by --list-models even without any AWS credentials.
+    # Region/session token alone does not constitute a usable credential source.
+    if any(os.environ.get(key, "").strip() for key in (
+        "AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE", "AWS_DEFAULT_PROFILE"
+    )):
+        return True
+    if all(os.environ.get(key, "").strip() for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")):
+        return True
+    agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
+    try:
+        auth = json.loads((agent_dir / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(auth, dict):
+        return False
+    for provider, credential in auth.items():
+        if provider.lower() not in names or not isinstance(credential, dict):
             continue
+        kind = credential.get("type")
+        if kind == "aws_credentials":
+            fields = ("access_key_id", "secret_access_key")
+        elif kind == "bearer_token":
+            fields = ("token",)
+        elif kind == "api_key":
+            fields = ("key",)
+        else:
+            continue
+        if all(isinstance(credential.get(field), str) and credential[field].strip() for field in fields):
+            return True
+    return False
+
+
+def has_credentials(metadata: dict, listed: set[str], names: set[str]) -> bool:
+    if metadata["id"] == "amazon-bedrock":
+        return bedrock_credentials_configured(names)
+    return bool(listed & names) or any(
+        os.environ.get(key, "").strip() for key in metadata["env_keys"]
+    )
+
+
+def parse_default_probe_response(
+    stdout: str, stderr: str, returncode: int, *, check_defaults: bool = True,
+    provider_names: set[str] | None = None,
+) -> dict[str, object]:
+    """Interpret the print stream without treating progress as a completed provider call."""
+    selected_model: str | None = None
+    failure = "missing_assistant_completion" if check_defaults else None
+    diagnostic = stderr if check_defaults else f"{stdout}\n{stderr}"
+    failed_over = False
+
+    json_lines = stdout.splitlines() if check_defaults else ()
+    for line in json_lines:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
         if not isinstance(event, dict):
             continue
+        kind = event.get("type")
+        if kind == "failover_start":
+            # A successful fallback does not validate the default destination.
+            if not failed_over and isinstance(event.get("fromModel"), str):
+                selected_model = event["fromModel"]
+            failed_over = True
+        if failed_over:
+            continue
+        if kind == "error":
+            code = event.get("code")
+            failure = code if isinstance(code, str) and code else "provider_error"
+            diagnostic = f"{stderr}\n{event.get('message', '')}"
+            continue
         msg = event.get("message")
-        if isinstance(msg, dict) and isinstance(msg.get("model"), str):
-            selected_model = msg["model"]
-        if isinstance(event.get("model"), str):
-            selected_model = event["model"]
-        if event.get("type") == "error":
-            if isinstance(event.get("code"), str):
-                error_code = event["code"]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        if kind not in ("message_start", "message_end"):
+            continue
+        model = msg.get("model")
+        selected_model = model if isinstance(model, str) and model.strip() else None
+        diagnostic = stderr
+        failure = "missing_assistant_completion"
+        if kind == "message_end":
+            reason = msg.get("stopReason")
+            content = msg.get("content")
+            if msg.get("errorMessage") or reason in ("error", "aborted", "refusal"):
+                failure = reason if reason in ("error", "aborted", "refusal") else "provider_error"
+                diagnostic = f"{stderr}\n{msg.get('errorMessage', '')}"
+            elif provider_names is not None and str(msg.get("provider", "")).lower() not in provider_names:
+                failure = "unexpected_provider"
+            elif selected_model and reason in ("stop", "length") and isinstance(content, list):
+                if any(
+                    isinstance(block, dict) and block.get("type") == "text"
+                    and isinstance(block.get("text"), str) and block["text"].strip()
+                    for block in content
+                ):
+                    failure = None
 
-    combined = f"{stdout}\n{stderr}"
-    if returncode == 0:
+    if failed_over:
+        failure = "default_model_failover"
+    if returncode != 0 and failure in (None, "missing_assistant_completion"):
+        failure = "process_failed"
+    http_status: int | None = None
+    if failure is None:
         http_status = 200
     else:
-        if "model_not_found" in combined:
-            error_code = "model_not_found"
-        match = HTTP_ERROR_RE.search(combined)
+        if "model_not_found" in diagnostic:
+            failure = "model_not_found"
+        match = HTTP_ERROR_RE.search(diagnostic)
         if match:
             http_status = int(match.group(1))
 
     return {
         "selected_model": selected_model,
         "http_status": http_status,
-        "error_code": error_code,
+        "error_code": failure,
     }
 
 
 def self_test() -> int:
-    # 1. parse_default_probe_response must extract 4xx/5xx on failure and never
-    #    misclassify assistant prose mentioning "HTTP 400" on exit 0.
-    ok_resp = parse_default_probe_response(
-        json.dumps({"model": "gpt-5.6-sol", "text": "HTTP 400 means bad request"}) + "\n",
-        "",
-        0,
-    )
+    assistant = {
+        "role": "assistant", "model": "gpt-5.6-sol", "stopReason": "stop",
+        "content": [{"type": "text", "text": "HTTP 400 means bad request"}],
+    }
+    end = json.dumps({"type": "message_end", "message": assistant})
+    start = json.dumps({"type": "message_start", "message": assistant})
+    ok_resp = parse_default_probe_response(start + "\n" + end, "", 0)
     assert ok_resp["http_status"] == 200, ok_resp
     assert ok_resp["selected_model"] == "gpt-5.6-sol", ok_resp
     assert ok_resp["error_code"] is None, ok_resp
+
+    for incomplete in (
+        "progress only", start, end + "\n" + start,
+        json.dumps({"type": "message_end", "message": dict(assistant, role="user")}),
+        json.dumps({"type": "message_end", "message": dict(assistant, content=[])}),
+        json.dumps({"type": "message_end", "message": dict(assistant, model="")}),
+    ):
+        parsed = parse_default_probe_response(incomplete, "", 0)
+        assert parsed["error_code"] == "missing_assistant_completion", parsed
+        assert parsed["http_status"] is None, parsed
+
+    errored = dict(assistant, stopReason="error", errorMessage="HTTP 400: model_not_found")
+    error_end = json.dumps({"type": "message_end", "message": errored})
+    parsed = parse_default_probe_response(error_end, "", 0)
+    assert (parsed["http_status"], parsed["error_code"]) == (400, "model_not_found"), parsed
+    assert parse_default_probe_response(error_end + "\n" + end, "", 0)["error_code"] is None
+    swap = json.dumps({"type": "failover_start", "fromModel": "failed-default"})
+    parsed = parse_default_probe_response(swap + "\n" + end, "", 0)
+    assert parsed["error_code"] == "default_model_failover", parsed
+    assert parsed["selected_model"] == "failed-default", parsed
+    assert parse_default_probe_response("four", "", 0, check_defaults=False)["error_code"] is None
+    assert parse_default_probe_response(end, "", 1)["error_code"] == "process_failed"
 
     err400 = parse_default_probe_response(
         "", "HTTP 400 Bad Request: model_not_found", 1
@@ -139,31 +230,35 @@ def self_test() -> int:
     err503 = parse_default_probe_response("", "HTTP 503 Service Unavailable", 1)
     assert err503["http_status"] == 503, err503
 
-    # 2. has_credentials must NOT treat null/empty auth.json keys as credentials.
+    wrong_provider = dict(assistant, provider="openai")
+    record = json.dumps({"type": "message_end", "message": wrong_provider})
+    assert parse_default_probe_response(record, "", 0, provider_names={"google", "gemini"})["error_code"] == "unexpected_provider"
+    assert parse_default_probe_response(record, "", 0, provider_names={"openai"})["error_code"] is None
+
+    # Model admission includes OAuth-only providers. AWS needs its own check:
+    # the catalog admits Bedrock even when the only AWS variable is a region.
+    from unittest.mock import patch
+
     with tempfile.TemporaryDirectory(prefix="pi-live-probe-test-") as tmp:
-        fake_home = Path(tmp)
-        codex_dir = fake_home / ".codex"
-        codex_dir.mkdir(parents=True)
-        (codex_dir / "auth.json").write_text(
-            json.dumps({"OPENAI_API_KEY": None, "tokens": None}), encoding="utf-8"
-        )
-        old_home = os.environ.get("HOME")
-        old_env = os.environ.pop("OPENAI_CODEX_AUTH_FILE", None)
-        try:
-            os.environ["HOME"] = str(fake_home)
-            present, _ = has_credentials("openai-codex", "OPENAI_CODEX_AUTH_FILE")
-            assert not present, "null OPENAI_API_KEY/tokens must not count as credentials"
-            (codex_dir / "auth.json").write_text(
-                json.dumps({"OPENAI_API_KEY": None, "tokens": {"access_token": "ok"}}),
-                encoding="utf-8",
-            )
-            present2, _ = has_credentials("openai-codex", "OPENAI_CODEX_AUTH_FILE")
-            assert present2, "non-empty tokens dict must count as credentials"
-        finally:
-            if old_home is not None:
-                os.environ["HOME"] = old_home
-            if old_env is not None:
-                os.environ["OPENAI_CODEX_AUTH_FILE"] = old_env
+        with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": tmp, "AWS_REGION": "us-west-2"}, clear=True):
+            names = {"amazon-bedrock", "bedrock"}
+            bedrock = {"id": "amazon-bedrock", "env_keys": ["AWS_REGION"]}
+            assert not has_credentials(bedrock, names, names)
+            os.environ["AWS_ACCESS_KEY_ID"] = "fixture"
+            assert not has_credentials(bedrock, names, names)
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "fixture"
+            assert has_credentials(bedrock, set(), names)
+            del os.environ["AWS_SECRET_ACCESS_KEY"]
+            Path(tmp, "auth.json").write_text(json.dumps({
+                "bedrock": {"type": "bearer_token", "token": "fixture"}
+            }))
+            assert has_credentials(bedrock, set(), names)
+            codex = {"id": "openai-codex", "env_keys": []}
+            assert not has_credentials(codex, {"openai"}, {"openai-codex"})
+            assert has_credentials(codex, {"openai-codex"}, {"openai-codex"})
+            copilot = {"id": "github-copilot", "env_keys": ["GITHUB_TOKEN"]}
+            os.environ["GITHUB_TOKEN"] = "fixture"
+            assert has_credentials(copilot, set(), {"github-copilot"})
 
     print("SELF-TEST PASS")
     return 0
@@ -209,7 +304,7 @@ def main() -> int:
             "verdict": "binary_missing",
             "providers": [
                 {"id": p, "status": "skipped_no_binary", "reason": "target/release/pi not built"}
-                for p, _, _ in PROVIDERS
+                for p in PROVIDERS
             ],
         }
         with open(args.out, "w") as f:
@@ -224,12 +319,19 @@ def main() -> int:
     fail_count = 0
     skip_count = 0
 
-    for prov_id, env_var, _ in PROVIDERS:
-        creds_ok, creds_reason = has_credentials(prov_id, env_var)
-        if not creds_ok:
+    try:
+        catalog, listed = provider_inventory(args.binary, args.timeout)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        print(f"FAIL: cannot enumerate providers with {args.binary}: {error}", file=sys.stderr)
+        return 1
+
+    for prov_id, selector in PROVIDERS.items():
+        metadata = catalog[selector]
+        names = {selector, *metadata["aliases"]}
+        if not has_credentials(metadata, listed, names):
             results.append({
                 "id": prov_id, "status": "skipped_no_credentials",
-                "reason": creds_reason,
+                "reason": f"no configured credentials detected for {selector}",
             })
             if args.check_defaults:
                 default_probe_rows.append({
@@ -244,20 +346,28 @@ def main() -> int:
             skip_count += 1
             continue
 
-        cmd = [str(args.binary), "--no-session", "--provider", prov_id, "--print"]
+        cmd = [str(args.binary), "--no-session", "--provider", selector, "--print"]
         if args.check_defaults:
             cmd.extend(["--mode", "json"])
         cmd.append(args.prompt)
         env = os.environ.copy()
-        env["PI_PROVIDER"] = prov_id
+        env["PI_PROVIDER"] = selector
+        if args.check_defaults:
+            # Clap treats PI_MODEL exactly like an explicit --model override.
+            env.pop("PI_MODEL", None)
         t0 = time.monotonic()
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=args.timeout, env=env,
             )
             elapsed = round((time.monotonic() - t0) * 1000, 1)
+            parsed = parse_default_probe_response(
+                proc.stdout, proc.stderr, proc.returncode,
+                check_defaults=args.check_defaults, provider_names=names,
+            )
             ok = proc.returncode == 0 and bool(proc.stdout.strip())
-            parsed = parse_default_probe_response(proc.stdout, proc.stderr, proc.returncode)
+            if args.check_defaults:
+                ok = ok and parsed["error_code"] is None
             results.append({
                 "id": prov_id, "status": "pass" if ok else "fail",
                 "elapsed_ms": elapsed,
