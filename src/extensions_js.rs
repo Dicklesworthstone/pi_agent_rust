@@ -17856,31 +17856,103 @@ class Readable extends Stream {
     if (!nodeReadable || typeof nodeReadable.on !== "function") {
       throw new Error("Readable.toWeb expects a Node Readable stream");
     }
+    let controller;
+    let settled = false;
+    let cancellation = null;
+    let resolveCancellation;
+    let rejectCancellation;
+    const stopFlow = () => {
+      nodeReadable.pause?.();
+      nodeReadable.removeListener?.("data", onData);
+      nodeReadable.removeListener?.("end", onEnd);
+    };
+    const cleanup = () => {
+      stopFlow();
+      nodeReadable.removeListener?.("error", onError);
+      nodeReadable.removeListener?.("close", onClose);
+    };
+    const prematureClose = () => __streamError(
+      "ERR_STREAM_PREMATURE_CLOSE", "Node readable closed before the end of the stream");
+    const onData = (chunk) => {
+      // The Web bridge closes its controller before invoking cancel(). A
+      // queued Node flow task must not enqueue into that closed controller.
+      if (settled || controller.desiredSize <= 0) {
+        nodeReadable.pause?.();
+        return;
+      }
+      controller.enqueue(chunk);
+      if (controller.desiredSize <= 0) nodeReadable.pause?.();
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      controller.close();
+    };
+    const onError = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      controller.error(__streamToError(error));
+    };
+    const onClose = () => {
+      cleanup();
+      if (!settled) {
+        settled = true;
+        controller.error(nodeReadable.errored || prematureClose());
+      }
+      const resolve = resolveCancellation;
+      resolveCancellation = rejectCancellation = undefined;
+      if (resolve) resolve();
+    };
     return new ReadableStream({
-      start(controller) {
-        const onData = (chunk) => controller.enqueue(chunk);
-        const onEnd = () => {
-          cleanup();
-          controller.close();
-        };
-        const onError = (err) => {
-          cleanup();
-          controller.error(__streamToError(err));
-        };
-        const cleanup = () => {
-          nodeReadable.removeListener?.("data", onData);
-          nodeReadable.removeListener?.("end", onEnd);
-          nodeReadable.removeListener?.("error", onError);
-        };
+      start(webController) {
+        controller = webController;
+        // Adding a data listener normally starts flowing. Preserve demand
+        // ownership until the Web reader pulls, then pause at its queue bound.
+        nodeReadable.pause?.();
         nodeReadable.on("data", onData);
         nodeReadable.on("end", onEnd);
         nodeReadable.on("error", onError);
-        if (typeof nodeReadable.resume === "function") nodeReadable.resume();
+        nodeReadable.on("close", onClose);
+        if (nodeReadable.readableEnded && !nodeReadable.errored) {
+          onEnd();
+        } else if (nodeReadable.destroyed || nodeReadable.closed) {
+          settled = true;
+          stopFlow();
+          controller.error(nodeReadable.errored || prematureClose());
+          // A pending destroy hook still owns its eventual error/close pair.
+          if (nodeReadable.closed) cleanup();
+        } else if (nodeReadable.errored) {
+          onError(nodeReadable.errored);
+        }
+      },
+      pull() {
+        if (!settled) nodeReadable.resume?.();
       },
       cancel(reason) {
-        if (typeof nodeReadable.destroy === "function") {
-          nodeReadable.destroy(__streamToError(reason ?? "stream cancelled"));
+        if (cancellation) return cancellation;
+        settled = true;
+        stopFlow();
+        if (nodeReadable.closed || typeof nodeReadable.destroy !== "function") {
+          cleanup();
+          return;
         }
+        cancellation = new Promise((resolve, reject) => {
+          resolveCancellation = resolve;
+          rejectCancellation = reject;
+        });
+        // Keep our error listener until close: asynchronous destroy hooks can
+        // report the cancellation reason after the Web side has settled.
+        try {
+          nodeReadable.destroy(__streamToError(reason ?? "stream cancelled"));
+          if (nodeReadable.closed) onClose();
+        } catch (error) {
+          cleanup();
+          if (rejectCancellation) rejectCancellation(error);
+          resolveCancellation = rejectCancellation = undefined;
+        }
+        return cancellation;
       },
     });
   }
@@ -31500,8 +31572,8 @@ mod tests {
         // Only this deliberately changed module is re-pinned.
         (
             "node:stream",
-            48_141,
-            "8863165a8c62c2be5beddbce72dbb1398aff74e23df99c3807d6017d8727cf8e",
+            50_718,
+            "068c9bb73c68c4febc53dfcd10933d92408991dfb03aaf7f5348ddc93f8d19de",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -47824,6 +47896,250 @@ globalThis.fsWriteStorage = { done: false };
             assert_eq!(result["totalBytes"], json!(65_536));
             assert_eq!(result["size"], json!(65_536));
             assert_eq!(result["allBytes"], json!(true));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_node_readable_to_web_bounds_idle_and_slow_consumers() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.toWebDemand = { done: false };
+                    (async () => {
+                        const { Readable } = await import("node:stream");
+                        const flush = async () => {
+                            for (let index = 0; index < 32; index++) await Promise.resolve();
+                        };
+                        const detached = stream => ["data", "end", "error", "close"]
+                            .every(event => stream.listenerCount(event) === 0);
+                        let produced = 0;
+                        let returned = 0;
+                        const source = Readable.from((function* () {
+                            try {
+                                for (let index = 0; index < 256; index++) {
+                                    produced++;
+                                    yield Uint8Array.of(index);
+                                }
+                            } finally {
+                                returned++;
+                            }
+                        })(), { objectMode: false, highWaterMark: 2 });
+                        const web = Readable.toWeb(source);
+                        await flush();
+                        const idleBounded = produced <= 1;
+                        const reader = web.getReader();
+                        const observed = [];
+                        let slowBounded = true;
+                        for (let index = 0; index < 8; index++) {
+                            const result = await reader.read();
+                            observed.push(result.done ? -1 : result.value[0]);
+                            await flush();
+                            slowBounded = slowBounded && produced <= observed.length + 1;
+                        }
+                        const beforeCancel = produced;
+                        await reader.cancel(new Error("reader finished early"));
+                        await flush();
+                        const cancelled = source.destroyed && source.closed && returned === 1;
+                        const stopped = produced === beforeCancel;
+                        const cancellationDetached = detached(source);
+                        reader.releaseLock();
+
+                        const complete = Readable.from(["first", "second", "third"]);
+                        const externalError = () => {};
+                        complete.on("error", externalError);
+                        const completeReader = Readable.toWeb(complete).getReader();
+                        const completeChunks = [];
+                        while (true) {
+                            const result = await completeReader.read();
+                            if (result.done) break;
+                            completeChunks.push(String(result.value));
+                        }
+                        await flush();
+                        const completionDetached = ["data", "end", "close"]
+                            .every(event => complete.listenerCount(event) === 0) &&
+                            complete.listeners("error").length === 1 &&
+                            complete.listeners("error")[0] === externalError;
+                        completeReader.releaseLock();
+                        globalThis.toWebDemand = {
+                            done: true, idleBounded, slowBounded, observed, cancelled, stopped,
+                            cancellationDetached, completeChunks, completionDetached,
+                        };
+                    })().catch(error => { globalThis.toWebDemand.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("eval Node-to-Web demand fixture");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "toWebDemand").await;
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "done": true,
+                    "idleBounded": true,
+                    "slowBounded": true,
+                    "observed": [0, 1, 2, 3, 4, 5, 6, 7],
+                    "cancelled": true,
+                    "stopped": true,
+                    "cancellationDetached": true,
+                    "completeChunks": ["first", "second", "third"],
+                    "completionDetached": true,
+                }),
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_node_readable_to_web_owns_cancellation_and_terminal_listeners() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.toWebLifecycle = { done: false };
+                    (async () => {
+                        const { Readable } = await import("node:stream");
+                        const flush = async () => {
+                            for (let index = 0; index < 32; index++) await Promise.resolve();
+                        };
+                        const detached = stream => ["data", "end", "error", "close"]
+                            .every(event => stream.listenerCount(event) === 0);
+                        const result = {};
+
+                        let finishDestroy;
+                        let destructionCount = 0;
+                        let destructionReason;
+                        const delayed = new Readable({
+                            read() {},
+                            destroy(error, callback) {
+                                destructionCount++;
+                                destructionReason = error;
+                                finishDestroy = () => callback(error);
+                            },
+                        });
+                        const delayedReader = Readable.toWeb(delayed).getReader();
+                        const pending = delayedReader.read();
+                        const reason = new Error("cancel owns deferred destruction");
+                        let cancellationDone = false;
+                        const cancellation = delayedReader.cancel(reason).then(() => {
+                            cancellationDone = true;
+                        });
+                        await flush();
+                        result.waitsForClose = !cancellationDone && delayed.destroyed && !delayed.closed;
+                        result.teardownListeners = delayed.listenerCount("data") === 0 &&
+                            delayed.listenerCount("end") === 0 && delayed.listenerCount("error") === 1 &&
+                            delayed.listenerCount("close") === 1;
+                        finishDestroy();
+                        await cancellation;
+                        result.pendingCancelled = (await pending).done;
+                        result.reasonPreserved = destructionReason === reason;
+                        await delayedReader.cancel(new Error("ignored repeat cancellation"));
+                        result.destroyedOnce = destructionCount === 1;
+                        result.cancelDetached = detached(delayed);
+                        delayedReader.releaseLock();
+
+                        // The bridge closes synchronously but defers its source.cancel callback.
+                        // A previously queued Node producer must not throw into that gap.
+                        const racing = new Readable({ read() {} });
+                        const racingReader = Readable.toWeb(racing).getReader();
+                        const racingRead = racingReader.read();
+                        await flush();
+                        let latePushError = "";
+                        const latePush = Promise.resolve().then(() => {
+                            try { racing.push("late bytes"); }
+                            catch (error) { latePushError = String(error); }
+                        });
+                        await Promise.all([latePush, racingReader.cancel()]);
+                        result.cancelRaceSafe = latePushError === "" && (await racingRead).done;
+                        result.cancelRaceDetached = detached(racing);
+                        racingReader.releaseLock();
+
+                        const observeRead = async (stream, action) => {
+                            const reader = Readable.toWeb(stream).getReader();
+                            let observation = "pending";
+                            const pendingRead = reader.read().then(
+                                value => { observation = value.done ? "end" : "data"; },
+                                error => { observation = error.code || error.message || String(error); },
+                            );
+                            if (action) action();
+                            await flush();
+                            const observed = observation;
+                            if (observation === "pending") await reader.cancel();
+                            await pendingRead;
+                            reader.releaseLock();
+                            return observed;
+                        };
+                        const premature = new Readable({ read() {} });
+                        result.premature = await observeRead(premature, () => premature.destroy());
+                        result.prematureDetached = detached(premature);
+                        const failed = new Readable({ read() {} });
+                        result.failure = await observeRead(failed, () => failed.destroy(new Error("source failure")));
+                        result.failureDetached = detached(failed);
+
+                        const ended = new Readable({ read() {} });
+                        ended.push(null);
+                        await flush();
+                        result.alreadyEnded = await observeRead(ended);
+                        result.alreadyEndedDetached = detached(ended);
+                        const closed = new Readable({ read() {} });
+                        closed.destroy();
+                        result.alreadyClosed = await observeRead(closed);
+                        result.alreadyClosedDetached = detached(closed);
+
+                        let finishEarlyDestroy;
+                        const destroying = new Readable({
+                            read() {},
+                            destroy(error, callback) { finishEarlyDestroy = () => callback(error); },
+                        });
+                        destroying.destroy(new Error("already destroying"));
+                        result.alreadyDestroying = await observeRead(destroying);
+                        result.earlyDestroyOwned = destroying.listenerCount("error") === 1 &&
+                            destroying.listenerCount("close") === 1;
+                        finishEarlyDestroy();
+                        await flush();
+                        result.earlyDestroyDetached = detached(destroying);
+                        globalThis.toWebLifecycle = { done: true, ...result };
+                    })().catch(error => { globalThis.toWebLifecycle.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("eval Node-to-Web lifecycle fixture");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "toWebLifecycle").await;
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "done": true,
+                    "waitsForClose": true,
+                    "teardownListeners": true,
+                    "pendingCancelled": true,
+                    "reasonPreserved": true,
+                    "destroyedOnce": true,
+                    "cancelDetached": true,
+                    "cancelRaceSafe": true,
+                    "cancelRaceDetached": true,
+                    "premature": "ERR_STREAM_PREMATURE_CLOSE",
+                    "prematureDetached": true,
+                    "failure": "source failure",
+                    "failureDetached": true,
+                    "alreadyEnded": "end",
+                    "alreadyEndedDetached": true,
+                    "alreadyClosed": "ERR_STREAM_PREMATURE_CLOSE",
+                    "alreadyClosedDetached": true,
+                    "alreadyDestroying": "already destroying",
+                    "earlyDestroyOwned": true,
+                    "earlyDestroyDetached": true,
+                }),
+            );
         });
     }
 
