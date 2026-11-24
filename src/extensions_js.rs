@@ -17977,9 +17977,12 @@ class Readable extends Stream {
     }
     let controller;
     let settled = false;
+    let ended = false;
     let cancellation = null;
     let resolveCancellation;
     let rejectCancellation;
+    let cancellationError = null;
+    let cancellationFailure = null;
     const stopFlow = () => {
       nodeReadable.pause?.();
       nodeReadable.removeListener?.("data", onData);
@@ -18004,25 +18007,47 @@ class Readable extends Stream {
     };
     const onEnd = () => {
       if (settled) return;
+      ended = true;
+      stopFlow();
+      // EOF precedes auto-destroy. Keep the result pending while the source
+      // still owns cleanup, including a failure reported by its destroy hook.
+      // A Duplex whose writable side is still active does not auto-destroy.
+      const allSidesComplete = !__streamHasWritable(nodeReadable) ||
+        __streamWriteComplete(nodeReadable);
+      if (!nodeReadable.closed && __streamEmitsClose(nodeReadable) &&
+          (nodeReadable.destroyed || (__streamAutoDestroys(nodeReadable) && allSidesComplete))) return;
       settled = true;
       cleanup();
       controller.close();
     };
     const onError = (error) => {
+      const failure = __streamToError(error);
+      if (cancellation) {
+        // The caller's cancellation reason is expected. Other errors emitted
+        // during owned destruction must reject its pending cancellation.
+        if (error !== cancellationError && !cancellationFailure) cancellationFailure = failure;
+        return;
+      }
       if (settled) return;
       settled = true;
-      cleanup();
-      controller.error(__streamToError(error));
+      stopFlow();
+      if (!nodeReadable.destroyed || nodeReadable.closed || !__streamEmitsClose(nodeReadable)) cleanup();
+      controller.error(failure);
     };
     const onClose = () => {
       cleanup();
       if (!settled) {
         settled = true;
-        controller.error(nodeReadable.errored || prematureClose());
+        if (nodeReadable.errored) controller.error(nodeReadable.errored);
+        else if (ended) controller.close();
+        else controller.error(prematureClose());
       }
       const resolve = resolveCancellation;
+      const reject = rejectCancellation;
       resolveCancellation = rejectCancellation = undefined;
-      if (resolve) resolve();
+      if (cancellationFailure) {
+        if (reject) reject(cancellationFailure);
+      } else if (resolve) resolve();
     };
     return new ReadableStream({
       start(webController) {
@@ -18047,7 +18072,7 @@ class Readable extends Stream {
         }
       },
       pull() {
-        if (!settled) nodeReadable.resume?.();
+        if (!settled && !ended) nodeReadable.resume?.();
       },
       cancel(reason) {
         if (cancellation) return cancellation;
@@ -18061,10 +18086,13 @@ class Readable extends Stream {
           resolveCancellation = resolve;
           rejectCancellation = reject;
         });
+        // A synthetic error would mask a real destroy-callback failure because
+        // Stream.destroy preserves the first error supplied to it.
+        cancellationError = reason == null ? null : __streamToError(reason);
         // Keep our error listener until close: asynchronous destroy hooks can
         // report the cancellation reason after the Web side has settled.
         try {
-          nodeReadable.destroy(__streamToError(reason ?? "stream cancelled"));
+          nodeReadable.destroy(cancellationError);
           if (nodeReadable.closed) onClose();
         } catch (error) {
           cleanup();
@@ -31687,12 +31715,12 @@ mod tests {
             39_043,
             "c496331afa268ea323d999aae67693ce6900c3975d89cffb1557de1f8e77ee06",
         ),
-        // Read hooks, readable capacity, and transform backpressure are intentional.
-        // Only this deliberately changed module is re-pinned.
+        // Read hooks, readable capacity, transform backpressure, and Web-stream
+        // cleanup error ownership are intentional source changes.
         (
             "node:stream",
-            50_755,
-            "a92d1c4b6f8649ca6c86f4e0d35cf02fba54e123ce5f6a85ac34166449f37d5a",
+            52_279,
+            "3394851df1b2b86e8def01a7b7cc0ec909a577fd566e005b5a617524b3b61777",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -48549,6 +48577,144 @@ globalThis.fsWriteStorage = { done: false };
                     "earlyDestroyDetached": true,
                 }),
             );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_readable_to_web_reports_owned_cleanup_failures() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.toWebCleanup = { done: false };
+                    (async () => {
+                        const { Readable, PassThrough } = await import("node:stream");
+                        const flush = async () => {
+                            for (let index = 0; index < 32; index++) await Promise.resolve();
+                        };
+                        const listeners = stream => ["data", "end", "error", "close"]
+                            .map(event => stream.listenerCount(event));
+                        const eof = async cleanupError => {
+                            let finishDestroy;
+                            const stream = new Readable({
+                                read() { this.push(null); },
+                                destroy(error, callback) {
+                                    finishDestroy = () => callback(cleanupError || error);
+                                },
+                            });
+                            const reader = Readable.toWeb(stream).getReader();
+                            let outcome = "pending";
+                            const reading = reader.read().then(
+                                value => { outcome = value.done ? "end" : "data"; },
+                                error => { outcome = error.message; },
+                            );
+                            await flush();
+                            const before = { outcome, closed: stream.closed, listeners: listeners(stream) };
+                            finishDestroy();
+                            await reading;
+                            reader.releaseLock();
+                            await flush();
+                            return { before, after: { outcome, closed: stream.closed, listeners: listeners(stream) } };
+                        };
+                        const cancel = async cleanupError => {
+                            let finishDestroy;
+                            let receivedError;
+                            const stream = new Readable({
+                                read() {},
+                                destroy(error, callback) {
+                                    receivedError = error && error.message;
+                                    finishDestroy = () => callback(cleanupError || error);
+                                },
+                            });
+                            const reader = Readable.toWeb(stream).getReader();
+                            let outcome = "pending";
+                            const cancellation = reader.cancel().then(
+                                () => { outcome = "cancelled"; },
+                                error => { outcome = error.message; },
+                            );
+                            await flush();
+                            const before = { outcome, closed: stream.closed, receivedError };
+                            finishDestroy();
+                            await cancellation;
+                            reader.releaseLock();
+                            await flush();
+                            return {
+                                before,
+                                after: { outcome, closed: stream.closed, receivedError, listeners: listeners(stream) },
+                            };
+                        };
+                        const result = {
+                            eofFailure: await eof(new Error("EOF cleanup failed")),
+                            eofSuccess: await eof(null),
+                            cancelFailure: await cancel(new Error("cancel cleanup failed")),
+                            cancelSuccess: await cancel(null),
+                        };
+                        // Readable EOF must not wait for a close it does not own:
+                        // autoDestroy:false and an unfinished Duplex writable side.
+                        for (const [name, stream] of [
+                            ["unowned", new Readable({ autoDestroy: false, read() { this.push(null); } })],
+                            ["duplex", new PassThrough()],
+                        ]) {
+                            const reader = Readable.toWeb(stream).getReader();
+                            let outcome = "pending";
+                            const reading = reader.read().then(
+                                value => { outcome = value.done ? "end" : "data"; },
+                                error => { outcome = error.message; },
+                            );
+                            if (name === "duplex") stream.push(null);
+                            await flush();
+                            result[name] = { outcome, destroyed: stream.destroyed, listeners: listeners(stream) };
+                            if (outcome === "pending") await reader.cancel();
+                            await reading;
+                            reader.releaseLock();
+                        }
+                        globalThis.toWebCleanup = { done: true, ...result };
+                    })().catch(error => { globalThis.toWebCleanup.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("eval Node-to-Web cleanup failure fixture");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "toWebCleanup").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            for name in ["eofFailure", "eofSuccess"] {
+                assert_eq!(
+                    result[name]["before"],
+                    json!({"outcome": "pending", "closed": false, "listeners": [0, 0, 1, 1]})
+                );
+            }
+            assert_eq!(
+                result["eofFailure"]["after"]["outcome"],
+                json!("EOF cleanup failed")
+            );
+            assert_eq!(result["eofSuccess"]["after"]["outcome"], json!("end"));
+            for name in ["cancelFailure", "cancelSuccess"] {
+                assert_eq!(
+                    result[name]["before"],
+                    json!({"outcome": "pending", "closed": false, "receivedError": null})
+                );
+                assert_eq!(result[name]["after"]["receivedError"], serde_json::Value::Null);
+            }
+            assert_eq!(
+                result["cancelFailure"]["after"]["outcome"],
+                json!("cancel cleanup failed")
+            );
+            assert_eq!(result["cancelSuccess"]["after"]["outcome"], json!("cancelled"));
+            for name in ["eofFailure", "eofSuccess", "cancelFailure", "cancelSuccess"] {
+                assert_eq!(result[name]["after"]["closed"], json!(true));
+                assert_eq!(result[name]["after"]["listeners"], json!([0, 0, 0, 0]));
+            }
+            for name in ["unowned", "duplex"] {
+                assert_eq!(
+                    result[name],
+                    json!({"outcome": "end", "destroyed": false, "listeners": [0, 0, 0, 0]})
+                );
+            }
         });
     }
 
