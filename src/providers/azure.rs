@@ -766,10 +766,14 @@ where
             self.record_error(message.to_string());
         }
 
-        let choices = chunk.choices;
+        let selected = super::openai::select_primary_choice(chunk.choices, |choice| choice.index)
+            .map_err(|message| {
+                let message = format!("Azure OpenAI stream choice error: {message}");
+                self.record_error(message.clone());
+                Error::api(message)
+            })?;
         if !self.started {
-            let first = choices.first();
-            let delta_is_empty = first.is_some_and(|choice| {
+            let delta_is_empty = selected.as_ref().is_some_and(|choice| {
                 choice.finish_reason.is_none()
                     && choice.delta.content.is_none()
                     && choice.delta.tool_calls.is_none()
@@ -780,10 +784,10 @@ where
             }
         }
 
-        // Process choices — handle content deltas BEFORE finish_reason so that
-        // TextEnd/ToolCallEnd events always follow the final delta (matching the
-        // OpenAI provider event ordering contract).
-        for choice in choices {
+        // Only the primary candidate owns this reply. Handle its content
+        // deltas BEFORE finish_reason so that TextEnd/ToolCallEnd events always
+        // follow the final delta (matching the OpenAI event ordering contract).
+        if let Some(choice) = selected {
             if self.finalized {
                 if matches!(
                     choice.finish_reason.as_deref(),
@@ -825,7 +829,7 @@ where
                         "Azure OpenAI sent content after a terminal finish reason".to_string(),
                     );
                 }
-                continue;
+                return Ok(());
             }
             // Handle text content
             if let Some(text) = choice.delta.content {
@@ -1078,6 +1082,8 @@ struct AzureStreamError {
 
 #[derive(Debug, Deserialize)]
 struct AzureChoice {
+    #[serde(default)]
+    index: Option<u32>,
     delta: AzureDelta,
     #[serde(default)]
     finish_reason: Option<String>,

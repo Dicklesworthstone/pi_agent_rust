@@ -1449,11 +1449,9 @@ where
     fn process_event(&mut self, data: &str) -> Result<()> {
         let chunk: OpenAIStreamChunk = serde_json::from_str(data)
             .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+        let selected = select_primary_choice(chunk.choices, |choice| choice.index);
         let authoritative_usage = self.finalized
-            || chunk
-                .choices
-                .iter()
-                .any(|choice| choice.finish_reason.is_some());
+            || matches!(&selected, Ok(Some(choice)) if choice.finish_reason.is_some());
 
         // Handle usage in final chunk
         if let Some(usage) = chunk.usage {
@@ -1515,8 +1513,14 @@ where
             self.record_error(message.to_string());
         }
 
-        // Process choices
-        if let Some(mut choice) = chunk.choices.into_iter().next() {
+        // A choice is an independent generated candidate, not another fragment
+        // of this reply. Its terminal marker cannot complete the primary call.
+        let selected = selected.map_err(|message| {
+            let message = format!("OpenAI stream choice error: {message}");
+            self.record_error(message.clone());
+            Error::api(message)
+        })?;
+        if let Some(mut choice) = selected {
             choice.delta.normalize_reasoning();
             if !self.started
                 && choice.finish_reason.is_none()
@@ -2018,6 +2022,34 @@ where
     }
 }
 
+/// Select the single reply consumed by Chat Completions transports. Wire
+/// array order can change between chunks, so only index zero owns its content
+/// and finish reason. A lone unindexed choice supports compatible gateways;
+/// multi-choice frames need explicit, unique indices before any content from
+/// the frame is delivered. The usual single-choice path allocates no ledger.
+pub(super) fn select_primary_choice<T>(
+    mut choices: Vec<T>,
+    index: impl Fn(&T) -> Option<u32>,
+) -> std::result::Result<Option<T>, &'static str> {
+    if choices.len() <= 1 {
+        return Ok(choices.pop().filter(|choice| index(choice).unwrap_or(0) == 0));
+    }
+    let mut indices = HashSet::with_capacity(choices.len());
+    let mut selected = None;
+    for choice in choices {
+        let Some(choice_index) = index(&choice) else {
+            return Err("multiple choices require explicit indices");
+        };
+        if !indices.insert(choice_index) {
+            return Err("duplicate choice index");
+        }
+        if choice_index == 0 {
+            selected = Some(choice);
+        }
+    }
+    Ok(selected)
+}
+
 /// Each completed call needs an unambiguous result identity and a function
 /// name. Validate the accumulated wire values without repairing them: changing
 /// an ID here would no longer answer the call the provider actually emitted.
@@ -2324,6 +2356,8 @@ struct OpenAIStreamChunk {
 
 #[derive(Debug, Deserialize)]
 struct OpenAIChoice {
+    #[serde(default)]
+    index: Option<u32>,
     delta: OpenAIDelta,
     #[serde(default)]
     finish_reason: Option<String>,

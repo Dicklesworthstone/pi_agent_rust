@@ -59,6 +59,135 @@ fn done_message(state: &mut TestState) -> AssistantMessage {
 }
 
 #[test]
+fn indexed_choices_keep_primary_text_tools_and_trailing_usage() {
+    for primary_first in [false, true] {
+        let mut opening = vec![
+            json!({"index": 1, "delta": {"content": "foreign"}}),
+            json!({"index": 0, "delta": {"content": "primary"}}),
+        ];
+        if primary_first {
+            opening.reverse();
+        }
+        let mut bytes = wire_bytes([
+            json!({"choices": opening}),
+            json!({"choices": [
+                {"index": 1, "delta": tool_delta(0, r#"{"path":"wrong"}"#)},
+                {"index": 0, "delta": tool_delta(0, r#"{"path":"#)}
+            ]}),
+            json!({"choices": [{"index": 1, "delta": {}, "finish_reason": "error"}]}),
+            json!({"choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": r#""kept"}"#}}]},
+                "finish_reason": "tool_calls"
+            }]}),
+            json!({"choices": [{"index": 1, "delta": {"content": "late foreign"}, "finish_reason": "length"}]}),
+            json!({"choices": [], "usage": {
+                "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15
+            }}),
+        ]);
+        bytes.extend_from_slice(b"data: [DONE]\n\n");
+        let (mut output, dropped) = wire_output([Ok(bytes)], true);
+        let events = futures::executor::block_on(output.by_ref().collect::<Vec<_>>())
+            .into_iter()
+            .collect::<crate::error::Result<Vec<_>>>()
+            .expect("independent choices must not corrupt the primary reply");
+        let Some(StreamEvent::Done { reason, message }) = events.last() else {
+            panic!("primary reply lost its terminal event");
+        };
+        assert_eq!(*reason, StopReason::ToolUse);
+        assert!(matches!(
+            message.content.as_slice(),
+            [ContentBlock::Text(text), ContentBlock::ToolCall(call)]
+                if text.text == "primary"
+                    && call.id == "call-0"
+                    && call.name == "read"
+                    && call.arguments == json!({"path": "kept"})
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(message.usage.input, 12);
+        assert_eq!(message.usage.output, 3);
+        assert_eq!(message.usage.total_tokens, 15);
+        assert_retired(&mut output, &dropped);
+    }
+}
+
+#[test]
+fn foreign_choice_finish_never_authorizes_primary_tool_arguments() {
+    for finish in ["stop", "tool_calls", "length"] {
+        let mut bytes = wire_bytes([
+            json!({"choices": [{
+                "index": 0,
+                "delta": tool_delta(0, r#"{"path":"kept"}"#)
+            }]}),
+            json!({"choices": [{"index": 1, "delta": {}, "finish_reason": finish}]}),
+            json!({"choices": [], "usage": {
+                "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15
+            }}),
+        ]);
+        bytes.extend_from_slice(b"data: [DONE]\n\n");
+        let (mut output, dropped) = wire_output([Ok(bytes)], true);
+        let events = futures::executor::block_on(output.by_ref().collect::<Vec<_>>())
+            .into_iter()
+            .collect::<crate::error::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+        );
+        let Some(StreamEvent::Done { reason, message }) = events.last() else {
+            panic!("unfinished primary reply lost its terminal error");
+        };
+        assert_eq!(*reason, StopReason::Error, "foreign finish {finish}");
+        assert!(
+            message
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("before a finish reason")
+        );
+        assert_eq!(message.usage.total_tokens, 15);
+        assert_retired(&mut output, &dropped);
+    }
+}
+
+#[test]
+fn ambiguous_choice_frames_fail_before_delivering_tools_and_retire_the_source() {
+    for choices in [
+        json!([
+            {"index": 0, "delta": tool_delta(0, "{}"), "finish_reason": "tool_calls"},
+            {"index": 0, "delta": {}, "finish_reason": "stop"}
+        ]),
+        json!([
+            {"index": 1, "delta": {"content": "private-first"}},
+            {"index": 1, "delta": {"content": "private-second"}}
+        ]),
+        json!([
+            {"delta": tool_delta(0, "{}")},
+            {"index": 1, "delta": {}, "finish_reason": "stop"}
+        ]),
+    ] {
+        let mut bytes = wire_bytes([
+            json!({"choices": choices}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ]);
+        bytes.extend_from_slice(b"data: [DONE]\n\n");
+        let (mut output, dropped) = wire_output([Ok(bytes)], true);
+        let error = output.next().now_or_never().unwrap().unwrap().unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("choice"));
+        assert!(!diagnostic.contains("private"));
+        assert_retired(&mut output, &dropped);
+    }
+}
+
+#[test]
 fn malformed_and_non_object_arguments_never_complete_a_tool() {
     for raw in ["{", r#"{"path":"unfinished"#, "null", "[]", "42", "true"] {
         let mut state = state();
