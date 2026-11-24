@@ -872,8 +872,8 @@ mod tests {
                 let out = AcpOutput::new(out);
                 let run = |command: Option<Command>| {
                     let (_, signal) = super::super::AbortHandle::new();
-                    Box::pin(super::super::run_prompt(Arc::clone(&state), vec![crate::model::ContentBlock::Text(
-                        crate::model::TextContent::new("Observe the tool schema"))],
+                    Box::pin(super::super::run_prompt(Arc::clone(&state),
+                        super::super::AcpPrompt::text("Observe the tool schema"),
                         command.map(super::super::commands::PromptCommand::Mcp),
                         signal, out.clone(), "schema-probe".into(), cx.clone()))
                 };

@@ -518,7 +518,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
             let (_, signal) = AbortHandle::new();
             let reason = Box::pin(crate::acp::run_prompt(
                 Arc::clone(&state),
-                text("/mcp trust remote"),
+                crate::acp::AcpPrompt::text("/mcp trust remote"),
                 Some(PromptCommand::Mcp(Command::Trust("remote".into()))),
                 signal,
                 tx.clone(),
@@ -550,7 +550,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
             let (_, signal) = AbortHandle::new();
             let prompt = crate::acp::run_prompt(
                 Arc::clone(&state),
-                text("Call echo"),
+                crate::acp::AcpPrompt::text("Call echo"),
                 None,
                 signal,
                 tx.clone(),
@@ -585,7 +585,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
             let (_, signal) = AbortHandle::new();
             Box::pin(crate::acp::run_prompt(
                 Arc::clone(&state),
-                text("/mcp deny remote"),
+                crate::acp::AcpPrompt::text("/mcp deny remote"),
                 Some(PromptCommand::Mcp(Command::Deny("remote".into()))),
                 signal,
                 tx,
@@ -638,7 +638,7 @@ fn assert_cancelled_setup(transport: Transport) {
         let (abort, signal) = AbortHandle::new();
         let prompt = crate::acp::run_prompt(
             Arc::clone(&state),
-            text("/mcp trust remote"),
+            crate::acp::AcpPrompt::text("/mcp trust remote"),
             Some(PromptCommand::Mcp(Command::Trust("remote".into()))),
             signal,
             tx,
@@ -743,7 +743,7 @@ fn sse_authentication_failure_is_repairable_without_sharing_session_tool_authori
             let (_, signal) = AbortHandle::new();
             Box::pin(crate::acp::run_prompt(
                 Arc::clone(&state),
-                text("MCP operator command"),
+                crate::acp::AcpPrompt::text("MCP operator command"),
                 Some(PromptCommand::Mcp(command)),
                 signal,
                 out.clone(),

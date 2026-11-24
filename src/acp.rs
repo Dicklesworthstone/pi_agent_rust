@@ -1447,7 +1447,7 @@ async fn run_with_input(options: AcpOptions, mut input: AcpInput, out_tx: AcpOut
                             continue;
                         };
                         let message_content =
-                            match content::extract_prompt_content(prompt_blocks, &session_config) {
+                            match AcpPrompt::from_wire(prompt_blocks, &session_config) {
                                 Ok(content) => content,
                                 Err(err) => {
                                     let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
@@ -3643,13 +3643,48 @@ async fn apply_set_config_option(
     }
 }
 
+/// Keep native reference/media content separate from the user's control prose.
+/// Resource wrappers are useful to the model, but their text and URI labels
+/// must never activate magic keywords, including on resource-only prompts.
+struct AcpPrompt {
+    content: Vec<ContentBlock>,
+    authored_text: String,
+}
+
+impl AcpPrompt {
+    fn from_wire(blocks: &[Value], config: &Config) -> std::result::Result<Self, String> {
+        let content = content::extract_prompt_content(blocks, config)?;
+        let authored_text = blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(Self {
+            content,
+            authored_text,
+        })
+    }
+
+    #[cfg(test)]
+    fn text(text: impl Into<String>) -> Self {
+        let authored_text = text.into();
+        Self {
+            content: vec![ContentBlock::Text(crate::model::TextContent::new(
+                authored_text.clone(),
+            ))],
+            authored_text,
+        }
+    }
+}
+
 /// Execute a prompt for a session and stream `session/update` notifications.
 ///
 /// Returns the ACP `stopReason` string so the dispatcher can attach it to the
 /// `session/prompt` response (which only completes when the turn does).
 async fn run_prompt(
     session_state: Arc<Mutex<AcpSessionState>>,
-    message: Vec<ContentBlock>,
+    prompt: AcpPrompt,
     command: Option<commands::PromptCommand>,
     abort_signal: AbortSignal,
     out_tx: AcpOutput,
@@ -3742,8 +3777,22 @@ async fn run_prompt(
         )
         .await
     } else {
+        let AcpPrompt {
+            content,
+            authored_text,
+        } = prompt;
         match agent_session
-            .prompt_with_content_with_abort(message, abort_signal, on_event)
+            .run_recoverable_turn_with_handoff(
+                Some(crate::model::UserContent::Blocks(content)),
+                abort_signal,
+                on_event,
+                move |agent| {
+                    // Install provenance only when native input is admitted.
+                    // Startup rejection/cancellation cannot leave an override
+                    // for the next prompt; retries reuse the admitted turn.
+                    agent.set_magic_keyword_scan_override(Some(authored_text));
+                },
+            )
             .await
         {
             Ok(message) if message.stop_reason == crate::model::StopReason::Error => {
@@ -4739,7 +4788,7 @@ mod tests {
         let tx = AcpOutput::new(tx);
         let reason = Box::pin(run_prompt(
             state,
-            vec![ContentBlock::Text(TextContent::new("editor prompt"))],
+            AcpPrompt::text("editor prompt"),
             None,
             signal,
             tx,
@@ -4837,7 +4886,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(128);
         let reason = Box::pin(run_prompt(
             state,
-            vec![ContentBlock::Text(TextContent::new(text))],
+            AcpPrompt::text(text),
             Some(command),
             signal,
             AcpOutput::new(tx),
@@ -5292,7 +5341,7 @@ mod tests {
             guard.started = true;
             let reason = Box::pin(run_prompt(
                 Arc::clone(&state),
-                vec![ContentBlock::Text(TextContent::new("editor prompt"))],
+                AcpPrompt::text("editor prompt"),
                 None,
                 signal,
                 output.clone(),
@@ -5376,9 +5425,7 @@ mod tests {
             guard.started = true;
             let reason = Box::pin(run_prompt(
                 state,
-                vec![ContentBlock::Text(TextContent::new(
-                    "cancelled before start",
-                ))],
+                AcpPrompt::text("cancelled before start"),
                 None,
                 signal,
                 output.clone(),
@@ -5600,7 +5647,7 @@ mod tests {
                     guard.started = true;
                     let reason = Box::pin(run_prompt(
                         Arc::clone(&state),
-                        vec![ContentBlock::Text(TextContent::new("editor prompt"))],
+                        AcpPrompt::text("editor prompt"),
                         None,
                         signal.clone(),
                         output.clone(),

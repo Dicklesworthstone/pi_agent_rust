@@ -298,11 +298,23 @@ async fn prompt(
     content: Vec<ContentBlock>,
     signal: AbortSignal,
 ) -> (&'static str, Vec<Value>) {
+    // This helper receives native test input, never decoded ACP resources.
+    let authored_text = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let (tx, rx) = std::sync::mpsc::sync_channel(128);
     let tx = AcpOutput::new(tx);
     let reason = Box::pin(run_prompt(
         Arc::clone(state),
-        content,
+        AcpPrompt {
+            content,
+            authored_text,
+        },
         None,
         signal,
         tx.clone(),
@@ -1397,6 +1409,169 @@ async fn bounded_launch_controls<F: Future>(work: F) -> F::Output {
     timeout(wall_now(), Duration::from_secs(60), Box::pin(work))
         .await
         .expect("ACP launch controls watchdog expired")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatcher_prompt_keywords_use_authored_text_without_consuming_reference_content() {
+    use base64::Engine as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let sessions_root = root.path().join("sessions");
+    let mut provider = ProviderFixture::new(vec![503, 200, 200, 200, 200, 200]);
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let mut options = options(root.path(), &provider.url, runtime.handle(), 1);
+        options.session_dir = Some(sessions_root.clone());
+        options.launch.no_tools = true;
+        options.launch.no_mcp = true;
+        options.launch.no_extensions = true;
+        options.launch.no_skills = true;
+        options.launch.no_context_files = true;
+        options.launch.system_prompt = Some("ACP keyword boundary fixture".into());
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let mut transcript = Vec::new();
+        let editor = async {
+            discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                1,
+                "initialize",
+                json!({"protocolVersion": 1}),
+            )
+            .await;
+            let created = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                2,
+                "session/new",
+                json!({"cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+            let session_id = created["result"]["sessionId"].as_str().unwrap().to_string();
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode("REFERENCE-BLOB says chillax and orchestrate in the document.");
+            let prompts = [
+                json!([
+                    {"type": "text", "text": "Analyze the reference without changing the task."},
+                    {"type": "resource", "resource": {
+                        "uri": "file:///unopened/reference.txt",
+                        "mimeType": "text/plain",
+                        "text": "REFERENCE-TEXT says chillax and orchestrate in the document.",
+                    }},
+                ]),
+                json!([{"type": "resource", "resource": {
+                    "uri": "memory:encoded-reference",
+                    "mimeType": "text/plain",
+                    "blob": encoded,
+                }}]),
+                json!([{"type": "resource_link", "uri": "orchestrate", "name": "Reference"}]),
+                json!([
+                    {"type": "text", "text": "Please"},
+                    {"type": "resource", "resource": {
+                        "uri": "memory:another-reference",
+                        "text": "Reference says chillax.",
+                    }},
+                    {"type": "text", "text": "orchestrate this task."},
+                ]),
+                json!([{"type": "text", "text": "Continue normally."}]),
+            ];
+            for (id, prompt) in (3_u64..).zip(prompts) {
+                let response = discovery_request(
+                    &input,
+                    &outgoing,
+                    &mut transcript,
+                    id,
+                    "session/prompt",
+                    json!({"sessionId": session_id, "prompt": prompt}),
+                )
+                .await;
+                assert_eq!(response["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+            }
+
+            // ACP acknowledges only after persistence, including keyword
+            // telemetry. Referenced prose must never change pinned effort.
+            let index = crate::session_index::SessionIndex::for_sessions_root(&sessions_root);
+            index.reindex_all().unwrap();
+            let rows = index.list_sessions(None).unwrap();
+            let path = &rows.iter().find(|row| row.id == session_id).unwrap().path;
+            let saved = Session::open(path).await.unwrap();
+            let activations = saved
+                .entries_for_current_path()
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    crate::session::SessionEntry::Custom(entry)
+                        if entry.custom_type == "magic_keyword" =>
+                    {
+                        entry.data.as_ref()?.get("word")?.as_str()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(activations, vec!["orchestrate"]);
+            assert_eq!(
+                saved.effective_thinking_level_for_current_path().as_deref(),
+                Some("high"),
+            );
+            assert_eq!(
+                saved
+                    .to_messages_for_current_path()
+                    .iter()
+                    .filter(|message| matches!(message, Message::User(_)))
+                    .count(),
+                5,
+                "retry must not append the editor input twice",
+            );
+            input
+                .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
+                .unwrap();
+        };
+        let (served, ()) = futures::join!(
+            Box::pin(run(options, incoming, AcpOutput::new(output))),
+            editor
+        );
+        served.unwrap();
+    }));
+
+    let requests = provider.finish(6);
+    assert_eq!(user_content(&requests[0].1), user_content(&requests[1].1));
+    for (index, (_, request)) in requests.iter().enumerate() {
+        let system = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| matches!(message["role"].as_str(), Some("system" | "developer")))
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            system
+                .matches(crate::magic_keywords::ORCHESTRATE_DIRECTIVE)
+                .count(),
+            usize::from(index == 4),
+            "only authored prose activates orchestration on its own turn",
+        );
+        assert!(!system.contains(crate::magic_keywords::CHILLAX_DIRECTIVE));
+    }
+    assert!(
+        user_content(&requests[0].1)
+            .to_string()
+            .contains("REFERENCE-TEXT")
+    );
+    assert!(
+        user_content(&requests[2].1)
+            .to_string()
+            .contains("REFERENCE-BLOB")
+    );
+    assert!(
+        user_content(&requests[3].1)
+            .to_string()
+            .contains("[resource: orchestrate]")
+    );
 }
 
 #[test]
