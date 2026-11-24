@@ -23495,6 +23495,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
+                // Bound buffered Fetch bodies before base64 or multipart expansion.
+                global.set(
+                    "__pi_fetch_max_request_bytes",
+                    crate::connectors::http::HttpConnectorConfig::default().max_request_bytes,
+                )?;
+
                 // __pi_http_native(request) -> call_id
                 global.set(
                     "__pi_http_native",
@@ -29973,7 +29979,7 @@ if (typeof globalThis.crypto.getRandomValues !== 'function') {
 }
 
 "),
-            compressed_js_literal!(r"if (!globalThis.crypto.subtle) {
+            compressed_js_literal!(r#"if (!globalThis.crypto.subtle) {
     globalThis.crypto.subtle = {};
 }
 
@@ -30929,6 +30935,7 @@ if (typeof globalThis.clearInterval !== 'function') {
 }
 
 if (typeof globalThis.fetch !== 'function') {
+    const __pi_fetch_native_byte_encoder = globalThis.__pi_base64_encode_bytes_native;
     const __pi_fetch_body_bytes_to_base64 = (value) => {
         let bytes = null;
         if (value instanceof Uint8Array) {
@@ -30939,8 +30946,8 @@ if (typeof globalThis.fetch !== 'function') {
             bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
         }
         if (!bytes) return null;
-        if (typeof globalThis.__pi_base64_encode_bytes_native === 'function') {
-            return __pi_base64_encode_bytes_native(bytes);
+        if (typeof __pi_fetch_native_byte_encoder === 'function') {
+            return __pi_fetch_native_byte_encoder(bytes);
         }
         let binaryChunks = [];
         let chunk = [];
@@ -31497,57 +31504,395 @@ if (typeof globalThis.fetch !== 'function') {
         return new TextEncoder().encode(String(value));
     };
 
-    class Response {
-        constructor(body, init) {
-            const options = init && typeof init === 'object' ? init : {};
-            this.status = Number(options.status === undefined ? 200 : options.status);
-            this.statusText = String(options.statusText || '');
-            this.ok = this.status >= 200 && this.status < 300;
-            this.headers = new Headers(options.headers || {});
-            this.url = String(options.url || '');
-            this.redirected = !!options.redirected;
-            this._bodyUsed = false;
-            this.body = body === undefined || body === null ? null
-                : typeof body.getReader === 'function' ? body
-                : new globalThis.ReadableStream({ start(controller) { controller.enqueue(__pi_fetch_bytes(body)); controller.close(); } });
+    // Uploads use the same bounded byte body as the native HTTP connector.
+    // Capture the host limit and private storage before any extension executes.
+    const __pi_fetch_body_limit = Number(globalThis.__pi_fetch_max_request_bytes);
+    if (!Number.isSafeInteger(__pi_fetch_body_limit) || __pi_fetch_body_limit <= 0) {
+        throw new Error('Fetch body limit is unavailable');
+    }
+    const __pi_fetch_blobs = new WeakMap();
+    const __pi_fetch_files = new WeakMap();
+    const __pi_fetch_forms = new WeakMap();
+    const __pi_fetch_bodies = new WeakMap();
+    const __pi_fetch_requests = new WeakMap();
+    const __pi_fetch_get = Function.call.bind(WeakMap.prototype.get);
+    const __pi_fetch_set = Function.call.bind(WeakMap.prototype.set);
+    const __pi_fetch_copy = Function.call.bind(Uint8Array.prototype.slice);
+    const __pi_fetch_set_bytes = Function.call.bind(Uint8Array.prototype.set);
+    const __pi_fetch_random = globalThis.crypto.getRandomValues.bind(globalThis.crypto);
+    const __pi_fetch_readable = globalThis.ReadableStream;
+    const __pi_fetch_reader = Function.call.bind(__pi_fetch_readable.prototype.getReader);
+    let __pi_fetch_boundary_sequence = 0;
+
+    const __pi_fetch_check_size = (size, limit = __pi_fetch_body_limit) => {
+        if (!Number.isSafeInteger(size) || size < 0 || size > limit) {
+            const error = new RangeError('Fetch body exceeds the ' + __pi_fetch_body_limit + ' byte limit');
+            error.code = 'ERR_PIJS_BODY_TOO_LARGE';
+            throw error;
         }
-        get bodyUsed() { return this._bodyUsed || !!(this.body && this.body._disturbed); }
-        async _consume() {
-            if (this.bodyUsed || (this.body && this.body.locked)) throw new TypeError('Response body is already used');
-            if (!this.body) return new Uint8Array();
-            this._bodyUsed = true;
-            const reader = this.body.getReader();
+        return size;
+    };
+    const __pi_fetch_scalar_string = (value) => {
+        const text = String(value);
+        return text.replace(/[\uD800-\uDFFF]/g, (unit, index) => {
+            const code = unit.charCodeAt(0);
+            if (code <= 0xDBFF && index + 1 < text.length &&
+                text.charCodeAt(index + 1) >= 0xDC00 && text.charCodeAt(index + 1) <= 0xDFFF) return unit;
+            if (code >= 0xDC00 && index > 0 &&
+                text.charCodeAt(index - 1) >= 0xD800 && text.charCodeAt(index - 1) <= 0xDBFF) return unit;
+            return '\uFFFD';
+        });
+    };
+    const __pi_fetch_encode = (value, limit = __pi_fetch_body_limit) => {
+        const text = __pi_fetch_scalar_string(value);
+        __pi_fetch_check_size(text.length, limit);
+        let length = 0;
+        for (const character of text) {
+            const point = character.codePointAt(0);
+            length += point < 0x80 ? 1 : point < 0x800 ? 2 : point < 0x10000 ? 3 : 4;
+            __pi_fetch_check_size(length, limit);
+        }
+        return new TextEncoder().encode(text);
+    };
+    const __pi_fetch_join = (parts, length) => {
+        __pi_fetch_check_size(length);
+        const bytes = new Uint8Array(length);
+        let offset = 0;
+        for (const part of parts) {
+            __pi_fetch_set_bytes(bytes, part, offset);
+            offset += part.byteLength;
+        }
+        return bytes;
+    };
+    const __pi_fetch_byte_view = (value) => {
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        return null;
+    };
+    const __pi_fetch_mime_type = (value) => {
+        const type = String(value === undefined ? '' : value);
+        return /[^\x20-\x7E]/.test(type) ? '' : type.toLowerCase();
+    };
+    const __pi_fetch_byte_stream = (bytes) => {
+        let source = bytes;
+        let offset = 0;
+        return new __pi_fetch_readable({
+            pull(controller) {
+                if (!source || offset === source.byteLength) { source = null; controller.close(); return; }
+                const end = Math.min(offset + 64 * 1024, source.byteLength);
+                controller.enqueue(__pi_fetch_copy(source, offset, end));
+                offset = end;
+                if (offset === source.byteLength) { source = null; controller.close(); }
+            },
+            cancel() { source = null; },
+        });
+    };
+    const __pi_fetch_blob_state = (value) => {
+        const state = __pi_fetch_get(__pi_fetch_blobs, value);
+        if (!state) throw new TypeError('Expected a Blob');
+        return state;
+    };
+
+    class Blob {
+        constructor(parts = [], options = {}) {
+            if (parts === null || typeof parts !== 'object' || typeof parts[Symbol.iterator] !== 'function') {
+                throw new TypeError('Blob parts must be an iterable');
+            }
+            const opts = options == null ? {} : options;
+            const endings = opts.endings === undefined ? 'transparent' : String(opts.endings);
+            if (endings !== 'transparent' && endings !== 'native') throw new TypeError('Invalid Blob endings');
             const chunks = [];
-            let size = 0;
+            let length = 0;
+            for (const part of parts) {
+                const blob = __pi_fetch_get(__pi_fetch_blobs, part);
+                let bytes;
+                if (blob) {
+                    // Internal blob bytes cannot be modified by a caller.
+                    bytes = blob.bytes;
+                } else {
+                    const view = __pi_fetch_byte_view(part);
+                    if (view) {
+                        __pi_fetch_check_size(length + view.byteLength);
+                        bytes = __pi_fetch_copy(view);
+                    } else {
+                        let value = __pi_fetch_scalar_string(part);
+                        if (endings === 'native') {
+                            value = value.replace(/\r\n|\r|\n/g, globalThis.process?.platform === 'win32' ? '\r\n' : '\n');
+                        }
+                        bytes = __pi_fetch_encode(value, __pi_fetch_body_limit - length);
+                    }
+                }
+                length = __pi_fetch_check_size(length + bytes.byteLength);
+                chunks.push(bytes);
+            }
+            __pi_fetch_set(__pi_fetch_blobs, this, {
+                bytes: __pi_fetch_join(chunks, length),
+                type: __pi_fetch_mime_type(opts.type),
+            });
+        }
+        get size() { return __pi_fetch_blob_state(this).bytes.byteLength; }
+        get type() { return __pi_fetch_blob_state(this).type; }
+        async arrayBuffer() { return __pi_fetch_copy(__pi_fetch_blob_state(this).bytes).buffer; }
+        async bytes() { return __pi_fetch_copy(__pi_fetch_blob_state(this).bytes); }
+        async text() { return new TextDecoder().decode(__pi_fetch_copy(__pi_fetch_blob_state(this).bytes)); }
+        stream() { return __pi_fetch_byte_stream(__pi_fetch_blob_state(this).bytes); }
+        slice(start = 0, end = this.size, contentType = '') {
+            const bytes = __pi_fetch_blob_state(this).bytes;
+            const index = (value) => {
+                const number = Number(value);
+                const integer = Number.isNaN(number) ? 0 : Math.trunc(number);
+                return integer < 0 ? Math.max(bytes.byteLength + integer, 0) : Math.min(integer, bytes.byteLength);
+            };
+            const first = index(start);
+            const last = Math.max(first, index(end));
+            return new Blob([__pi_fetch_copy(bytes, first, last)], { type: contentType });
+        }
+        get [Symbol.toStringTag]() { return 'Blob'; }
+    }
+
+    class File extends Blob {
+        constructor(parts, name, options = {}) {
+            if (arguments.length < 2) throw new TypeError('File requires parts and a name');
+            super(parts, options);
+            const modified = options?.lastModified === undefined ? Date.now() : Number(options.lastModified);
+            __pi_fetch_set(__pi_fetch_files, this, {
+                name: __pi_fetch_scalar_string(name),
+                lastModified: Number.isFinite(modified) ? Math.trunc(modified) : 0,
+            });
+        }
+        get name() {
+            const state = __pi_fetch_get(__pi_fetch_files, this);
+            if (!state) throw new TypeError('Expected a File');
+            return state.name;
+        }
+        get lastModified() {
+            const state = __pi_fetch_get(__pi_fetch_files, this);
+            if (!state) throw new TypeError('Expected a File');
+            return state.lastModified;
+        }
+        get [Symbol.toStringTag]() { return 'File'; }
+    }
+
+    const __pi_fetch_form_entries = (value) => {
+        const entries = __pi_fetch_get(__pi_fetch_forms, value);
+        if (!entries) throw new TypeError('Expected FormData');
+        return entries;
+    };
+    const __pi_fetch_form_entry = (name, value, filename) => {
+        const key = __pi_fetch_scalar_string(name);
+        const blob = __pi_fetch_get(__pi_fetch_blobs, value);
+        if (!blob) {
+            if (filename !== undefined) throw new TypeError('A filename requires a Blob value');
+            return [key, __pi_fetch_scalar_string(value)];
+        }
+        const file = __pi_fetch_get(__pi_fetch_files, value);
+        return [key, file && filename === undefined ? value : new File([value],
+            filename === undefined ? 'blob' : filename,
+            { type: blob.type, lastModified: file ? file.lastModified : Date.now() })];
+    };
+
+    class FormData {
+        constructor(form) {
+            if (form !== undefined) throw new TypeError('DOM form construction is unavailable in PiJS');
+            __pi_fetch_set(__pi_fetch_forms, this, []);
+        }
+        append(name, value, filename) {
+            if (arguments.length < 2) throw new TypeError('FormData.append requires a name and value');
+            __pi_fetch_form_entries(this).push(__pi_fetch_form_entry(name, value, filename));
+        }
+        set(name, value, filename) {
+            if (arguments.length < 2) throw new TypeError('FormData.set requires a name and value');
+            const entry = __pi_fetch_form_entry(name, value, filename);
+            const entries = __pi_fetch_form_entries(this);
+            const index = entries.findIndex(([key]) => key === entry[0]);
+            if (index < 0) { entries.push(entry); return; }
+            entries[index] = entry;
+            for (let i = entries.length - 1; i > index; i--) if (entries[i][0] === entry[0]) entries.splice(i, 1);
+        }
+        get(name) {
+            const key = __pi_fetch_scalar_string(name);
+            const entry = __pi_fetch_form_entries(this).find(([candidate]) => candidate === key);
+            return entry ? entry[1] : null;
+        }
+        getAll(name) {
+            const key = __pi_fetch_scalar_string(name);
+            return __pi_fetch_form_entries(this).filter(([candidate]) => candidate === key).map((entry) => entry[1]);
+        }
+        has(name) {
+            const key = __pi_fetch_scalar_string(name);
+            return __pi_fetch_form_entries(this).some(([candidate]) => candidate === key);
+        }
+        delete(name) {
+            const key = __pi_fetch_scalar_string(name);
+            const entries = __pi_fetch_form_entries(this);
+            for (let i = entries.length - 1; i >= 0; i--) if (entries[i][0] === key) entries.splice(i, 1);
+        }
+        *entries() { for (const [name, value] of __pi_fetch_form_entries(this)) yield [name, value]; }
+        *keys() { for (const [name] of __pi_fetch_form_entries(this)) yield name; }
+        *values() { for (const [, value] of __pi_fetch_form_entries(this)) yield value; }
+        forEach(callback, thisArg) {
+            if (typeof callback !== 'function') throw new TypeError('FormData callback must be a function');
+            for (const [name, value] of __pi_fetch_form_entries(this)) callback.call(thisArg, value, name, this);
+        }
+        [Symbol.iterator]() { return this.entries(); }
+        get [Symbol.toStringTag]() { return 'FormData'; }
+    }
+
+    const __pi_fetch_multipart = (form) => {
+        const random = new Uint8Array(18);
+        __pi_fetch_random(random);
+        const boundary = '----pi-formdata-' + Array.from(random, (byte) => byte.toString(16).padStart(2, '0')).join('') +
+            (++__pi_fetch_boundary_sequence).toString(36);
+        const newline = (value) => value.replace(/\r\n|\r|\n/g, '\r\n');
+        const escape = (value) => value.replace(/[\r\n"]/g, (character) =>
+            character === '\r' ? '%0D' : character === '\n' ? '%0A' : '%22');
+        const chunks = [];
+        let length = 0;
+        const append = (bytes) => {
+            length = __pi_fetch_check_size(length + bytes.byteLength);
+            chunks.push(bytes);
+        };
+        const text = (value) => append(__pi_fetch_encode(value, __pi_fetch_body_limit - length));
+        // Serialize now: later mutation of the FormData cannot alter a Request.
+        for (const [name, value] of __pi_fetch_form_entries(form)) {
+            let header = '--' + boundary + '\r\nContent-Disposition: form-data; name="' + escape(newline(name)) + '"';
+            const blob = __pi_fetch_get(__pi_fetch_blobs, value);
+            if (blob) {
+                const file = __pi_fetch_get(__pi_fetch_files, value);
+                header += '; filename="' + escape(file.name) + '"\r\nContent-Type: ' + (blob.type || 'application/octet-stream');
+            }
+            text(header + '\r\n\r\n');
+            if (blob) append(blob.bytes);
+            else text(newline(value));
+            text('\r\n');
+        }
+        text('--' + boundary + '--\r\n');
+        return { bytes: __pi_fetch_join(chunks, length), type: 'multipart/form-data; boundary=' + boundary };
+    };
+
+    const __pi_fetch_extract_body = (value, allowStream = false) => {
+        if (value === undefined || value === null) return { bytes: null, stream: null, type: null };
+        if (typeof value.getReader === 'function') {
+            if (!allowStream) throw new TypeError('Streaming request bodies are not available in PiJS');
+            if (value.locked || value._disturbed) throw new TypeError('Body is already used');
+            return { bytes: null, stream: value, type: null };
+        }
+        const blob = __pi_fetch_get(__pi_fetch_blobs, value);
+        if (blob) return { bytes: blob.bytes, type: blob.type || null };
+        if (__pi_fetch_get(__pi_fetch_forms, value)) return __pi_fetch_multipart(value);
+        const view = __pi_fetch_byte_view(value);
+        if (view) {
+            __pi_fetch_check_size(view.byteLength);
+            return { bytes: __pi_fetch_copy(view), type: null };
+        }
+        const text = __pi_fetch_scalar_string(value);
+        const type = typeof globalThis.URLSearchParams === 'function' && value instanceof globalThis.URLSearchParams
+            ? 'application/x-www-form-urlencoded;charset=UTF-8' : 'text/plain;charset=UTF-8';
+        return { bytes: __pi_fetch_encode(text), text, type };
+    };
+    const __pi_fetch_body_state = (value) => {
+        const state = __pi_fetch_get(__pi_fetch_bodies, value);
+        if (!state) throw new TypeError('Expected a Fetch body');
+        return state;
+    };
+    const __pi_fetch_body_usable = (state) => {
+        if (state.used || (state.stream && (state.stream.locked || state.stream._disturbed))) {
+            throw new TypeError('Body is already used');
+        }
+    };
+    const __pi_fetch_install_body = (target, extracted) => {
+        __pi_fetch_set(__pi_fetch_bodies, target, {
+            ...extracted, used: false,
+            stream: extracted.bytes !== null ? __pi_fetch_byte_stream(extracted.bytes) : extracted.stream || null,
+        });
+    };
+    const __pi_fetch_take_body = (state) => {
+        __pi_fetch_body_usable(state);
+        if (!state.stream) return;
+        // Buffered Request bodies own no external producer. Retire their view,
+        // retaining its reader lock like a transferred/consumed Fetch body.
+        const reader = __pi_fetch_reader(state.stream);
+        state.used = true;
+        state.bytes = null;
+        state.text = undefined;
+        Promise.resolve(reader.cancel()).catch(() => {});
+    };
+    class FetchBody {
+        constructor(extracted) { __pi_fetch_install_body(this, extracted); }
+        get body() { return __pi_fetch_body_state(this).stream; }
+        get bodyUsed() {
+            const state = __pi_fetch_body_state(this);
+            return state.used || !!(state.stream && state.stream._disturbed);
+        }
+        async _consume() {
+            const state = __pi_fetch_body_state(this);
+            __pi_fetch_body_usable(state);
+            if (!state.stream) return new Uint8Array();
+            state.used = true;
+            state.bytes = null;
+            state.text = undefined;
+            const reader = state.stream.getReader();
+            const chunks = [];
+            let length = 0;
             try {
                 while (true) {
                     const result = await reader.read();
                     if (result.done) break;
                     const bytes = __pi_fetch_bytes(result.value);
-                    chunks.push(bytes);
-                    size += bytes.byteLength;
+                    length = __pi_fetch_check_size(length + bytes.byteLength);
+                    chunks.push(__pi_fetch_copy(bytes));
                 }
+            } catch (error) {
+                // Cancellation may wait on an unconsumed tee sibling or a
+                // producer that never settles; rejection must stay bounded.
+                try { Promise.resolve(reader.cancel(error)).catch(() => {}); } catch (_) {}
+                throw error;
             } finally { reader.releaseLock(); }
-            const bytes = new Uint8Array(size);
-            let offset = 0;
-            for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-            return bytes;
+            return __pi_fetch_join(chunks, length);
         }
         async text() { return new TextDecoder().decode(await this._consume()); }
         async json() { return JSON.parse(await this.text()); }
         async arrayBuffer() { return (await this._consume()).buffer; }
-        clone() {
-            if (this.bodyUsed || (this.body && this.body.locked)) throw new TypeError('Response body is already used');
-            let body = null;
-            if (this.body) {
-                const branches = this.body.tee();
-                this.body = branches[0];
-                body = branches[1];
-            }
-            return new Response(body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, redirected: this.redirected });
-        }
+        async bytes() { return this._consume(); }
+        async blob() { return new Blob([await this._consume()], { type: this.headers.get('content-type') || '' }); }
     }
 
+    class Response extends FetchBody {
+        constructor(body, init) {
+            const options = init && typeof init === 'object' ? init : {};
+            const extracted = __pi_fetch_extract_body(body, true);
+            super(extracted);
+            this.status = Number(options.status === undefined ? 200 : options.status);
+            this.statusText = String(options.statusText || '');
+            this.ok = this.status >= 200 && this.status < 300;
+            this.headers = new Headers(options.headers || {});
+            if (extracted.type && !this.headers.has('content-type')) this.headers.set('content-type', extracted.type);
+            this.url = String(options.url || '');
+            this.redirected = !!options.redirected;
+        }
+        clone() {
+            const state = __pi_fetch_body_state(this);
+            __pi_fetch_body_usable(state);
+            const init = { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, redirected: this.redirected };
+            if (state.bytes !== null) {
+                const clone = new Response(null, init);
+                __pi_fetch_install_body(clone, { bytes: state.bytes, text: state.text, type: state.type });
+                return clone;
+            }
+            let body = null;
+            if (state.stream) {
+                const branches = state.stream.tee();
+                state.stream = branches[0];
+                body = branches[1];
+            }
+            return new Response(body, init);
+        }
+        get [Symbol.toStringTag]() { return 'Response'; }
+    }
+
+    globalThis.Blob = Blob;
+    globalThis.File = File;
+    globalThis.FormData = FormData;
     globalThis.Headers = Headers;
     globalThis.Response = Response;
 
@@ -31887,39 +32232,105 @@ if (typeof globalThis.fetch !== 'function') {
         globalThis.AbortSignal = AbortSignal;
     }
 
+    const __pi_fetch_validate_signal = (signal) => {
+        if (signal !== undefined && signal !== null &&
+            (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function' ||
+             typeof signal.removeEventListener !== 'function')) throw new TypeError('Expected an AbortSignal');
+    };
+    const __pi_fetch_request_state = (value) => {
+        const state = __pi_fetch_get(__pi_fetch_requests, value);
+        if (!state) throw new TypeError('Expected a Request');
+        return state;
+    };
+    class Request extends FetchBody {
+        constructor(input, init = {}) {
+            if (arguments.length === 0) throw new TypeError('Request requires a URL');
+            const options = init && typeof init === 'object' ? init : {};
+            const source = __pi_fetch_get(__pi_fetch_requests, input);
+            const url = new globalThis.URL(source ? source.url : String(input));
+            if (url.username || url.password) throw new TypeError('Request URLs must not include credentials');
+            const method = String(options.method === undefined ? source ? source.method : 'GET' : options.method).toUpperCase();
+            if (!/^[!#$%&'*+\-.^_`|~0-9A-Z]+$/.test(method) || ['CONNECT', 'TRACE', 'TRACK'].includes(method)) {
+                throw new TypeError('Invalid Request method');
+            }
+            const suppliedBody = options.body;
+            const inherited = source && (suppliedBody === undefined || suppliedBody === null)
+                ? __pi_fetch_body_state(input) : null;
+            if (inherited) __pi_fetch_body_usable(inherited);
+            const extracted = inherited
+                ? { bytes: inherited.bytes, text: inherited.text, type: inherited.type }
+                : __pi_fetch_extract_body(suppliedBody);
+            if ((method === 'GET' || method === 'HEAD') && extracted.bytes !== null) {
+                throw new TypeError('GET and HEAD requests must not include a body');
+            }
+            const headers = new Headers(options.headers === undefined && source ? source.headers : options.headers);
+            if (!inherited && extracted.type && !headers.has('content-type')) headers.set('content-type', extracted.type);
+            const signal = options.signal === undefined
+                ? source ? source.signal : new globalThis.AbortController().signal
+                : options.signal === null ? new globalThis.AbortController().signal : options.signal;
+            __pi_fetch_validate_signal(signal);
+            super(extracted);
+            __pi_fetch_set(__pi_fetch_requests, this, { url: url.href, method, headers, signal });
+            // Explicit replacement bodies never inspect or consume the old one.
+            if (inherited) __pi_fetch_take_body(inherited);
+        }
+        get url() { return __pi_fetch_request_state(this).url; }
+        get method() { return __pi_fetch_request_state(this).method; }
+        get headers() { return __pi_fetch_request_state(this).headers; }
+        get signal() { return __pi_fetch_request_state(this).signal; }
+        clone() {
+            const source = __pi_fetch_request_state(this);
+            const body = __pi_fetch_body_state(this);
+            __pi_fetch_body_usable(body);
+            const clone = new Request(source.url, { method: source.method, headers: source.headers, signal: source.signal });
+            __pi_fetch_install_body(clone, { bytes: body.bytes, text: body.text, type: body.type });
+            return clone;
+        }
+        get [Symbol.toStringTag]() { return 'Request'; }
+    }
+    globalThis.Request = Request;
+
     const __pi_fetch = async (input, init, nodeResponse = false) => {
-        const url = typeof input === 'string' ? input : String(input && input.url ? input.url : input);
+        const source = __pi_fetch_get(__pi_fetch_requests, input);
+        const url = source ? source.url : typeof input === 'string' ? input : String(input && input.url ? input.url : input);
         const options = init && typeof init === 'object' ? init : {};
         const inputRequest = input && typeof input === 'object' && typeof input.url === 'string' ? input : null;
-        const option = (name) => options[name] === undefined && inputRequest ? inputRequest[name] : options[name];
-        const method = option('method') === undefined ? 'GET' : String(option('method'));
+        const option = (name) => {
+            const value = options[name];
+            if (value !== undefined) return value;
+            if (source && (name === 'method' || name === 'headers' || name === 'signal')) return source[name];
+            return inputRequest ? inputRequest[name] : undefined;
+        };
+        const requestedMethod = option('method');
+        const method = requestedMethod === undefined ? 'GET' : String(requestedMethod).toUpperCase();
         const signal = option('signal');
         const abortReason = () => signal.reason === undefined ? __pi_fetch_abort_error() : signal.reason;
-        if (signal !== undefined && signal !== null) {
-            if (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function') throw new TypeError('fetch signal must be an AbortSignal');
-            if (signal.aborted) throw abortReason();
+        __pi_fetch_validate_signal(signal);
+        if (signal && signal.aborted) throw abortReason();
+        const dispatcher = option('dispatcher');
+        if (dispatcher !== undefined && dispatcher !== null) throw new TypeError('Custom fetch dispatchers are not available in PiJS; use the capability-gated fetch transport');
+        const headerValues = new Headers(option('headers'));
+        const suppliedBody = options.body;
+        const inheritedBody = source && (suppliedBody === undefined || suppliedBody === null)
+            ? __pi_fetch_body_state(input) : null;
+        if (inheritedBody) __pi_fetch_body_usable(inheritedBody);
+        else if (inputRequest && inputRequest.bodyUsed && suppliedBody === undefined) throw new TypeError('Request body is already used');
+        const extracted = inheritedBody
+            ? { bytes: inheritedBody.bytes, text: inheritedBody.text, type: inheritedBody.type }
+            : __pi_fetch_extract_body(suppliedBody === undefined && inputRequest ? inputRequest.body : suppliedBody);
+        if ((method === 'GET' || method === 'HEAD') && extracted.bytes !== null) {
+            throw new TypeError('GET and HEAD requests must not include a body');
         }
-        if (option('dispatcher') !== undefined && option('dispatcher') !== null) throw new TypeError('Custom fetch dispatchers are not available in PiJS; use the capability-gated fetch transport');
-        if (inputRequest && inputRequest.bodyUsed) throw new TypeError('Request body is already used');
+        if (!inheritedBody && extracted.type && !headerValues.has('content-type')) headerValues.set('content-type', extracted.type);
         const headers = Object.create(null);
-        for (const [key, value] of new Headers(option('headers'))) headers[key] = value;
-
-        let body = undefined;
-        let body_bytes = undefined;
-        const requestBody = option('body');
-        if (requestBody !== undefined && requestBody !== null) {
-            if (typeof requestBody.getReader === 'function') throw new TypeError('Streaming request bodies are not available in PiJS');
-            const encoded = __pi_fetch_body_bytes_to_base64(requestBody);
-            if (encoded !== null) {
-                body_bytes = encoded;
-            } else {
-                body = typeof requestBody === 'string' ? requestBody : String(requestBody);
-            }
-        }
+        for (const [key, value] of headerValues) headers[key] = value;
 
         const request = { url, method, headers, stream: true };
-        if (body !== undefined) request.body = body;
-        if (body_bytes !== undefined) request.body_bytes = body_bytes;
+        if (extracted.bytes !== null) {
+            __pi_fetch_check_size(extracted.bytes.byteLength);
+            if (extracted.text !== undefined) request.body = extracted.text;
+            else request.body_bytes = __pi_fetch_body_bytes_to_base64(extracted.bytes);
+        }
         // node:http already supports a host-enforced timeout. Keep that
         // option on the same capability-gated transport and native deadline.
         if (nodeResponse && options.timeout !== undefined) request.timeout = options.timeout;
@@ -31975,6 +32386,7 @@ if (typeof globalThis.fetch !== 'function') {
             // Input/header getters can themselves abort during normalization.
             if (signal && signal.aborted) onAbort();
             if (stopped) throw stopReason;
+            if (inheritedBody) __pi_fetch_take_body(inheritedBody);
             const virtual = typeof globalThis.__pi_virtual_http_dispatch === 'function' ? globalThis.__pi_virtual_http_dispatch(request) : null;
             const stream = virtual === null ? pi.http(request) : virtual;
             if (stream && typeof stream.next === 'function') iterator = stream;
@@ -32227,7 +32639,7 @@ for (const name of Object.getOwnPropertyNames(globalThis)) {
     } catch (_) {}
 }
 })();
-")
+"#)
         ]
         .concat()
     })
@@ -32401,8 +32813,8 @@ mod tests {
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            299_181,
-            "9ff03c39cad17b85b2fe7dc87b27b5ba37a3e5a740158c8d18b0f2d653ed66fc",
+            320_417,
+            "ad4973e1e09851db7d622896ca76ac5a2819f71c15c6fe4b90369dcee986923f",
         ),
         // Demand-driven file reads add byte ranges and owned descriptor cleanup.
         // Incremental write acknowledgements, descriptor ownership and amortized
@@ -37509,6 +37921,285 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert!(
                 payload.get("body").is_none(),
                 "binary fetch bodies must use body_bytes instead of text coercion: {payload:?}"
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_fetch_multipart_request_snapshots_binary_files_and_headers() {
+        use base64::Engine as _;
+
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+const backing = new Uint8Array([9, 0, 255, 7, 128, 9]);
+const file = new File([new DataView(backing.buffer, 1, 4)], 'r"\n.txt',
+    { type: 'APPLICATION/OCTET-STREAM', lastModified: 1234 });
+const form = new FormData();
+form.append('tag', 'alpha');
+form.append('upload', file);
+form.append('tag', 'line1\nline2');
+form.append('field"\r\nname', 'last');
+const request = new Request('https://example.com/upload', {
+    method: 'POST', headers: { 'x-test': 'kept' }, body: form,
+});
+const copy = request.clone();
+backing.fill(99);
+form.set('tag', 'changed later');
+fetch(request);
+fetch(copy, { headers: { 'content-type': 'application/x-fixed' } });
+const stripped = new Request('https://example.com/text', { method: 'POST', body: 'payload' });
+stripped.headers.delete('content-type');
+const transferred = new Request(stripped);
+fetch(transferred);
+globalThis.fetchUploadState = {
+    originalUsed: request.bodyUsed, copyUsed: copy.bodyUsed,
+    transferredUsed: transferred.bodyUsed, oldViewUsed: stripped.bodyUsed,
+};
+"#,
+                ))
+                .await
+                .expect("evaluate multipart upload");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 3);
+            assert!(requests.iter().all(|request| matches!(&request.kind, HostcallKind::Http)));
+            let payload = &requests[0].payload;
+            assert_eq!(payload["method"], "POST");
+            assert_eq!(payload["headers"]["x-test"], "kept");
+            assert!(payload.get("body").is_none());
+            let boundary = payload["headers"]["content-type"]
+                .as_str()
+                .and_then(|value| value.strip_prefix("multipart/form-data; boundary="))
+                .expect("inferred multipart boundary");
+            let actual = base64::engine::general_purpose::STANDARD
+                .decode(payload["body_bytes"].as_str().expect("binary payload"))
+                .expect("valid base64");
+            let mut expected = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\nalpha\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"r%22%0A.txt\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            )
+            .into_bytes();
+            expected.extend_from_slice(&[0, 255, 7, 128]);
+            expected.extend_from_slice(
+                format!(
+                    "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\nline1\r\nline2\r\n\
+                     --{boundary}\r\nContent-Disposition: form-data; name=\"field%22%0D%0Aname\"\r\n\r\nlast\r\n\
+                     --{boundary}--\r\n"
+                )
+                .as_bytes(),
+            );
+            assert_eq!(actual, expected);
+            assert_eq!(
+                requests[1].payload["headers"]["content-type"],
+                "application/x-fixed"
+            );
+            assert_eq!(requests[1].payload["body_bytes"], payload["body_bytes"]);
+            assert_eq!(requests[2].payload["body"], "payload");
+            assert!(
+                requests[2].payload["headers"].get("content-type").is_none(),
+                "inheriting a Request must preserve a caller-deleted Content-Type"
+            );
+            assert_eq!(
+                get_global_json(&runtime, "fetchUploadState").await,
+                serde_json::json!({
+                    "originalUsed": true, "copyUsed": true,
+                    "transferredUsed": true, "oldViewUsed": true,
+                })
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_fetch_body_values_are_immutable_and_request_ownership_is_enforced() {
+        assert_web_stream_fixture(
+            r#"
+const throwsType = (operation) => { try { operation(); return false; } catch (error) { return error instanceof TypeError; } };
+const originalBytes = new Uint8Array([8, 0, 255, 7, 128, 9]);
+const file = new File([new DataView(originalBytes.buffer, 1, 4)], 'report.bin',
+    { type: 'APPLICATION/OCTET-STREAM', lastModified: 1234 });
+originalBytes.fill(99);
+check(file.size === 4 && file.type === 'application/octet-stream' && file.name === 'report.bin' && file.lastModified === 1234,
+    'File metadata and byte-view range are preserved');
+const exposed = new Uint8Array(await success(file.arrayBuffer(), 'file copy'));
+exposed.fill(1);
+check(Array.from(await success(file.bytes(), 'immutable file')).join(',') === '0,255,7,128',
+    'Blob construction and arrayBuffer results are copied');
+const blobReader = file.stream().getReader();
+const blobChunk = await success(blobReader.read(), 'blob stream');
+blobChunk.value.fill(2);
+blobReader.releaseLock();
+check(Array.from(await success(file.bytes(), 'immutable stream bytes')).join(',') === '0,255,7,128',
+    'Blob stream chunks cannot mutate stored bytes');
+check(Array.from(await success(file.slice(-3, -1).bytes(), 'blob slice')).join(',') === '255,7',
+    'Blob slices honor negative offsets');
+check(Array.from(await success(new Blob(['a\uD800', '\u00e9', new Uint8Array([0])]).bytes(), 'UTF-8 blob')).join(',') === '97,239,191,189,195,169,0',
+    'Blob strings normalize isolated surrogates and preserve binary parts');
+
+const fields = new FormData();
+fields.append('a', 'one'); fields.append('b', 'two'); fields.append('a', 'three');
+const exposedEntry = fields.entries().next().value;
+exposedEntry[1] = 'outside mutation';
+check(fields.getAll('a').join(',') === 'one,three', 'FormData preserves duplicates and hides entry storage');
+fields.set('a', 'replacement');
+check(Array.from(fields.keys()).join(',') === 'a,b' && fields.get('a') === 'replacement',
+    'FormData.set replaces the first entry and removes later duplicates');
+fields.append('file', file, 'renamed.bin');
+check(fields.get('file').name === 'renamed.bin' && fields.get('file').lastModified === 1234,
+    'FormData filename overrides retain File metadata');
+fields.delete('a');
+check(!fields.has('a') && fields.get('missing') === null, 'FormData deletion and missing lookups');
+
+const request = new Request('https://example.com/upload', { method: 'POST', body: file, headers: { 'x-test': 'original' } });
+const copy = request.clone();
+request.headers.set('x-test', 'changed');
+check(!request.bodyUsed && !copy.bodyUsed && copy.headers.get('x-test') === 'original',
+    'Request.clone leaves both bodies available and copies headers');
+check(Array.from(await success(copy.bytes(), 'clone bytes')).join(',') === '0,255,7,128' && !request.bodyUsed,
+    'Consuming a clone leaves the original body available');
+check(Array.from(await success(request.bytes(), 'original bytes')).join(',') === '0,255,7,128',
+    'Original and clone body reads are independent');
+check(throwsType(() => request.clone()) && throwsType(() => new Request(request)),
+    'Used bodies reject cloning and inheritance');
+const replacement = new Request(request, { body: '' });
+check(await success(replacement.text(), 'explicit replacement') === '', 'An explicit empty replacement accepts an already-used source');
+
+const inherited = new Request('https://example.com/upload', { method: 'POST', body: 'payload' });
+inherited.headers.delete('content-type');
+const transferred = new Request(inherited);
+check(inherited.bodyUsed && inherited.body.locked && !transferred.headers.has('content-type'),
+    'Request transfer consumes the old view and preserves deleted caller headers');
+check(await success(transferred.text(), 'transferred body') === 'payload', 'Transferred body retains its original bytes');
+
+const locked = new Request('https://example.com/upload', { method: 'POST', body: 'locked' });
+const lock = locked.body.getReader();
+check(throwsType(() => locked.clone()) && throwsType(() => new Request(locked)), 'Locked bodies reject clone and transfer');
+lock.releaseLock();
+const disturbedReader = locked.body.getReader();
+await success(disturbedReader.read(), 'external body read');
+disturbedReader.releaseLock();
+check(locked.bodyUsed && throwsType(() => locked.clone()), 'External reads disturb a Request even after release');
+const empty = new Request('https://example.com/');
+check(await success(empty.text(), 'empty body first') === '' && await success(empty.text(), 'empty body second') === '' && !empty.bodyUsed,
+    'Null body reads remain repeatable without marking body used');
+
+const response = new Response(file, { headers: { 'content-type': 'custom/type' } });
+const responseCopy = response.clone();
+const responseBlob = await success(response.blob(), 'Response.blob');
+check(responseBlob.type === 'custom/type' && Array.from(await success(responseBlob.bytes(), 'response blob bytes')).join(',') === '0,255,7,128',
+    'Response.blob preserves binary data and caller MIME metadata');
+check(Array.from(await success(responseCopy.bytes(), 'response clone')).join(',') === '0,255,7,128',
+    'Buffered Response clones have independent body consumption');
+let foreignLocked = false, foreignReads = 0, foreignReleases = 0;
+const foreign = {
+    get locked() { return foreignLocked; },
+    getReader() {
+        foreignLocked = true;
+        return {
+            async read() { return foreignReads++ === 0 ? { done: false, value: new Uint8Array([111, 107]) } : { done: true }; },
+            async cancel() {},
+            releaseLock() { foreignLocked = false; foreignReleases++; },
+        };
+    },
+};
+check(await success(new Response(foreign).text(), 'foreign Response body') === 'ok' && !foreignLocked && foreignReleases === 1,
+    'Accepted foreign reader bodies preserve existing consumption and release semantics');
+return checks;
+"#,
+            22,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_fetch_body_rejections_preserve_ownership_and_do_not_dispatch() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let fixture = [
+                "globalThis.fetchRejectedBodyFixture = { done: false };\n(async () => {\n",
+                WEB_STREAM_TEST_HELPERS,
+                r#"
+const reason = new Error('cancel before admission');
+const aborted = new AbortController();
+aborted.abort(reason);
+const request = new Request('https://example.com/upload', { method: 'POST', body: 'original', signal: aborted.signal });
+const abortedResult = await settle(fetch(request), 'pre-aborted upload');
+check(!abortedResult.ok && abortedResult.error === reason && !request.bodyUsed,
+    'A pre-aborted upload preserves its body and exact cancellation reason');
+const late = new AbortController();
+const lateReason = new Error('cancel from headers');
+const headers = {};
+Object.defineProperty(headers, 'x-abort', { enumerable: true, get() { late.abort(lateReason); return 'value'; } });
+const lateRequest = new Request('https://example.com/upload', { method: 'POST', body: 'retained' });
+const lateResult = await settle(fetch(lateRequest, { signal: late.signal, headers }), 'header getter cancellation');
+check(!lateResult.ok && lateResult.error === lateReason && !lateRequest.bodyUsed,
+    'Cancellation during normalization prevents admission and body consumption');
+const streaming = await settle(fetch('https://example.com/upload', {
+    method: 'POST', body: new ReadableStream({ start(controller) { controller.close(); } }),
+}), 'unsupported streaming upload');
+check(!streaming.ok && streaming.error instanceof TypeError, 'Arbitrary request streams remain explicitly unsupported');
+const lockedRequest = new Request('https://example.com/upload', { method: 'POST', body: 'locked' });
+const lock = lockedRequest.body.getReader();
+const lockedResult = await settle(fetch(lockedRequest), 'locked request upload');
+check(!lockedResult.ok && lockedResult.error instanceof TypeError && !lockedRequest.bodyUsed,
+    'A locked Request is rejected before dispatch');
+lock.releaseLock();
+
+const limit = Number(globalThis.__pi_fetch_max_request_bytes);
+const unit = Math.min(limit, 1024 * 1024);
+const part = new File([new Uint8Array(unit)], 'part.bin');
+let aggregateError;
+try { new Blob(Array(Math.floor(limit / unit) + 1).fill(part)); } catch (error) { aggregateError = error; }
+check(aggregateError?.code === 'ERR_PIJS_BODY_TOO_LARGE', 'Blob aggregate bounds reject before joining repeated private parts');
+const prefix = new Blob([new Uint8Array((limit - 1) % unit)]);
+let encodedError;
+try { new Blob([...Array(Math.floor((limit - 1) / unit)).fill(part), prefix, '\u00e9']); } catch (error) { encodedError = error; }
+check(encodedError?.code === 'ERR_PIJS_BODY_TOO_LARGE', 'UTF-8 byte counts include multibyte expansion');
+const form = new FormData();
+for (let index = 0; index < Math.ceil(limit / unit); index++) form.append('file', part);
+const multipart = await settle(fetch('https://example.com/upload', { method: 'POST', body: form }), 'multipart limit');
+check(!multipart.ok && multipart.error.code === 'ERR_PIJS_BODY_TOO_LARGE',
+    'Multipart bounds include headers, boundaries and repeated file bytes before dispatch');
+
+let cancelled = 0;
+const chunk = new Uint8Array(unit);
+const stream = new ReadableStream({
+    pull(controller) { controller.enqueue(chunk); },
+    cancel() { cancelled++; return new Promise(() => {}); },
+});
+const response = new Response(stream);
+const overflow = await settle(response.arrayBuffer(), 'bounded response overflow');
+check(!overflow.ok && overflow.error.code === 'ERR_PIJS_BODY_TOO_LARGE',
+    'Response consumption rejects at its bound even if producer cancellation never settles');
+await tick();
+check(cancelled === 1 && !stream.locked && response.bodyUsed,
+    'Failed consumption requests cancellation once and releases its reader');
+return checks;
+"#,
+                "\n})().then(checks => { globalThis.fetchRejectedBodyFixture = { done: true, checks }; }, error => { globalThis.fetchRejectedBodyFixture = { done: false, error: String(error) }; });",
+            ]
+            .concat();
+            runtime
+                .eval(&privileged_test_script(&runtime, &fixture))
+                .await
+                .expect("evaluate rejected Fetch bodies");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fetchRejectedBodyFixture").await;
+            assert_eq!(result["done"], serde_json::json!(true), "{result}");
+            assert_eq!(result["checks"].as_array().map(Vec::len), Some(9), "{result}");
+            assert!(
+                runtime.drain_hostcall_requests().is_empty(),
+                "invalid or cancelled uploads must not enter the native HTTP queue"
             );
         });
     }
