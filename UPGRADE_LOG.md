@@ -158,3 +158,71 @@ serde_json's `preserve_order` to fsqlite-ext-json, so pi's
   diet is upstream engine work, not a downstream feature toggle.
 - Gates: 7183/7183 lib tests, session e2e suites green, clippy `-D warnings`
   clean, fmt clean.
+
+## 2026-11-23: semver lock refresh (11 crates)
+
+`cargo update` within the existing requirements. Cargo.toml is unchanged.
+
+| Crate | From | To |
+|---|---|---|
+| anyhow | 1.0.104 | 1.0.105 |
+| globset | 0.4.21 | 0.4.22 |
+| grep-matcher | 0.1.9 | 0.1.10 |
+| grep-regex | 0.1.14 | 0.1.15 |
+| grep-searcher | 0.1.17 | 0.1.18 |
+| ignore | 0.4.34 | 0.4.35 |
+| lru | 0.19.1 | 0.19.2 |
+| swc_ecma_codegen | 34.0.0 | 34.0.1 |
+| swc_ecma_parser | 48.0.0 | 48.1.0 |
+| swc_ecma_transforms_base | 52.0.0 | 52.0.1 |
+| swc_ecma_utils | 37.0.0 | 37.0.1 |
+
+Held back:
+
+- **filetime 0.2.30** deprecates `filetime::set_file_mtime` in favour of
+  `std::fs::set_times`. With it, `clippy --all-targets -D warnings` fails on
+  11 calls in the library (src/session.rs, src/tools.rs, src/gc.rs,
+  src/jobs.rs, src/file_lock.rs, src/worktree_iso.rs), and src/main.rs and
+  two test files have more. filetime stays at 0.2.29 until those calls move
+  to std.
+- **ahash 0.8.13** was published the same day; left for the next refresh.
+- Releases outside the current requirements, not attempted: asupersync 0.7.0
+  (published 11-21), charmed-glamour and charmed-lipgloss 0.3.0 (11-22),
+  jsonschema 0.63 (11-22), zip 9.8.2 (11-23; Cargo.toml pins `=9.8.1`). Each
+  was days old and needs its own gate and benchmarks. rquickjs 0.14.0 would
+  first need the patched rquickjs-sys 0.12.2 ported. charmed-bubbles and
+  charmed-bubbletea stay at 0.2.0 because of the wrapped-tail rendering
+  regression in 0.2.4 (tracked in .beads).
+
+Performance: the `search_backends` and `ext_load_init` benches (perf
+profile), 3 runs before and 3 after on the same x86-64 Linux builder. Medians
+of the criterion point estimates:
+
+| Bench | Before | After | Change |
+|---|---|---|---|
+| ext_load_init/load_init_cold/hello | 5.259 ms | 4.771 ms | -9.3% |
+| ext_load_init/load_init_cold/pirate | 5.095 ms | 4.780 ms | -6.2% |
+| search_backends/grep_inproc_2k_files | 427.25 ms | 432.09 ms | +1.1% |
+| search_backends/find_inproc_2k_files | 190.20 ms | 183.50 ms | -3.5% |
+| search_backends/grep_external_2k_files (control) | 440.86 ms | 442.03 ms | +0.3% |
+| search_backends/find_external_2k_files (control) | 198.79 ms | 185.75 ms | -6.6% |
+
+The `*_external_*` rows run the external `rg`/`fd` binaries, which this
+refresh does not touch. They moved by up to 6.6%, which is the noise floor
+of this builder, and no in-process row slowed by more than that.
+
+Gates, with the new lock on top of ca25491af:
+
+- `clippy --locked --all-targets --keep-going -- -D warnings`: clean.
+- `cargo test --lib`: 15926 passed and 2 failed (15935 ran, 7 ignored).
+  Both failures are timing-sensitive tests
+  (`extension_command_deadline_cancels_blocked_session_hostcalls_and_reuses_shard`,
+  `active_backend_is_not_polled_while_live_identity_is_unresolved`), and
+  both passed on a rerun on another builder with the same lock (109 passed,
+  2 ignored, across their two modules).
+- tools_conformance 289/289, extensions_concurrent_correctness 136/136,
+  e2e_ts_extension_loading 146/146, config_edge_cases 157/157,
+  config_precedence 124/124, ext_entry_scan 4/4.
+- extensions_fs_shim: 62 passed and 1 failed. The failure,
+  `fs_directory_rename_preflights_nested_source_and_destination_admission`,
+  also fails without this refresh.
