@@ -1071,6 +1071,16 @@ fn forward_acp_input(
 /// Reads JSON-RPC requests line-by-line from stdin, dispatches them,
 /// and writes JSON-RPC responses/notifications to stdout.
 pub async fn run_stdio(options: AcpOptions) -> Result<()> {
+    Box::pin(run_stdio_inner(options, None)).await
+}
+
+/// Stop accepting input when the host requests shutdown, then await prompt
+/// persistence, external-tool cleanup and final stdout delivery.
+pub async fn run_stdio_with_shutdown(options: AcpOptions, shutdown: AbortSignal) -> Result<()> {
+    Box::pin(run_stdio_inner(options, Some(shutdown))).await
+}
+
+async fn run_stdio_inner(options: AcpOptions, shutdown: Option<AbortSignal>) -> Result<()> {
     let (in_tx, in_rx) =
         asupersync::channel::mpsc::channel::<io::Result<String>>(ACP_INPUT_QUEUE_CAPACITY);
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
@@ -1098,7 +1108,8 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
         let _ = writer_done_tx.send(result);
     });
 
-    let result = Box::pin(run_with_input(options, AcpInput::Stdio(in_rx), out_tx)).await;
+    let result =
+        Box::pin(run_with_input(options, AcpInput::Stdio(in_rx), out_tx, shutdown)).await;
     // Prompt settlement can leave final frames queued. The process must keep
     // running until stdout flushes them, or report that delivery is incomplete.
     // A blocked OS write cannot be joined safely on an async worker.
@@ -1160,11 +1171,16 @@ async fn run(
     in_rx: asupersync::channel::mpsc::Receiver<String>,
     out_tx: AcpOutput,
 ) -> Result<()> {
-    Box::pin(run_with_input(options, AcpInput::Lines(in_rx), out_tx)).await
+    Box::pin(run_with_input(options, AcpInput::Lines(in_rx), out_tx, None)).await
 }
 
 /// Core ACP event loop, including ordered stdin failures and owner cleanup.
-async fn run_with_input(options: AcpOptions, mut input: AcpInput, out_tx: AcpOutput) -> Result<()> {
+async fn run_with_input(
+    options: AcpOptions,
+    mut input: AcpInput,
+    out_tx: AcpOutput,
+    shutdown: Option<AbortSignal>,
+) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
     let sessions: AcpSessionsMap = Arc::new(Mutex::new(HashMap::new()));
     let prompt_counter = Arc::new(AtomicU64::new(0));
@@ -1180,6 +1196,11 @@ async fn run_with_input(options: AcpOptions, mut input: AcpInput, out_tx: AcpOut
                 // outer failure race. Never dispatch another request after a lost frame.
                 if let Some(reason) = out_tx.failure_reason() {
                     return Err(Error::session(reason));
+                }
+                // Buffered input can stay ready within one poll. Stop before
+                // admitting another request even if the outer race cannot run.
+                if shutdown.as_ref().is_some_and(AbortSignal::is_aborted) {
+                    return Ok(());
                 }
                 let line = match frame.and_then(|line| {
                     if line.strip_suffix('\n').unwrap_or(&line).len() > MAX_ACP_INPUT_FRAME_BYTES {
@@ -2034,15 +2055,29 @@ async fn run_with_input(options: AcpOptions, mut input: AcpInput, out_tx: AcpOut
             }
             Ok(())
         };
-        // A writer failure must wake even an idle dispatcher or one awaiting a
-        // management operation. Drop that operation before draining prompt owners.
-        let failure = out_tx.shared.failure.wait();
-        futures::pin_mut!(dispatch, failure);
-        match futures::future::select(failure, dispatch).await {
-            futures::future::Either::Left(_) => Err(Error::session(
-                out_tx.failure_reason().unwrap_or("ACP output failed"),
-            )),
-            futures::future::Either::Right((result, _)) => result,
+        // Stop only dispatch. The signal must never drop prompt persistence,
+        // MCP cleanup or the stdout flush that follows this scope.
+        let stop = async {
+            let failure = out_tx.shared.failure.wait();
+            let requested = async {
+                if let Some(signal) = &shutdown {
+                    signal.wait().await;
+                } else {
+                    futures::future::pending::<()>().await;
+                }
+            };
+            futures::pin_mut!(failure, requested);
+            match futures::future::select(failure, requested).await {
+                futures::future::Either::Left(_) => Err(Error::session(
+                    out_tx.failure_reason().unwrap_or("ACP output failed"),
+                )),
+                futures::future::Either::Right(_) => Ok(()),
+            }
+        };
+        futures::pin_mut!(dispatch, stop);
+        match futures::future::select(stop, dispatch).await {
+            futures::future::Either::Left((result, _))
+            | futures::future::Either::Right((result, _)) => result,
         }
     };
 
@@ -4251,6 +4286,7 @@ mod tests {
                     options,
                     AcpInput::Stdio(receiver),
                     output.clone(),
+                    None,
                 )),
                 settle,
             );
@@ -4290,6 +4326,7 @@ mod tests {
                 options,
                 AcpInput::Stdio(receiver),
                 AcpOutput::new(tx),
+                None,
             ))
             .await
             .expect("ordinary malformed JSON does not close admission");
@@ -4610,11 +4647,13 @@ mod tests {
         ErrorThenComplete,
         StreamAbortedThenComplete,
         ToolThenBurst,
+        WriteThenPending,
     }
 
     struct PromptTestProvider {
         outcome: PromptTestOutcome,
         calls: AtomicUsize,
+        pending_tool_started: Arc<AtomicBool>,
         save_fault: Option<(Arc<Mutex<Session>>, PathBuf)>,
     }
 
@@ -4661,7 +4700,32 @@ mod tests {
             };
             let mut message = partial.clone();
             let mut events = vec![Ok(StreamEvent::Start { partial })];
-            if matches!(self.outcome, PromptTestOutcome::ToolThenBurst) && call_number == 0 {
+            if matches!(self.outcome, PromptTestOutcome::WriteThenPending) && call_number == 0 {
+                message.content = vec![
+                    serde_json::from_value(json!({
+                        "type": "toolCall",
+                        "id": "write-before-shutdown",
+                        "name": "write",
+                        "arguments": {
+                            "path": "shutdown-effect.txt",
+                            "content": "written before shutdown\n",
+                        },
+                    }))
+                    .expect("write fixture"),
+                    serde_json::from_value(json!({
+                        "type": "toolCall",
+                        "id": "pending-during-shutdown",
+                        "name": "pending_shutdown_tool",
+                        "arguments": {},
+                    }))
+                    .expect("pending tool fixture"),
+                ];
+                message.stop_reason = StopReason::ToolUse;
+                events.push(Ok(StreamEvent::Done {
+                    reason: StopReason::ToolUse,
+                    message,
+                }));
+            } else if matches!(self.outcome, PromptTestOutcome::ToolThenBurst) && call_number == 0 {
                 message.content = vec![
                     serde_json::from_value(json!({
                         "type": "toolCall",
@@ -4724,6 +4788,44 @@ mod tests {
         }
     }
 
+    struct PendingShutdownTool {
+        started: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::tools::Tool for PendingShutdownTool {
+        fn name(&self) -> &str {
+            "pending_shutdown_tool"
+        }
+
+        fn label(&self) -> &str {
+            "Pending shutdown tool"
+        }
+
+        fn description(&self) -> &str {
+            "Wait until the owning native turn is cancelled or dropped"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type":"object"})
+        }
+
+        fn effects(&self) -> crate::tools::ToolEffects {
+            crate::tools::ToolEffects::read()
+        }
+
+        async fn execute(
+            &self,
+            _id: &str,
+            _input: Value,
+            _update: Option<Box<dyn Fn(crate::tools::ToolUpdate) + Send + Sync>>,
+        ) -> Result<crate::tools::ToolOutput> {
+            self.started.store(true, Ordering::SeqCst);
+            futures::future::pending().await
+        }
+    }
+
     async fn prompt_test_state(
         root: &std::path::Path,
         outcome: PromptTestOutcome,
@@ -4745,16 +4847,23 @@ mod tests {
         let provider = Arc::new(PromptTestProvider {
             outcome,
             calls: AtomicUsize::new(0),
+            pending_tool_started: Arc::new(AtomicBool::new(false)),
             save_fault: fail_after_provider.then(|| (Arc::clone(&stored), root.to_path_buf())),
         });
-        let tools: &[&str] = if matches!(outcome, PromptTestOutcome::ToolThenBurst) {
-            &["current_time"]
-        } else {
-            &[]
+        let tool_names: &[&str] = match outcome {
+            PromptTestOutcome::ToolThenBurst => &["current_time"],
+            PromptTestOutcome::WriteThenPending => &["write"],
+            _ => &[],
         };
+        let mut tools = ToolRegistry::new(tool_names, root, None);
+        if matches!(outcome, PromptTestOutcome::WriteThenPending) {
+            tools.push(Box::new(PendingShutdownTool {
+                started: Arc::clone(&provider.pending_tool_started),
+            }));
+        }
         let agent = crate::agent::Agent::new(
             Arc::clone(&provider) as Arc<dyn crate::provider::Provider>,
-            ToolRegistry::new(tools, root, None),
+            tools,
             crate::agent::AgentConfig::default(),
         );
         let session = AgentSession::new(
@@ -5730,6 +5839,161 @@ mod tests {
                 assert_eq!(frames.last().unwrap()["result"]["stopReason"], "end_turn");
             }
         }
+    }
+
+    #[test]
+    fn shutdown_signal_waits_for_native_effects_to_persist_with_stdin_open() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let options = acp_workspace_options(root.path(), handle);
+            let (state, provider, stored) =
+                prompt_test_state(root.path(), PromptTestOutcome::WriteThenPending, false).await;
+            let cx = AgentCx::for_current_or_request();
+            let (input_tx, input_rx) = asupersync::channel::mpsc::channel(8);
+            let (output_tx, output_rx) = std::sync::mpsc::sync_channel(64);
+            let output = AcpOutput::new(output_tx);
+            let (abort, signal) = AbortHandle::new();
+            let mut owner = output.begin_prompt("editor-session".into(), abort).unwrap();
+            let prompt_output = output.clone();
+            let prompt_state = Arc::clone(&state);
+            let prompt_signal = signal.clone();
+            let prompt_cx = cx.clone();
+            let mut prompt = Box::pin(async move {
+                owner.started = true;
+                let reason = Box::pin(run_prompt(
+                    prompt_state,
+                    AcpPrompt::text("write once, then wait"),
+                    None,
+                    prompt_signal,
+                    prompt_output.clone(),
+                    "editor-session".into(),
+                    prompt_cx,
+                ))
+                .await;
+                owner.settled = true;
+                prompt_output
+                    .send(json_rpc_ok(json!(7), json!({"stopReason":reason})))
+                    .expect("deliver settled prompt");
+                drop(owner);
+                reason
+            });
+            timeout(
+                wall_now(),
+                Duration::from_secs(5),
+                Box::pin(async {
+                    while !provider.pending_tool_started.load(Ordering::SeqCst) {
+                        assert!(futures::poll!(&mut prompt).is_pending());
+                        sleep(wall_now(), Duration::from_millis(5)).await;
+                    }
+                }),
+            )
+            .await
+            .expect("real write must finish before the second tool waits");
+            assert_eq!(
+                std::fs::read(root.path().join("shutdown-effect.txt")).unwrap(),
+                b"written before shutdown\n"
+            );
+            // Delay the native turn's actual persistence, not just the prompt
+            // guard: a shutdown that merely signals abort must remain pending.
+            let saving = OwnedMutexGuard::lock(Arc::clone(&stored), &cx).await.unwrap();
+            let path = saving.path.clone().unwrap();
+            let (shutdown, requested) = AbortHandle::new();
+            let mut dispatch = Box::pin(run_with_input(
+                options,
+                AcpInput::Lines(input_rx),
+                output.clone(),
+                Some(requested),
+            ));
+            assert!(futures::poll!(&mut dispatch).is_pending());
+            // Keep stdin open and queue another request. Neither EOF nor a
+            // second request is allowed to be the reason shutdown progresses.
+            input_tx
+                .try_send(json!({"jsonrpc":"2.0","id":99,"method":"initialize"}).to_string())
+                .unwrap();
+            shutdown.abort();
+            assert!(futures::poll!(&mut dispatch).is_pending());
+            assert!(signal.is_aborted());
+            assert!(futures::poll!(&mut prompt).is_pending());
+            assert!(output.prompt_is_active("editor-session"));
+            assert!(state.try_lock().unwrap().agent_session.is_none());
+            assert!(input_tx.try_send("must not dispatch".into()).is_err());
+            assert!(futures::poll!(&mut dispatch).is_pending());
+            drop(saving);
+            let (reason, stopped) = timeout(
+                wall_now(),
+                Duration::from_secs(5),
+                Box::pin(async { futures::join!(prompt, dispatch) }),
+            )
+            .await
+            .expect("shutdown must settle after persistence is released");
+            stopped.expect("cooperative shutdown succeeds");
+            assert_eq!(reason, ACP_STOP_REASON_CANCELLED);
+            assert!(state.try_lock().unwrap().agent_session.is_some());
+            assert!(!output.prompt_is_active("editor-session"));
+            assert!(output.failure_reason().is_none());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            let messages = reopened.to_messages_for_current_path();
+            for (id, is_error) in [
+                ("write-before-shutdown", false),
+                ("pending-during-shutdown", true),
+            ] {
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| matches!(
+                            message,
+                            crate::model::Message::ToolResult(result)
+                                if result.tool_call_id == id && result.is_error == is_error
+                        ))
+                        .count(),
+                    1,
+                    "shutdown must persist each admitted tool outcome exactly once"
+                );
+            }
+            let frames = output_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            assert!(frames.iter().all(|frame| frame["id"] != 99));
+            assert_eq!(frames.last().unwrap()["id"], 7);
+            assert_eq!(frames.last().unwrap()["result"]["stopReason"], "cancelled");
+            drop(input_tx);
+        });
+    }
+
+    #[test]
+    fn pre_requested_shutdown_rejects_buffered_input_without_waiting_for_eof() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let options = acp_workspace_options(root.path(), handle);
+            let (sender, receiver) = asupersync::channel::mpsc::channel(8);
+            sender
+                .try_send(json!({"jsonrpc":"2.0","id":1,"method":"initialize"}).to_string())
+                .unwrap();
+            let (tx, rx) = std::sync::mpsc::sync_channel(8);
+            let (shutdown, signal) = AbortHandle::new();
+            shutdown.abort();
+            timeout(
+                wall_now(),
+                Duration::from_secs(1),
+                Box::pin(run_with_input(
+                    options,
+                    AcpInput::Lines(receiver),
+                    AcpOutput::new(tx),
+                    Some(signal),
+                )),
+            )
+            .await
+            .expect("an idle shutdown must not wait for stdin EOF")
+            .expect("shutdown succeeds");
+            assert!(rx.try_recv().is_err(), "no buffered request may dispatch");
+            assert!(sender.try_send("closed".into()).is_err());
+        });
     }
 
     #[test]

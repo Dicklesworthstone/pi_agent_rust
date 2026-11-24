@@ -10062,8 +10062,6 @@ async fn run_rpc_mode(
 }
 
 async fn run_acp_mode(options: pi::acp::AcpOptions) -> Result<()> {
-    use futures::FutureExt;
-
     let (abort_handle, abort_signal) = AbortHandle::new();
     let abort_listener = abort_handle.clone();
     if let Err(err) = ctrlc::set_handler(move || {
@@ -10071,18 +10069,11 @@ async fn run_acp_mode(options: pi::acp::AcpOptions) -> Result<()> {
     }) {
         eprintln!("Warning: Failed to install Ctrl+C handler for ACP mode: {err}");
     }
-    let acp_task = pi::acp::run_stdio(options).fuse();
-    let signal_task = abort_signal.wait().fuse();
-
-    futures::pin_mut!(acp_task, signal_task);
-
-    match futures::future::select(acp_task, signal_task).await {
-        futures::future::Either::Left((result, _)) => match result {
-            Ok(()) => Ok(()),
-            Err(err) => Err(anyhow::Error::new(err)),
-        },
-        futures::future::Either::Right(((), _)) => Ok(()),
-    }
+    // ACP owns prompt persistence and final output delivery. A signal stops
+    // its dispatcher, then waits for those owners instead of dropping them.
+    pi::acp::run_stdio_with_shutdown(options, abort_signal)
+        .await
+        .map_err(anyhow::Error::new)
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
