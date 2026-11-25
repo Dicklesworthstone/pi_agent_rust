@@ -1,14 +1,14 @@
 {
   "schema": "pi.ext.health_delta.v1",
-  "generated_at": "2026-11-24T13:53:42.760Z",
+  "generated_at": "2026-11-25T07:20:25.339Z",
   "baseline_path": "/data/projects/pi_agent_rust/tests/ext_conformance/reports/conformance_baseline.json",
   "baseline_date": "2026-08-04T03:26:54Z",
   "current_summary": {
     "excluded": 1,
-    "failed": 2,
+    "failed": 1,
     "manifest_count": 227,
-    "pass_rate_pct": 99.11504424778761,
-    "passed": 224,
+    "pass_rate_pct": 99.5575221238938,
+    "passed": 225,
     "skipped": 1,
     "tested": 226
   },
@@ -19,10 +19,10 @@
     "tested": 223
   },
   "aggregate_delta": {
-    "fail_delta": 2,
+    "fail_delta": 1,
     "net_change": 0,
-    "pass_delta": 1,
-    "rate_delta_pct": -0.8849557522123916
+    "pass_delta": 2,
+    "rate_delta_pct": -0.4424778761061958
   },
   "regressions": [],
   "fixes": [],
@@ -252,9 +252,8 @@
     {
       "id": "community/nicobailon-subagents",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Load error: Extension error: ERR_FEATURE_UNAVAILABLE: fs.watch native notifications are unavailable; use fs.watchFile for stat polling\n    at watch (node:fs:1759:21)\n    at registerSubagentExtension (/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/nicobailon-subagents/index.ts:96:30)\n    at <anonymous> (__pi_bridge_prelude__:752:20)\n"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/ogulcancelik-ghostty-theme-sync",
@@ -573,7 +572,7 @@
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Load error: Extension error: ENOENT: ENOENT: no such file or directory, open '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/agentsbox/dist/package.json' (host: Error loading module '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/agentsbox/dist/package.json': host read open: No such file or directory (os error 2))\n    at readFileSync (node:fs:1167:80)\n    at <anonymous> (/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/agentsbox/dist/pi.js:138409:35)\n"
+      "failure_reason": "Load error: Extension error: ENOENT: ENOENT: no such file or directory, open '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/agentsbox/dist/package.json' (host: Error loading module '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/agentsbox/dist/package.json': host read open: No such file or directory (os error 2))\n    at readFileSync (node:fs:1210:80)\n    at <anonymous> (/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/npm/agentsbox/dist/pi.js:138409:35)\n"
     },
     {
       "id": "npm/aliou-pi-extension-dev",

@@ -1,6 +1,6 @@
 # Extension Health & Regression Delta Report
 
-> Generated: 2026-11-24T13:53:42Z
+> Generated: 2026-11-25T07:20:25Z
 > Baseline: 2026-08-04T03:26:54Z
 
 ## Aggregate Comparison
@@ -8,9 +8,9 @@
 | Metric | Baseline | Current | Delta |
 |--------|----------|---------|-------|
 | Tested | 223 | 226 | +3 |
-| Passed | 223 | 224 | +1 |
-| Failed | 0 | 2 | +2 |
-| Pass rate | 100.0% | 99.1% | -0.9pp |
+| Passed | 223 | 225 | +2 |
+| Failed | 0 | 1 | +1 |
+| Pass rate | 100.0% | 99.6% | -0.4pp |
 
 ## Delta Summary
 
