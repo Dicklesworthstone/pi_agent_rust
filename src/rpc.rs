@@ -679,7 +679,6 @@ async fn take_last_rpc_user_turn_for_retry(
     // against current durable state, retaining the abandoned original branch.
     let provider_admission = session.provider_admission_gate();
     provider_admission.ensure_allowed()?;
-    let save_enabled = session.save_enabled();
     let cx = AgentCx::for_request();
     // Provider callbacks may acquire Session actions and the store. Reserve
     // their outer authority first, without quarantining a read-only plan.
@@ -688,7 +687,7 @@ async fn take_last_rpc_user_turn_for_retry(
         .await?;
     let session_actions = session.session_action_admission_gate();
     let _session_action_permit = session_actions.acquire(cx.cx()).await?;
-    let (content, messages) = {
+    let content = {
         let session_store = Arc::clone(&session.session);
         let mut inner = OwnedMutexGuard::lock(session_store, cx.cx())
             .await
@@ -705,29 +704,19 @@ async fn take_last_rpc_user_turn_for_retry(
                 "RPC retry found a projected user turn but could not rewind to its durable entry",
             ));
         }
-        let messages = candidate.to_messages_for_current_path();
-        provider_admission.ensure_allowed()?;
-        provider_admission.block(
-            "retry rewind persistence was interrupted before live installation completed"
-                .to_string(),
-        );
-        if save_enabled
-            && let Err(first_err) = candidate.save().await
-            && let Err(retry_err) = candidate.save().await
-        {
-            let reason = format!(
-                "retry rewind persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-            );
-            provider_admission.block(reason.clone());
-            return Err(Error::session_persistence(reason));
-        }
-        session.invalidate_background_compaction();
-        *inner = candidate;
-        (content, messages)
+        session
+            .install_context_candidate(
+                &mut inner,
+                candidate,
+                true,
+                &provider_admission,
+                "RPC retry rewind",
+                cx.cx(),
+            )
+            .await?;
+        content
     };
 
-    session.agent.replace_messages(messages);
-    provider_admission.clear();
     Ok(Some(content))
 }
 
@@ -24195,6 +24184,71 @@ export default function init(pi) {
             assert!(matches!(content, UserContent::Text(text) if text == "original input"));
             assert!(store.try_lock().unwrap().leaf_id().is_none());
             provider.ensure_allowed().unwrap();
+        });
+    }
+
+    #[test]
+    fn rpc_retry_retires_the_abandoned_plan_review_and_owned_prompt() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            for approve in [false, true] {
+                let mut session = build_test_agent_session(Session::in_memory());
+                session
+                    .agent
+                    .set_system_prompt(Some("base instructions".to_string()));
+                let mut control = crate::plan::rpc::RpcPlanControl::default();
+                let cx = AgentCx::for_request();
+                control
+                    .command(&mut session, &cx, "set_plan_mode", &json!({"mode":"on"}))
+                    .await
+                    .unwrap();
+                let state = session.agent.plan_state();
+                assert!(state.submit_plan(
+                    "Goal: edit source. Steps: make the change and verify it.".to_string()
+                ));
+                let review = control
+                    .command(&mut session, &cx, "get_plan", &json!({}))
+                    .await
+                    .unwrap();
+                let receipt = json!({"reviewId": review["reviewId"]});
+                if approve {
+                    control
+                        .command(&mut session, &cx, "approve_plan", &receipt)
+                        .await
+                        .unwrap();
+                    assert!(
+                        session
+                            .agent
+                            .system_prompt()
+                            .unwrap()
+                            .contains("Approved Plan")
+                    );
+                }
+                let store = Arc::clone(&session.session);
+                let source = store
+                    .try_lock()
+                    .unwrap()
+                    .append_model_message(build_user_message("retry this branch", &[]));
+                let content = take_last_rpc_user_turn_for_retry(&mut session)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(content, UserContent::Text(text) if text == "retry this branch"));
+                assert_eq!(state.mode(), crate::plan::PlanMode::Planning);
+                assert!(state.plan().is_none());
+                assert!(!state.allows_effects(crate::tools::ToolEffects::write()));
+                assert_eq!(session.agent.system_prompt(), Some("base instructions"));
+                assert!(
+                    control
+                        .command(&mut session, &cx, "approve_plan", &receipt)
+                        .await
+                        .is_err()
+                );
+                assert!(store.try_lock().unwrap().get_entry(&source).is_some());
+                session.ensure_provider_reentry_allowed().unwrap();
+            }
         });
     }
 

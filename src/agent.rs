@@ -24691,6 +24691,44 @@ impl AgentSession {
         owner: &asupersync::Cx,
     ) -> Result<()> {
         admission.ensure_allowed()?;
+        // A live proposal and its approval belong to the selected branch,
+        // not merely to the Session's storage identity. Appending fresh
+        // entries (including compaction) continues that branch; selecting an
+        // existing entry or the empty root must retire its review and pin.
+        // Walk only candidate additions, so ordinary append transactions do
+        // not scan the complete transcript.
+        let branch_prompt = if replace_context {
+            let mut anchor = candidate.leaf_id();
+            let mut remaining = candidate.entries.len();
+            while let Some(id) = anchor {
+                if live.get_entry(id).is_some() {
+                    break;
+                }
+                if remaining == 0 {
+                    return Err(Error::session(
+                        "Context candidate contains a cycle in its new ancestry",
+                    ));
+                }
+                remaining -= 1;
+                anchor = candidate
+                    .get_entry(id)
+                    .ok_or_else(|| Error::session("Context candidate has a missing ancestor"))?
+                    .base()
+                    .parent_id
+                    .as_deref();
+            }
+            if anchor != live.leaf_id() || candidate.header.id != live.header.id {
+                Some(crate::plan::replacement_system_prompt(
+                    &self.agent,
+                    &self.session,
+                    live,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let save_enabled = self.save_enabled();
         let mut persistence = save_enabled.then(|| TurnPersistenceGuard {
             admission,
@@ -24733,6 +24771,12 @@ impl AgentSession {
         if let Some(messages) = messages {
             self.invalidate_background_compaction();
             self.agent.replace_messages(messages);
+        }
+        if let Some(prompt) = branch_prompt {
+            self.agent
+                .plan_state()
+                .reset_for_session(crate::plan::replayed_plan_mode(live));
+            self.agent.set_system_prompt(prompt);
         }
         if save_enabled {
             admission.clear();

@@ -216,6 +216,245 @@ fn foreign_review_with_same_id_and_text_cannot_control_a_new_store() {
 }
 
 #[test]
+fn branch_navigation_retires_approved_context_and_requires_fresh_review() {
+    for save in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut stored = Session::in_memory();
+        if save {
+            stored.path = Some(temp.path().join("branch-plan.jsonl"));
+        }
+        let (mut handle, events) = fixture(stored, save);
+        let owner = AgentCx::for_request();
+        let _ = run(handle.enter_plan_mode(&owner)).unwrap();
+        let planning_leaf = handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .leaf_id()
+            .unwrap()
+            .to_string();
+        let old = submit(&handle);
+        let _ = run(handle.approve_plan_review(&owner, &old)).unwrap();
+        let approved_leaf = handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .leaf_id()
+            .unwrap()
+            .to_string();
+        let state = handle.session().agent.plan_state();
+        let prompt = handle.session().agent.system_prompt().unwrap().to_string();
+
+        // Selecting the current leaf is a no-op, including for live authority.
+        run(handle.switch_to_entry(&approved_leaf)).unwrap();
+        assert_eq!(state.mode(), PlanMode::Approved);
+        assert_eq!(handle.session().agent.system_prompt(), Some(prompt.as_str()));
+
+        run(handle.switch_to_entry(&planning_leaf)).unwrap();
+        assert_eq!(state.mode(), PlanMode::Planning);
+        assert!(state.plan().is_none());
+        assert!(!state.allows_effects(ToolEffects::write()));
+        assert_eq!(
+            handle.session().agent.system_prompt(),
+            Some("original instructions")
+        );
+        assert!(run(handle.approve_plan_review(&owner, &old)).is_err());
+
+        // Forward navigation into the old approved history cannot resurrect
+        // approval either. Recover its text explicitly for a new decision.
+        run(handle.switch_to_entry(&approved_leaf)).unwrap();
+        assert_eq!(state.mode(), PlanMode::Planning);
+        assert!(handle.pending_plan_review().unwrap().is_none());
+        let restored = run(handle.restore_plan_checkpoint(&owner)).unwrap();
+        assert_eq!(restored.mode, PlanMode::PendingApproval);
+        let current = handle.pending_plan_review().unwrap().unwrap();
+        assert_eq!(current.text(), old.text());
+        assert!(!current.same_submission(&old));
+        assert!(!state.allows_effects(ToolEffects::write()));
+        assert!(run(handle.approve_plan_review(&owner, &old)).is_err());
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn sibling_navigation_invalidates_pending_review_without_changing_other_history() {
+    let mut stored = Session::in_memory();
+    let root = stored.append_custom_entry("root".to_string(), None);
+    let sibling = stored.append_custom_entry("other-branch".to_string(), None);
+    assert!(stored.navigate_to(&root));
+    let (mut handle, _) = fixture(stored, false);
+    let owner = AgentCx::for_request();
+    let _ = run(handle.enter_plan_mode(&owner)).unwrap();
+    let review = submit(&handle);
+    let source = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .leaf_id()
+        .unwrap()
+        .to_string();
+    run(handle.switch_to_entry(&source)).unwrap();
+    assert!(review.same_submission(&handle.pending_plan_review().unwrap().unwrap()));
+
+    run(handle.switch_to_entry(&sibling)).unwrap();
+    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Off);
+    assert!(handle.pending_plan_review().unwrap().is_none());
+    assert!(run(handle.approve_plan_review(&owner, &review)).is_err());
+    assert!(run(handle.reject_plan_review(&owner, &review)).is_err());
+    let store = handle.session_store();
+    let session = store.try_lock().unwrap();
+    assert_eq!(session.leaf_id(), Some(sibling.as_str()));
+    assert!(session.get_entry(&source).is_some());
+    assert!(session.get_entry(&root).is_some());
+}
+
+#[test]
+fn retry_and_user_rewind_remove_approval_from_the_abandoned_context() {
+    for retry in [false, true] {
+        let (mut handle, owner, review) = pending();
+        let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
+        let store = handle.session_store();
+        let (approved_leaf, user) = {
+            let mut session = store.try_lock().unwrap();
+            let approved_leaf = session.leaf_id().unwrap().to_string();
+            let user = session.append_message(crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Text("revise this turn".to_string()),
+                timestamp: Some(0),
+            });
+            (approved_leaf, user)
+        };
+        if retry {
+            let input = run(handle.prepare_retry_content()).unwrap();
+            assert!(
+                matches!(input, crate::model::UserContent::Text(text) if text == "revise this turn")
+            );
+        } else {
+            let _ = run(handle.rewind_to_user_message(&user)).unwrap();
+        }
+        assert_eq!(
+            store.try_lock().unwrap().leaf_id(),
+            Some(approved_leaf.as_str())
+        );
+        let state = handle.session().agent.plan_state();
+        assert_eq!(state.mode(), PlanMode::Planning);
+        assert!(state.plan().is_none());
+        assert!(!state.allows_effects(ToolEffects::write()));
+        assert_eq!(
+            handle.session().agent.system_prompt(),
+            Some("original instructions")
+        );
+    }
+
+    let mut stored = Session::in_memory();
+    stored.append_message(crate::session::SessionMessage::User {
+        content: crate::model::UserContent::Text("first turn".to_string()),
+        timestamp: Some(0),
+    });
+    let (mut handle, _) = fixture(stored, false);
+    let owner = AgentCx::for_request();
+    let _ = run(handle.enter_plan_mode(&owner)).unwrap();
+    let review = submit(&handle);
+    let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
+    let _ = run(handle.prepare_retry_content()).unwrap();
+    assert!(handle.session_store().try_lock().unwrap().leaf_id().is_none());
+    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Off);
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("original instructions")
+    );
+}
+
+#[test]
+fn append_only_context_replacement_keeps_the_current_plan_and_prompt() {
+    let (mut handle, owner, review) = pending();
+    let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
+    let prompt = handle.session().agent.system_prompt().unwrap().to_string();
+    run(async {
+        let admission = handle.session().provider_admission_gate();
+        let _provider = admission
+            .acquire_transition_authority(owner.cx())
+            .await
+            .unwrap();
+        let actions = handle.session().session_action_admission_gate();
+        let _action = actions.acquire(owner.cx()).await.unwrap();
+        let store = handle.session_store();
+        let mut live = asupersync::sync::OwnedMutexGuard::lock(store, owner.cx())
+            .await
+            .unwrap();
+        let mut candidate = live.clone();
+        candidate.append_custom_entry("context-metadata".to_string(), None);
+        candidate.append_custom_entry("context-metadata".to_string(), None);
+        handle
+            .session_mut()
+            .install_context_candidate(
+                &mut live,
+                candidate,
+                true,
+                &admission,
+                "append-only context replacement",
+                owner.cx(),
+            )
+            .await
+            .unwrap();
+    });
+    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Approved);
+    assert_eq!(handle.session().agent.system_prompt(), Some(prompt.as_str()));
+    assert_eq!(
+        handle.session().agent.plan_state().approved_plan().as_deref(),
+        Some(review.text())
+    );
+}
+
+#[test]
+fn failed_branch_installation_preserves_live_plan_prompt_and_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut stored = Session::in_memory();
+    stored.path = Some(temp.path().join("source.jsonl"));
+    let target = stored.append_custom_entry("before-plan".to_string(), None);
+    let (mut handle, _) = fixture(stored, true);
+    let owner = AgentCx::for_request();
+    let _ = run(handle.enter_plan_mode(&owner)).unwrap();
+    let review = submit(&handle);
+    let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
+    let source = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .leaf_id()
+        .unwrap()
+        .to_string();
+    let prompt = handle.session().agent.system_prompt().unwrap().to_string();
+
+    handle
+        .session_mut()
+        .agent
+        .set_system_prompt(Some("rewritten pin".to_string()));
+    let error = run(handle.switch_to_entry(&target)).unwrap_err();
+    assert!(error.to_string().contains("PLAN_CONTEXT_CHANGED"));
+    assert_eq!(
+        handle.session_store().try_lock().unwrap().leaf_id(),
+        Some(source.as_str())
+    );
+    assert_eq!(handle.session().agent.system_prompt(), Some("rewritten pin"));
+    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Approved);
+
+    handle
+        .session_mut()
+        .agent
+        .set_system_prompt(Some(prompt.clone()));
+    handle.session_store().try_lock().unwrap().path = Some(temp.path().to_path_buf());
+    let error = run(handle.switch_to_entry(&target)).unwrap_err();
+    assert!(error.is_session_persistence());
+    assert_eq!(
+        handle.session_store().try_lock().unwrap().leaf_id(),
+        Some(source.as_str())
+    );
+    assert_eq!(handle.session().agent.system_prompt(), Some(prompt.as_str()));
+    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Approved);
+    assert!(handle.session().ensure_provider_reentry_allowed().is_err());
+}
+
+#[test]
 fn identity_changes_in_the_same_store_also_invalidate_a_review() {
     let (mut handle, owner, review) = pending();
     handle.session_store().try_lock().unwrap().header.id = "replacement".to_string();
