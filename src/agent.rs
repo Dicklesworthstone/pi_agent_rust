@@ -1167,9 +1167,8 @@ struct TurnCheckpointReceipt {
 }
 
 /// Each pair carries whether the message is an authored queued input.
-type TurnCheckpoint = Arc<
-    dyn Fn(Vec<(Message, bool)>) -> BoxFuture<'static, TurnCheckpointReceipt> + Send + Sync,
->;
+type TurnCheckpoint =
+    Arc<dyn Fn(Vec<(Message, bool)>) -> BoxFuture<'static, TurnCheckpointReceipt> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMode {
@@ -28402,8 +28401,7 @@ impl AgentSession {
                         )
                         .await
                     };
-                    let persistence =
-                        finish_turn_persistence(&admission, Ok(()), persist_result);
+                    let persistence = finish_turn_persistence(&admission, Ok(()), persist_result);
                     if let Err(err) = &persistence {
                         tracing::warn!(error = %err, "mid-run session checkpoint failed");
                     }

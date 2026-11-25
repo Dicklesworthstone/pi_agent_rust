@@ -2033,6 +2033,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn failed_mid_run_checkpoint_stops_new_work_without_duplicating_retained_results() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
@@ -2174,12 +2175,17 @@ mod tests {
                         saved.path = Some(path.clone());
                         saved.save().await.expect("recover retained rows on disk");
                     }
-                    let reopened = Session::open(path.to_string_lossy().as_ref()).await.unwrap();
+                    let reopened = Session::open(path.to_string_lossy().as_ref())
+                        .await
+                        .unwrap();
                     let history = reopened.to_messages_for_current_path();
                     assert_eq!(
-                        history.iter().filter(|message| matches!(message,
-                            Message::ToolResult(result) if result.tool_call_id == "checkpointed"
-                        )).count(),
+                        history
+                            .iter()
+                            .filter(|message| matches!(message,
+                                Message::ToolResult(result) if result.tool_call_id == "checkpointed"
+                            ))
+                            .count(),
                         1,
                         "a failed checkpoint and final save must not duplicate a tool result"
                     );
@@ -2196,14 +2202,10 @@ mod tests {
                         NativeEffectEntry::Continue,
                         NativeEffectEntry::Custom,
                     ] {
-                        let error = run_native_effect_turn(
-                            &mut session,
-                            entry,
-                            None,
-                            Arc::new(|_| {}),
-                        )
-                        .await
-                        .expect_err("repairing the path must not clear admission");
+                        let error =
+                            run_native_effect_turn(&mut session, entry, None, Arc::new(|_| {}))
+                                .await
+                                .expect_err("repairing the path must not clear admission");
                         assert!(error.is_session_persistence());
                     }
                     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);

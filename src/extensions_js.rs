@@ -47472,6 +47472,7 @@ globalThis.__spawn_abort_result = result;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn pijs_readable_sized_reads_preserve_frames_and_adapter_demand() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
@@ -47643,6 +47644,7 @@ globalThis.__spawn_abort_result = result;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn pijs_readable_iterators_preserve_terminal_errors_and_owned_cleanup() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
