@@ -31253,9 +31253,12 @@ if (typeof globalThis.fetch !== 'function') {
                 this._queueSize = 0;
                 if (this._closed) { this._settleReader(); return Promise.resolve(); }
                 this._controller.close();
-                return Promise.resolve().then(() => {
-                    if (typeof this._source.cancel === 'function') return this._source.cancel(reason);
-                });
+                // Register cancellation before queued close/error observers run.
+                // In particular, tee must know both branches have cancelled
+                // before deciding who owns the producer's acknowledgement.
+                try {
+                    return Promise.resolve(typeof this._source.cancel === 'function' ? this._source.cancel(reason) : undefined);
+                } catch (error) { return Promise.reject(error); }
             }
             cancel(reason) {
                 return this._locked ? Promise.reject(new TypeError('ReadableStream is locked')) : this._cancel(reason);
@@ -31391,26 +31394,72 @@ if (typeof globalThis.fetch !== 'function') {
                 const controllers = [];
                 const cancelled = [false, false];
                 const reasons = [];
+                const cancellation = __pi_stream_deferred();
                 let pending = null;
                 let ended = false;
+                let sourceClosed = false;
+                let released = false;
+                const release = () => {
+                    if (released) return;
+                    released = true;
+                    reader.releaseLock();
+                };
+                const cancelSource = (reason) => {
+                    ended = true;
+                    // reader.closed and pending reads settle before producer
+                    // cleanup. Only its cancellation promise acknowledges it.
+                    Promise.resolve(reader.cancel(reason)).then(() => {
+                        release();
+                        cancellation.resolve();
+                    }, error => {
+                        release();
+                        cancellation.reject(error);
+                    });
+                };
+                const finish = (failed, error) => {
+                    if (ended) return;
+                    ended = true;
+                    for (let i = 0; i < 2; i++) {
+                        if (cancelled[i]) continue;
+                        if (failed) controllers[i].error(error);
+                        else controllers[i].close();
+                    }
+                    // A cancelled branch also waits for its live sibling to
+                    // finish. Source errors settle that wait without invoking
+                    // cancellation on an already failed producer.
+                    cancellation.resolve();
+                    release();
+                };
+                reader.closed.then(() => {
+                    sourceClosed = true;
+                    // Draining the source's last queued chunk resolves closed
+                    // before read().then delivers that chunk to the branches.
+                    if (!pending) finish(false);
+                }, error => finish(true, error));
                 const pull = () => {
                     if (ended) return;
                     if (!pending) {
                         pending = reader.read().then((result) => {
-                            pending = null;
+                            if (ended) return;
                             if (result.done) {
-                                ended = true;
-                                for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].close();
-                                reader.releaseLock();
+                                finish(false);
                             } else {
                                 for (let i = 0; i < 2; i++) {
                                     if (!cancelled[i]) controllers[i].enqueue(result.value instanceof Uint8Array ? result.value.slice() : result.value);
                                 }
                             }
-                        }, (error) => {
-                            ended = true;
-                            for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].error(error);
-                            reader.releaseLock();
+                        }, error => finish(true, error)).catch(error => {
+                            if (ended) return;
+                            // A chunk-copy/delivery failure is not EOF. Fail
+                            // both consumers and retain producer ownership
+                            // until cancellation has actually completed.
+                            for (let i = 0; i < 2; i++) {
+                                if (!cancelled[i]) controllers[i].error(error);
+                            }
+                            cancelSource(error);
+                        }).finally(() => {
+                            pending = null;
+                            if (sourceClosed) finish(false);
                         });
                     }
                     return pending;
@@ -31422,9 +31471,10 @@ if (typeof globalThis.fetch !== 'function') {
                         cancelled[index] = true;
                         reasons[index] = reason;
                         if (cancelled[0] && cancelled[1] && !ended) {
-                            ended = true;
-                            return reader.cancel(reasons).finally(() => reader.releaseLock());
+                            // Both callers own the same cleanup acknowledgement.
+                            cancelSource(reasons);
                         }
+                        return cancellation.promise;
                     },
                 }));
             }
@@ -32929,10 +32979,13 @@ mod tests {
     /// filesystem literal already had 311 bytes of receipt drift at 7ddfa2ac;
     /// only the two deliberately changed modules are re-pinned here.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
+        // Tee failures now reach idle consumers, and both cancellation callers
+        // retain source cleanup ownership. The four tee lifecycle regressions
+        // cover the deliberate 2,556-byte bridge change.
         (
             BRIDGE_RECEIPT,
-            320_417,
-            "ad4973e1e09851db7d622896ca76ac5a2819f71c15c6fe4b90369dcee986923f",
+            322_973,
+            "54b5aea47788c89842aa0eebf348847d16650617204aac681800ebc1f16539fe",
         ),
         // Demand-driven file reads add byte ranges and owned descriptor cleanup.
         // Incremental write acknowledgements, descriptor ownership and amortized
@@ -51423,6 +51476,214 @@ const defer = () => { let resolve, reject; const promise = new Promise((a,b) => 
                 "{result}",
             );
         });
+    }
+
+    #[test]
+    fn pijs_web_tee_propagates_idle_source_errors_and_backpressured_pipes() {
+        assert_web_stream_fixture(
+            r"
+for (const reason of [new Error('idle source failure'), undefined]) {
+    let controller, pulls = 0, cancellations = 0;
+    const source = new ReadableStream({
+        start(value) { controller = value; },
+        pull() { pulls++; },
+        cancel() { cancellations++; },
+    });
+    const [left, right] = source.tee();
+    const leftReader = left.getReader(), rightReader = right.getReader();
+    controller.error(reason);
+    await rejectsWith(leftReader.closed, reason, 'idle left branch observes original source error');
+    await rejectsWith(rightReader.closed, reason, 'idle right branch observes original source error');
+    check(!source.locked, 'idle source error releases the tee source reader');
+    check(pulls === 0 && cancellations === 0, 'idle error propagation neither pulls nor cancels an errored producer');
+
+    let pipeController, writes = 0, aborts = 0, abortReason;
+    const pipeSource = new ReadableStream({ start(value) { pipeController = value; } });
+    const [piped, idle] = pipeSource.tee();
+    const idleReader = idle.getReader();
+    const destination = new WritableStream({
+        write() { writes++; },
+        abort(value) { aborts++; abortReason = value; },
+    }, { highWaterMark: 0 });
+    const pipe = piped.pipeTo(destination);
+    await tick();
+    pipeController.error(reason);
+    await rejectsWith(pipe, reason, 'source error interrupts a tee pipe waiting for writer.ready');
+    await rejectsWith(idleReader.closed, reason, 'backpressured pipe source error reaches its idle sibling');
+    check(writes === 0 && aborts === 1 && abortReason === reason, 'blocked destination aborts once with the original source error');
+    check(!pipeSource.locked && !piped.locked && !destination.locked, 'failed tee pipe releases every owned endpoint');
+}
+return checks;
+",
+            16,
+        );
+    }
+
+    #[test]
+    fn pijs_web_tee_cancellation_shares_the_producer_cleanup_acknowledgement() {
+        assert_web_stream_fixture(
+            r"
+for (const failCleanup of [false, true]) {
+    const cleanup = defer(), cleanupError = new Error('producer cleanup failed');
+    const leftReason = { branch: 'left' }, rightReason = { branch: 'right' };
+    let cancelCalls = 0, cancelReasons;
+    const source = new ReadableStream({
+        cancel(reasons) { cancelCalls++; cancelReasons = reasons; return cleanup.promise; },
+    });
+    const [left, right] = source.tee();
+    const leftReader = left.getReader(), rightReader = right.getReader();
+    const leftRead = leftReader.read(), rightRead = rightReader.read();
+    let leftDone = false, rightDone = false;
+    const rightCancel = rightReader.cancel(rightReason);
+    rightCancel.then(() => { rightDone = true; }, () => { rightDone = true; });
+    check((await success(rightRead, 'cancelled right pending read')).done, 'right cancellation settles its pending read');
+    await tick();
+    check(!rightDone && cancelCalls === 0, 'first branch cancellation waits for the sibling without stopping the producer');
+    const leftCancel = leftReader.cancel(leftReason);
+    leftCancel.then(() => { leftDone = true; }, () => { leftDone = true; });
+    check(cancelCalls === 1 && cancelReasons[0] === leftReason && cancelReasons[1] === rightReason,
+        'both cancellations start producer cleanup immediately with reasons in branch order');
+    check((await success(leftRead, 'cancelled left pending read')).done, 'left cancellation settles its pending read');
+    await tick();
+    check(!leftDone && !rightDone && source.locked, 'both cancellation callers retain source ownership until cleanup settles');
+    if (failCleanup) cleanup.reject(cleanupError); else cleanup.resolve();
+    const outcomes = await success(Promise.all([settle(leftCancel, 'left cleanup'), settle(rightCancel, 'right cleanup')]), 'shared cleanup outcomes');
+    check(failCleanup ? !outcomes[0].ok && outcomes[0].error === cleanupError : outcomes[0].ok,
+        'left cancellation reports the producer cleanup outcome');
+    check(failCleanup ? !outcomes[1].ok && outcomes[1].error === cleanupError : outcomes[1].ok,
+        'right cancellation reports the same producer cleanup outcome');
+    check(!source.locked, 'settled producer cleanup releases its source reader');
+    await success(Promise.all([leftReader.cancel('again'), rightReader.cancel('again')]), 'repeat branch cancellation');
+    check(cancelCalls === 1, 'repeat branch cancellation cannot repeat producer cleanup');
+}
+return checks;
+",
+            18,
+        );
+    }
+
+    #[test]
+    fn pijs_web_tee_linearizes_cancellation_errors_and_final_chunk_delivery() {
+        assert_web_stream_fixture(
+            r"
+const failure = new Error('source failure');
+let failedController, failedCancels = 0;
+const failedSource = new ReadableStream({ start(c) { failedController = c; }, cancel() { failedCancels++; } });
+const failedReaders = failedSource.tee().map(branch => branch.getReader());
+failedController.error(failure);
+const failedCancellations = await success(Promise.allSettled(failedReaders.map(reader => reader.cancel('too late'))), 'same-turn failed cancellations');
+check(failedCancellations[0].status === 'rejected' && failedCancellations[0].reason === failure,
+    'source error before both cancellations rejects left acknowledgement');
+check(failedCancellations[1].status === 'rejected' && failedCancellations[1].reason === failure,
+    'source error before both cancellations rejects right acknowledgement');
+check(failedCancels === 0 && !failedSource.locked, 'source error owns same-turn cancellation without invoking failed producer cleanup');
+
+let cancelledController, cancelledCalls = 0, cancelledDone = 0;
+const cleanup = defer();
+const cancelledSource = new ReadableStream({
+    start(c) { cancelledController = c; },
+    cancel() { cancelledCalls++; return cleanup.promise; },
+});
+const cancelledReaders = cancelledSource.tee().map(branch => branch.getReader());
+const cancelled = cancelledReaders.map(reader => reader.cancel('stop').then(() => { cancelledDone++; }));
+cancelledController.error(failure);
+check(cancelledCalls === 1, 'both cancellations own cleanup before a same-turn source error');
+await tick();
+check(cancelledDone === 0 && cancelledSource.locked, 'a late source error cannot acknowledge pending producer cleanup');
+cleanup.resolve();
+await success(Promise.all(cancelled), 'cancel before same-turn error');
+check(cancelledDone === 2 && !cancelledSource.locked, 'completed producer cleanup acknowledges both callers and releases ownership');
+
+let siblingController, siblingCancels = 0;
+const siblingSource = new ReadableStream({ start(c) { siblingController = c; }, cancel() { siblingCancels++; } });
+const siblingReaders = siblingSource.tee().map(branch => branch.getReader());
+const firstCancel = siblingReaders[0].cancel('left done');
+siblingController.error(failure);
+await success(firstCancel, 'first cancellation followed by source failure');
+await rejectsWith(siblingReaders[1].closed, failure, 'source failure after one cancellation errors the live sibling');
+check(siblingCancels === 0 && !siblingSource.locked, 'single cancellation followed by source failure releases without cancelling an errored producer');
+
+const finalSource = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1, 2, 255])); c.close(); } });
+const finalReaders = finalSource.tee().map(branch => branch.getReader());
+const chunks = await success(Promise.all(finalReaders.map(reader => reader.read())), 'last queued tee chunk');
+check(chunks.every(chunk => !chunk.done && Array.from(chunk.value).join(',') === '1,2,255'), 'the final source bytes reach both branches before close');
+chunks[0].value[0] = 99;
+check(chunks[1].value[0] === 1, 'final byte chunks retain independent branch ownership');
+const ends = await success(Promise.all(finalReaders.map(reader => reader.read())), 'final tee EOF');
+check(ends.every(result => result.done), 'both branches end after the final chunk');
+await success(Promise.all(finalReaders.map(reader => reader.closed)), 'final tee closed');
+check(!finalSource.locked, 'final queued chunk delivery releases the source reader');
+
+let emptyController;
+const emptySource = new ReadableStream({ start(c) { emptyController = c; } });
+const emptyReaders = emptySource.tee().map(branch => branch.getReader());
+emptyController.close();
+await success(Promise.all(emptyReaders.map(reader => reader.closed)), 'idle empty close');
+check(!emptySource.locked, 'idle source close reaches both branches without a synthetic read');
+
+let closedController, closedCancels = 0;
+const closedSource = new ReadableStream({ start(c) { closedController = c; }, cancel() { closedCancels++; } });
+const closedReaders = closedSource.tee().map(branch => branch.getReader());
+const closedCancel = closedReaders[0].cancel('left complete');
+closedController.close();
+await success(Promise.all([closedCancel, closedReaders[1].closed]), 'first cancellation followed by source close');
+check(closedCancels === 0 && !closedSource.locked, 'natural source close acknowledges a cancelled branch without producer cancellation');
+return checks;
+",
+            14,
+        );
+    }
+
+    #[test]
+    fn pijs_web_tee_delivery_failures_error_both_branches_and_own_cleanup() {
+        assert_web_stream_fixture(
+            r"
+for (const closeSource of [false, true]) {
+    const failure = new Error('chunk copy failed'), cleanup = defer();
+    class BrokenChunk extends Uint8Array { slice() { throw failure; } }
+    let cancellations = 0, cancelReason;
+    const source = new ReadableStream({
+        start(controller) { controller.enqueue(new BrokenChunk([1])); if (closeSource) controller.close(); },
+        cancel(reason) { cancellations++; cancelReason = reason; return cleanup.promise; },
+    });
+    const [left, right] = source.tee();
+    const leftReader = left.getReader(), rightReader = right.getReader();
+    await rejectsWith(leftReader.read(), failure, 'copy failure rejects the pending consumer instead of becoming EOF');
+    await rejectsWith(leftReader.closed, failure, 'copy failure rejects the pulling branch closed promise');
+    await rejectsWith(rightReader.closed, failure, 'copy failure reaches an idle sibling with no pull');
+    await rejectsWith(rightReader.read(), failure, 'copy failure remains the idle sibling terminal reason');
+    check(cancellations === (closeSource ? 0 : 1) && (closeSource || cancelReason === failure),
+        'copy failure cancels a live producer once and leaves a closed producer uncancelled');
+    check(source.locked === !closeSource, 'copy failure retains source ownership only while producer cleanup is pending');
+    cleanup.resolve();
+    await tick();
+    check(!source.locked, 'copy failure cleanup releases its source reader');
+}
+
+const copyError = new Error('surviving branch copy failed'), cleanupError = new Error('copy cleanup failed');
+const cleanup = defer();
+class BrokenSurvivorChunk extends Uint8Array { slice() { throw copyError; } }
+let cleanupCalls = 0, cleanupReason;
+const source = new ReadableStream({
+    start(controller) { controller.enqueue(new BrokenSurvivorChunk([2])); },
+    cancel(reason) { cleanupCalls++; cleanupReason = reason; return cleanup.promise; },
+});
+const [left, right] = source.tee();
+const leftReader = left.getReader(), rightReader = right.getReader();
+let cancelled = false;
+const leftCancel = leftReader.cancel('left finished');
+leftCancel.then(() => { cancelled = true; }, () => { cancelled = true; });
+await rejectsWith(rightReader.read(), copyError, 'delivery error reaches the surviving branch pending read');
+await rejectsWith(rightReader.closed, copyError, 'delivery error remains the surviving branch terminal reason');
+check(!cancelled && cleanupCalls === 1 && cleanupReason === copyError && source.locked,
+    'earlier branch cancellation waits for delivery-failure producer cleanup');
+cleanup.reject(cleanupError);
+await rejectsWith(leftCancel, cleanupError, 'earlier cancelled branch observes producer cleanup rejection');
+check(cleanupCalls === 1 && !source.locked, 'failed producer cleanup releases ownership exactly once');
+return checks;
+",
+            19,
+        );
     }
 
     #[test]
