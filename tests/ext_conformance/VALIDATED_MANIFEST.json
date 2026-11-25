@@ -1297,14 +1297,12 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "async_subagent:complete",
           "session_branch",
           "session_shutdown",
           "session_start",
           "session_switch",
           "subagent:complete",
           "subagent:started",
-          "subagent_enhanced:complete",
           "tool_result"
         ],
         "uses_exec": true,
@@ -1326,14 +1324,12 @@
         "commands": [],
         "flags": [],
         "event_handlers": [
-          "async_subagent:complete",
           "session_branch",
           "session_shutdown",
           "session_start",
           "session_switch",
           "subagent:complete",
           "subagent:started",
-          "subagent_enhanced:complete",
           "tool_result"
         ]
       }

@@ -24600,7 +24600,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let module_state = Rc::clone(&module_state);
                         move |ctx: Ctx<'_>,
                               path: String,
-                              limit: Opt<usize>|
+                              limit: Opt<Option<usize>>|
                               -> rquickjs::Result<String> {
                             let extension_id = current_extension_id(&ctx);
                             let workspace_root =
@@ -24655,7 +24655,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 ) {
                                     continue;
                                 }
-                                if limit.0.is_some_and(|limit| entries.len() >= limit) {
+                                if limit
+                                    .0
+                                    .flatten()
+                                    .is_some_and(|limit| entries.len() >= limit)
+                                {
                                     let error = rquickjs::Exception::from_message(
                                         ctx.clone(),
                                         "fs.watch directory entry limit exceeded",
@@ -24713,10 +24717,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let runtime_id = runtime_id.clone();
                         move |ctx: Ctx<'_>,
                               path: String,
-                              snapshot: Opt<bool>|
+                              snapshot: Opt<Option<bool>>|
                               -> rquickjs::Result<String> {
                             const MAX_SYNC_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB hard limit
-                            let snapshot = snapshot.0.unwrap_or(false);
+                            let snapshot = snapshot.0.flatten().unwrap_or(false);
                             let encode = |bytes: Vec<u8>, metadata: Option<std::fs::Metadata>| {
                                 let data = BASE64_STANDARD.encode(bytes);
                                 if let Some(metadata) = metadata {

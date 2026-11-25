@@ -4165,3 +4165,57 @@ fn fs_persistent_namespace_rejects_existing_and_late_symlink_escapes() {
         );
     });
 }
+
+#[test]
+fn fs_readdir_sync_host_fallback_succeeds_without_watch_limit() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = pi::extensions::safe_canonicalize(temp.path());
+        let prompts_dir = workspace.join(".pi").join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        std::fs::write(prompts_dir.join("model-mode.md"), "hello-prompt\n")
+            .expect("write prompt fixture");
+
+        let config = PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            ..default_config()
+        };
+        let runtime =
+            PiJsRuntime::with_clock_and_config(Arc::new(DeterministicClock::new(0)), config)
+                .await
+                .expect("create runtime");
+        let dir_json = serde_json::to_string(&prompts_dir.display().to_string()).expect("dir json");
+        let script = format!(
+            r"
+            import('node:fs').then((fs) => {{
+                const dir = {dir_json};
+                const names = fs.readdirSync(dir);
+                const entries = fs.readdirSync(dir, {{ withFileTypes: true }});
+                const text = fs.readFileSync(dir + '/model-mode.md', 'utf8');
+                globalThis.hostReaddirCheck = {{
+                    names,
+                    entries: entries.map((entry) => ({{
+                        name: entry.name,
+                        isFile: entry.isFile(),
+                        isDir: entry.isDirectory(),
+                    }})),
+                    text,
+                }};
+            }});
+            "
+        );
+        runtime.eval(&script).await.expect("eval host readdirSync");
+        runtime.drain_microtasks().await.expect("drain microtasks");
+
+        let result = runtime
+            .read_global_json("hostReaddirCheck")
+            .await
+            .expect("read hostReaddirCheck");
+        assert_eq!(result["names"], serde_json::json!(["model-mode.md"]));
+        assert_eq!(
+            result["entries"],
+            serde_json::json!([{"name": "model-mode.md", "isFile": true, "isDir": false}])
+        );
+        assert_eq!(result["text"], serde_json::json!("hello-prompt\n"));
+    });
+}
