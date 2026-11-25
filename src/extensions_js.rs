@@ -17657,6 +17657,7 @@ class Readable extends Stream {
     this._flowScheduled = false;
     this._endScheduled = false;
     this._readRequested = false;
+    this._readSize = 0;
     this._readWaiter = null;
     this._pipeCleanup = new Map();
     this._autoDestroy = opts.autoDestroy !== false;
@@ -17685,6 +17686,25 @@ class Readable extends Stream {
     return chunk;
   }
 
+  _readFromQueue(size) {
+    const state = this._readableState;
+    if (state.objectMode) return this._shiftChunk();
+    const chunks = [];
+    let remaining = size;
+    while (remaining > 0) {
+      const queued = this._queue[0];
+      const chunk = state.encoding || Buffer.isBuffer(queued) ? queued : Buffer.from(queued);
+      const count = Math.min(remaining, chunk.length);
+      chunks.push(count === chunk.length ? chunk : chunk.slice(0, count));
+      if (count === chunk.length) this._queue.shift();
+      else this._queue[0] = chunk.slice(count);
+      remaining -= count;
+    }
+    state.length -= size;
+    if (state.encoding) return chunks.join("");
+    return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, size);
+  }
+
   _read(size) {
     if (this._readImpl) this._readImpl(size);
   }
@@ -17692,7 +17712,7 @@ class Readable extends Stream {
   _canRead() {
     const state = this._readableState;
     return !this.destroyed && !state.ended && !state.reading &&
-      (state.flowing === true || this._readRequested) &&
+      (state.flowing === true || this._readRequested || this._readSize > state.length) &&
       (state.length < state.highWaterMark || state.length === 0);
   }
 
@@ -17778,8 +17798,9 @@ class Readable extends Stream {
   // pull another HTTP body/iterable chunk until its consumer asks for it.
   async _waitForRead() {
     while (!this.destroyed && !this._readableState.ended) {
-      if (this._queue.length === 0 &&
-          (this._readableState.flowing === true || this._readRequested)) {
+      const needsSize = this._readSize > this._readableState.length;
+      if ((this._queue.length === 0 || needsSize) &&
+          (this._readableState.flowing === true || this._readRequested || needsSize)) {
         this._readRequested = false;
         return true;
       }
@@ -17828,7 +17849,7 @@ class Readable extends Stream {
         this._readableState.length += this._chunkLength(tail);
       }
       this._readableState.ended = true;
-      if (tail.length) {
+      if (this._queue.length > 0) {
         if (this._readableState.flowing === true) this._flow();
         else this.emit("readable");
       }
@@ -17871,8 +17892,30 @@ class Readable extends Stream {
   }
 
   read(size) {
-    const value = size !== 0 && this._queue.length > 0 ? this._shiftChunk() : null;
-    if (this._readableState.length < this._readableState.highWaterMark || this._queue.length === 0) {
+    const state = this._readableState;
+    const requested = size === undefined ? NaN : Number.parseInt(size, 10);
+    if (requested < 0 || requested > 0x40000000) {
+      const error = new RangeError("read size must be between 0 and 1 GiB");
+      error.code = "ERR_OUT_OF_RANGE";
+      throw error;
+    }
+    if (!state.objectMode && requested > state.highWaterMark) {
+      // A framed reader may ask for more than the initial buffer capacity.
+      // Raise the capacity before pulling so a partial frame cannot deadlock.
+      state.highWaterMark = 2 ** Math.ceil(Math.log2(requested));
+    }
+    const amount = requested === 0 ? 0 : state.objectMode ? 1
+      : Number.isNaN(requested) ? state.length : requested;
+    let value = null;
+    if (amount > 0 && this._queue.length > 0 && (amount <= state.length || state.ended)) {
+      value = this._readFromQueue(Math.min(amount, state.length));
+      this._readSize = 0;
+    } else if (amount > 0 && !state.ended && !this.destroyed) {
+      // Keep this demand across pushes and adapter awaits until the complete
+      // requested frame is available. No bytes are consumed by a short read.
+      this._readSize = amount;
+    }
+    if (state.length < state.highWaterMark || this._queue.length === 0) {
       this._readRequested = true;
       this._wakeRead();
     }
@@ -17887,6 +17930,7 @@ class Readable extends Stream {
     this._readableState.reading = false;
     this._decoder = null;
     this._readRequested = false;
+    this._readSize = 0;
     this.readable = false;
     this._wakeRead();
     return super.destroy(error);
@@ -17978,8 +18022,23 @@ class Readable extends Stream {
     const queue = [];
     const waiters = [];
     let queuedBytes = 0;
-    let done = stream.destroyed || stream._readableState.endEmitted;
+    let done = false;
+    let ended = stream._readableState.endEmitted;
     let failure = null;
+    let returning = null;
+    let resolveReturn;
+    let rejectReturn;
+
+    const stopFlow = () => {
+      stream.pause();
+      stream.removeListener("data", onData);
+      stream.removeListener("end", onEnd);
+    };
+    const cleanup = () => {
+      stopFlow();
+      stream.removeListener("error", onError);
+      stream.removeListener("close", onClose);
+    };
 
     const settleDone = () => {
       done = true;
@@ -17989,14 +18048,18 @@ class Readable extends Stream {
       }
     };
     const settleError = (err) => {
-      failure = __streamToError(err);
+      failure = failure || __streamToError(err);
       done = true;
       queue.length = 0;
       queuedBytes = 0;
-      cleanup();
+      stopFlow();
       while (waiters.length > 0) {
         waiters.shift().reject(failure);
       }
+      // The destroy callback can report an error asynchronously. Retain its
+      // observer until close, even after all next() calls have been rejected.
+      if (!stream.destroyed) stream.destroy(failure);
+      if (stream.closed) cleanup();
     };
     const onData = (value) => {
       if (done) return;
@@ -18006,7 +18069,6 @@ class Readable extends Stream {
         const size = typeof value === 'string' ? value.length * 2 : (value && value.byteLength) || 1;
         if (queue.length >= 1024 || queuedBytes + size > 1024 * 1024) {
           settleError(new Error('Readable async iterator buffer exceeds its limit'));
-          stream.destroy();
           return;
         }
         queue.push({ value, size });
@@ -18014,26 +18076,39 @@ class Readable extends Stream {
       }
       if (waiters.length === 0 && typeof stream.pause === 'function') stream.pause();
     };
-    const onEnd = () => settleDone();
-    const onError = (err) => {
-      settleError(err);
-      if (!stream.destroyed) stream.destroy();
+    const onEnd = () => {
+      ended = true;
+      stopFlow();
+      // EOF can start asynchronous auto-destruction. Do not report successful
+      // iteration while that cleanup can still fail. A live Duplex writable
+      // side and autoDestroy:false deliberately keep their resource owner.
+      const allSidesComplete = !__streamHasWritable(stream) || __streamWriteComplete(stream);
+      if (!stream.closed && (stream.destroyed || (__streamAutoDestroys(stream) && allSidesComplete))) return;
+      settleDone();
     };
-    const onClose = () => settleDone();
-    const cleanup = () => {
-      stream.removeListener("data", onData);
-      stream.removeListener("end", onEnd);
-      stream.removeListener("error", onError);
-      stream.removeListener("close", onClose);
+    const onError = (err) => settleError(err);
+    const onClose = () => {
+      if (stream.errored || failure) settleError(failure || stream.errored);
+      else if (ended || returning) settleDone();
+      else settleError(__streamError("ERR_STREAM_PREMATURE_CLOSE", "readable closed before EOF"));
+      cleanup();
+      const resolve = resolveReturn;
+      const reject = rejectReturn;
+      resolveReturn = rejectReturn = undefined;
+      if (failure) { if (reject) reject(failure); }
+      else if (resolve) resolve({ value: undefined, done: true });
     };
 
-    if (!done) {
+    stream.on("error", onError);
+    stream.on("close", onClose);
+    stream.on("end", onEnd);
+    if (!ended && !stream.destroyed) {
+      stream.pause();
       stream.on("data", onData);
-      stream.on("end", onEnd);
-      stream.on("error", onError);
-      stream.on("close", onClose);
-      if (typeof stream.pause === 'function') stream.pause();
     }
+    if (stream.errored) settleError(stream.errored);
+    else if (stream.closed) onClose();
+    else if (ended) onEnd();
 
     return {
       async next() {
@@ -18041,23 +18116,41 @@ class Readable extends Stream {
         if (queue.length > 0) {
           const item = queue.shift();
           queuedBytes -= item.size;
-          if (queue.length === 0 && !done && typeof stream.resume === 'function') stream.resume();
+          if (queue.length === 0 && !done && !ended && !stream.destroyed) stream.resume();
           return { value: item.value, done: false };
         }
         if (done) return { value: undefined, done: true };
         const pending = new Promise((resolve, reject) => waiters.push({ resolve, reject }));
-        if (typeof stream.resume === 'function') stream.resume();
+        if (!ended && !stream.destroyed) stream.resume();
         return await pending;
       },
       async return() {
-        const cancel = !done && !stream.destroyed;
+        if (returning) return await returning;
         queue.length = 0;
         queuedBytes = 0;
-        settleDone();
-        // Early return cancels a live source. QuickJS also calls return()
-        // after normal exhaustion, when the stream's EOF policy already ran.
-        if (cancel) stream.destroy();
-        return { value: undefined, done: true };
+        // QuickJS also returns an already exhausted iterator. Preserve the
+        // normal EOF policy, including autoDestroy:false and open Duplexes.
+        if (done && ended && !failure) return { value: undefined, done: true };
+        done = true;
+        stopFlow();
+        while (waiters.length > 0) waiters.shift().resolve({ value: undefined, done: true });
+        returning = new Promise((resolve, reject) => {
+          resolveReturn = resolve;
+          rejectReturn = reject;
+        });
+        // Cancellation owns its asynchronous cleanup. Observers remain live
+        // until close so a failed release rejects return() instead of escaping
+        // as an unhandled error after a supposedly successful cancellation.
+        try {
+          if (!stream.destroyed) stream.destroy();
+          if (stream.closed) onClose();
+        } catch (error) {
+          failure = failure || __streamToError(error);
+          cleanup();
+          if (rejectReturn) rejectReturn(failure);
+          resolveReturn = rejectReturn = undefined;
+        }
+        return await returning;
       },
       [Symbol.asyncIterator]() { return this; },
     };
@@ -32835,12 +32928,12 @@ mod tests {
             39_043,
             "c496331afa268ea323d999aae67693ce6900c3975d89cffb1557de1f8e77ee06",
         ),
-        // Read hooks, readable capacity, transform backpressure, and Web-stream
-        // cleanup error ownership are intentional source changes.
+        // Sized reads preserve frame boundaries and demand across adapters;
+        // iterators retain terminal-error ownership through asynchronous cleanup.
         (
             "node:stream",
-            52_279,
-            "3394851df1b2b86e8def01a7b7cc0ec909a577fd566e005b5a617524b3b61777",
+            56_470,
+            "f33b66dd2648cae742f4d04ad0a481e03d67431d0c221c797d85e0d11bf79ac0",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -47308,7 +47401,7 @@ globalThis.__spawn_abort_result = result;
                         const decodedLength = bytes.readableLength;
                         const zeroRead = bytes.read(0);
                         const afterZero = bytes.readableLength;
-                        const read = bytes.read();
+                        const read = bytes.read(1);
                         const afterRead = bytes.readableLength;
                         bytes.destroy();
 
@@ -47375,6 +47468,344 @@ globalThis.__spawn_abort_result = result;
             assert_eq!(result["objectMode"], json!(true));
             assert_eq!(result["zeroText"], json!("z"));
             assert_eq!(result["zeroCalls"], json!(2));
+        });
+    }
+
+    #[test]
+    fn pijs_readable_sized_reads_preserve_frames_and_adapter_demand() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.sizedReads = { done: false };
+                    (async () => {
+                        const { Readable } = await import('node:stream');
+                        const fs = await import('node:fs');
+                        const settle = async () => {
+                            for (let i = 0; i < 40; i++) await Promise.resolve();
+                        };
+                        const split = new Readable({ highWaterMark: 2 });
+                        split.push(Buffer.from('abcdef'));
+                        const pieces = [String(split.read(2)), String(split.read(3))];
+                        const shortRead = split.read(2);
+                        const afterShort = split.readableLength;
+                        split.push(Buffer.from('gh'));
+                        pieces.push(String(split.read(2)));
+                        const zeroRead = split.read(0);
+                        split.push(null);
+                        pieces.push(String(split.read(99)));
+                        await settle();
+
+                        const binary = new Readable();
+                        binary.push(Buffer.from([0, 255]));
+                        binary.push(new Uint8Array([1, 2, 3]));
+                        binary.push(Buffer.from([4]));
+                        const binaryFirst = binary.read(4);
+                        const binaryRest = binary.read();
+                        binary.destroy();
+
+                        const stringBytes = new Readable();
+                        stringBytes.push('é');
+                        stringBytes.push('中');
+                        const bytePrefix = Array.from(stringBytes.read(3));
+                        const byteSuffix = Array.from(stringBytes.read());
+                        stringBytes.destroy();
+
+                        const encoded = new Readable({ encoding: 'utf8' });
+                        encoded.push(Buffer.from('é中😀Z'));
+                        const text = [encoded.read(2), encoded.read(2)];
+                        const textShort = encoded.read(2);
+                        encoded.push(null);
+                        text.push(encoded.read(2));
+
+                        const objects = new Readable({ objectMode: true });
+                        objects.push({ index: 1 });
+                        objects.push(false);
+                        const firstObject = objects.read(50);
+                        const objectZero = objects.read(0);
+                        const secondObject = objects.read(50);
+                        objects.destroy();
+                        const invalid = new Readable();
+                        invalid.push(Buffer.from('kept'));
+                        const invalidCodes = [];
+                        for (const size of [-1, 0x40000001]) {
+                            try { invalid.read(size); }
+                            catch (error) { invalidCodes.push(error.code); }
+                        }
+                        const afterInvalid = String(invalid.read());
+                        invalid.destroy();
+
+                        const frameResults = {};
+                        const chunks = ['ab', 'cd', 'ef'].map(text => Buffer.from(text));
+                        let nativePulls = 0;
+                        let webPulls = 0;
+                        let webReleases = 0;
+                        fs.writeFileSync('/tmp/sized-stream-frames', 'abcdef');
+                        const sources = {
+                            native: new Readable({ highWaterMark: 1, read() {
+                                this.push(nativePulls < chunks.length ? chunks[nativePulls++] : null);
+                            } }),
+                            iterable: Readable.from(chunks, { objectMode: false, highWaterMark: 1 }),
+                            web: Readable.fromWeb({ getReader() { return {
+                                async read() {
+                                    const index = webPulls++;
+                                    return index < chunks.length
+                                        ? { done: false, value: chunks[index] } : { done: true };
+                                },
+                                releaseLock() { webReleases++; }, cancel() {},
+                            }; } }, { highWaterMark: 1 }),
+                            file: fs.createReadStream('/tmp/sized-stream-frames', { highWaterMark: 1 }),
+                        };
+                        for (const [name, source] of Object.entries(sources)) {
+                            const frames = [];
+                            const completed = new Promise((resolve, reject) => {
+                                source.on('end', resolve);
+                                source.on('error', reject);
+                            });
+                            source.on('readable', () => {
+                                let frame;
+                                while ((frame = source.read(4)) !== null) frames.push(String(frame));
+                            });
+                            await completed;
+                            frameResults[name] = { frames, buffered: source.readableLength };
+                        }
+                        // A size request without a readable listener must also
+                        // retain demand across chunks, then stop at its target.
+                        let pulls = 0;
+                        const demanded = Readable.from((function* () {
+                            for (let index = 0; index < 20; index++) {
+                                pulls++;
+                                yield Buffer.from([index]);
+                            }
+                        })(), { objectMode: false, highWaterMark: 1 });
+                        const initial = demanded.read(5);
+                        await settle();
+                        const waiting = { pulls, buffered: demanded.readableLength };
+                        const demandedBytes = Array.from(demanded.read(5));
+                        demanded.destroy();
+                        globalThis.sizedReads = {
+                            done: true, pieces, shortRead, afterShort, zeroRead,
+                            splitEnded: split.readableEnded, splitBuffered: split.readableLength,
+                            binaryFirst: Array.from(binaryFirst), binaryRest: Array.from(binaryRest),
+                            binaryBuffers: Buffer.isBuffer(binaryFirst) && Buffer.isBuffer(binaryRest),
+                            bytePrefix, byteSuffix, text, textShort,
+                            firstObject, objectZero, secondObject, invalidCodes, afterInvalid,
+                            frameResults, nativePulls, webPulls, webReleases,
+                            initial, waiting, demandedBytes,
+                        };
+                    })().catch(error => { globalThis.sizedReads.error = String(error); });
+                    ",
+                )
+                .await
+                .expect("evaluate sized readable frames");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "sizedReads").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["pieces"], json!(["ab", "cde", "fg", "h"]));
+            assert_eq!(result["shortRead"], serde_json::Value::Null);
+            assert_eq!(result["afterShort"], json!(1));
+            assert_eq!(result["zeroRead"], serde_json::Value::Null);
+            assert_eq!(result["splitEnded"], json!(true));
+            assert_eq!(result["splitBuffered"], json!(0));
+            assert_eq!(result["binaryFirst"], json!([0, 255, 1, 2]));
+            assert_eq!(result["binaryRest"], json!([3, 4]));
+            assert_eq!(result["binaryBuffers"], json!(true));
+            assert_eq!(result["bytePrefix"], json!([195, 169, 228]));
+            assert_eq!(result["byteSuffix"], json!([184, 173]));
+            assert_eq!(result["text"], json!(["é中", "😀", "Z"]));
+            assert_eq!(result["textShort"], serde_json::Value::Null);
+            assert_eq!(result["firstObject"], json!({ "index": 1 }));
+            assert_eq!(result["objectZero"], serde_json::Value::Null);
+            assert_eq!(result["secondObject"], json!(false));
+            assert_eq!(
+                result["invalidCodes"],
+                json!(["ERR_OUT_OF_RANGE", "ERR_OUT_OF_RANGE"])
+            );
+            assert_eq!(result["afterInvalid"], json!("kept"));
+            for name in ["native", "iterable", "web", "file"] {
+                assert_eq!(
+                    result["frameResults"][name],
+                    json!({ "frames": ["abcd", "ef"], "buffered": 0 }),
+                    "source={name}: {result}"
+                );
+            }
+            assert_eq!(result["nativePulls"], json!(3));
+            assert_eq!(result["webPulls"], json!(4));
+            assert_eq!(result["webReleases"], json!(1));
+            assert_eq!(result["initial"], serde_json::Value::Null);
+            assert_eq!(result["waiting"], json!({ "pulls": 5, "buffered": 5 }));
+            assert_eq!(result["demandedBytes"], json!([0, 1, 2, 3, 4]));
+        });
+    }
+
+    #[test]
+    fn pijs_readable_iterators_preserve_terminal_errors_and_owned_cleanup() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.iteratorLifecycle = { done: false };
+                    (async () => {
+                        const { Readable, Duplex } = await import('node:stream');
+                        const settle = async () => {
+                            for (let i = 0; i < 40; i++) await Promise.resolve();
+                        };
+                        const observe = operation => operation.then(
+                            result => ({ done: result.done }),
+                            error => ({ error: error.code || error.message }),
+                        );
+                        const ownedListeners = stream => ['data', 'end', 'error', 'close']
+                            .reduce((count, event) => count + stream.listenerCount(event), 0);
+                        const partial = new Readable();
+                        partial.push('part');
+                        const iterator = partial[Symbol.asyncIterator]();
+                        const first = String((await iterator.next()).value);
+                        const pending = observe(iterator.next());
+                        partial.destroy();
+                        const truncated = await pending;
+                        const closed = new Readable();
+                        closed.destroy();
+                        const alreadyClosed = await observe(closed[Symbol.asyncIterator]().next());
+
+                        const failed = new Readable();
+                        const ignore = () => {};
+                        failed.on('error', ignore);
+                        const original = new Error('original source failure');
+                        failed.destroy(original);
+                        failed.removeListener('error', ignore);
+                        let retainedError = false;
+                        try { await failed[Symbol.asyncIterator]().next(); }
+                        catch (error) { retainedError = error === original; }
+
+                        const endings = [];
+                        for (const fail of [false, true]) {
+                            let finish;
+                            let destroys = 0;
+                            const source = new Readable({ read() { this.push(null); },
+                                destroy(error, callback) { destroys++; finish = callback; },
+                            });
+                            let status = 'pending';
+                            const work = observe(source[Symbol.asyncIterator]().next())
+                                .then(result => { status = 'settled'; return result; });
+                            await settle();
+                            const before = { status, closed: source.closed, observed: source.listenerCount('error') };
+                            finish(fail ? new Error('EOF cleanup failed') : null);
+                            const outcome = await work;
+                            endings.push({ before, outcome, destroys, closed: source.closed, listeners: ownedListeners(source) });
+                        }
+
+                        const cancellations = [];
+                        for (const fail of [false, true]) {
+                            let finish;
+                            let destroys = 0;
+                            const source = new Readable({ read() {},
+                                destroy(error, callback) { destroys++; finish = callback; },
+                            });
+                            const iterator = source[Symbol.asyncIterator]();
+                            const pending = observe(iterator.next());
+                            let status = 'pending';
+                            const work = observe(iterator.return())
+                                .then(result => { status = 'settled'; return result; });
+                            await settle();
+                            const before = { status, closed: source.closed, observed: source.listenerCount('error') };
+                            finish(fail ? new Error('cancel cleanup failed') : null);
+                            const outcome = await work;
+                            const repeated = await observe(iterator.return());
+                            cancellations.push({ before, outcome, repeated, pending: await pending,
+                                destroys, closed: source.closed, listeners: ownedListeners(source) });
+                        }
+
+                        let finishLate;
+                        const late = new Readable({ destroy(error, callback) { finishLate = callback; } });
+                        late.destroy();
+                        const lateIterator = late[Symbol.asyncIterator]();
+                        const lateRead = observe(lateIterator.next());
+                        finishLate(new Error('late release failed'));
+                        const lateFailure = await lateRead;
+
+                        const retained = new Readable({ autoDestroy: false, read() { this.push(null); } });
+                        const retainedIterator = retained[Symbol.asyncIterator]();
+                        const retainedDone = (await retainedIterator.next()).done;
+                        await retainedIterator.return();
+                        const keptOpen = !retained.destroyed && !retained.closed;
+                        retained.destroy();
+                        const duplex = new Duplex({ read() { this.push(null); }, write(chunk, encoding, callback) { callback(null); } });
+                        const duplexIterator = duplex[Symbol.asyncIterator]();
+                        const duplexDone = (await duplexIterator.next()).done;
+                        await duplexIterator.return();
+                        const duplexWritable = !duplex.destroyed && duplex.writable;
+                        duplex.end();
+                        await settle();
+                        globalThis.iteratorLifecycle = {
+                            done: true, first, truncated, alreadyClosed, retainedError,
+                            terminalListeners: ownedListeners(partial) + ownedListeners(closed) + ownedListeners(failed),
+                            endings, cancellations, lateFailure, lateListeners: ownedListeners(late),
+                            retainedDone, keptOpen, duplexDone, duplexWritable, duplexClosed: duplex.closed,
+                        };
+                    })().catch(error => { globalThis.iteratorLifecycle.error = String(error); });
+                    ",
+                )
+                .await
+                .expect("evaluate iterator terminal ownership");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "iteratorLifecycle").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["first"], json!("part"));
+            for name in ["truncated", "alreadyClosed"] {
+                assert_eq!(
+                    result[name],
+                    json!({ "error": "ERR_STREAM_PREMATURE_CLOSE" })
+                );
+            }
+            assert_eq!(result["retainedError"], json!(true));
+            assert_eq!(result["terminalListeners"], json!(0));
+            for (group, error) in [
+                ("endings", "EOF cleanup failed"),
+                ("cancellations", "cancel cleanup failed"),
+            ] {
+                for index in 0..2 {
+                    let entry = &result[group][index];
+                    assert_eq!(
+                        entry["before"],
+                        json!({ "status": "pending", "closed": false, "observed": 1 })
+                    );
+                    let expected = if index == 0 {
+                        json!({ "done": true })
+                    } else {
+                        json!({ "error": error })
+                    };
+                    assert_eq!(entry["outcome"], expected, "{group}: {result}");
+                    assert_eq!(entry["destroys"], json!(1));
+                    assert_eq!(entry["closed"], json!(true));
+                    assert_eq!(entry["listeners"], json!(0));
+                    if group == "cancellations" {
+                        assert_eq!(entry["repeated"], expected);
+                        assert_eq!(entry["pending"], json!({ "done": true }));
+                    }
+                }
+            }
+            assert_eq!(
+                result["lateFailure"],
+                json!({ "error": "late release failed" })
+            );
+            assert_eq!(result["lateListeners"], json!(0));
+            for name in [
+                "retainedDone",
+                "keptOpen",
+                "duplexDone",
+                "duplexWritable",
+                "duplexClosed",
+            ] {
+                assert_eq!(result[name], json!(true), "{name}: {result}");
+            }
         });
     }
 
