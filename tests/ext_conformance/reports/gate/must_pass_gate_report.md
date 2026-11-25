@@ -1,10 +1,10 @@
 # Must-Pass Extension CI Gate Report
 
-> Generated: 2026-11-25T07:27:10Z
-> Run ID: local-20261125T072641796Z
-> Correlation ID: must-pass-gate-local-20261125T072641796Z
-> Git commit: `a6ce8700d9c0ca853bc336be4658dd6ad73b0989`
-> Source tree SHA-256: `1792e8dc214f52867c9888aef1f9b18057e65eefdda4982eaaea53b0f04125bd`
+> Generated: 2026-11-25T09:26:18Z
+> Run ID: local-20261125T092551681Z
+> Correlation ID: must-pass-gate-local-20261125T092551681Z
+> Git commit: `817a3937dc3c6c53977a2d51d06fe75676c0a4dd`
+> Source tree SHA-256: `120d5b6b3d4151d7ab2121d706d795b2765c73989ed2244d0a5a369837da85e3`
 > Inclusion-list SHA-256: `8801e2f1193105778cd0f88a0892c4699f2fbf1ff42fc87590b8e7fa88f51fe4`
 > Manifest SHA-256: `eab748bba758eeb1de7f83bba39fd3173bc52901706d42e12df1519ab7ea237e`
 > Mode: strict
