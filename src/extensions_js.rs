@@ -48022,13 +48022,14 @@ globalThis.__spawn_abort_result = result;
                     json!({"returned":1,"released":true,"hooks":1,"closed":false,"settled":false,
                         "hookError":hook_error})
                 );
-                let expected = error.map_or_else(
-                    || json!({"ok":true}),
-                    |message| json!({"error":message}),
-                );
+                let expected =
+                    error.map_or_else(|| json!({"ok":true}), |message| json!({"error":message}));
                 assert_eq!(entry["outcome"], expected, "{result}");
                 assert_eq!(entry["repeated"], expected);
-                assert_eq!(entry["errors"], json!(error.into_iter().collect::<Vec<_>>()));
+                assert_eq!(
+                    entry["errors"],
+                    json!(error.into_iter().collect::<Vec<_>>())
+                );
                 for name in ["returned", "hooks", "closes"] {
                     assert_eq!(entry[name], json!(1), "{name}: {result}");
                 }
@@ -48151,9 +48152,15 @@ globalThis.__spawn_abort_result = result;
                 );
                 assert_eq!(entry["afterNext"], json!(true));
                 assert_eq!(entry["afterReturn"], json!(true));
-                assert_eq!(entry["waitingForReturnValue"], json!(!matches!(index, 3 | 5)));
+                assert_eq!(
+                    entry["waitingForReturnValue"],
+                    json!(!matches!(index, 3 | 5))
+                );
                 assert_eq!(entry["hookError"], json!(error));
-                assert_eq!(entry["errors"], json!(error.into_iter().collect::<Vec<_>>()));
+                assert_eq!(
+                    entry["errors"],
+                    json!(error.into_iter().collect::<Vec<_>>())
+                );
                 assert_eq!(entry["delivered"], json!([]));
                 assert_eq!(entry["ends"], json!(0));
                 assert_eq!(entry["closed"], json!(true));

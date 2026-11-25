@@ -248,7 +248,10 @@ fn branch_navigation_retires_approved_context_and_requires_fresh_review() {
         // Selecting the current leaf is a no-op, including for live authority.
         run(handle.switch_to_entry(&approved_leaf)).unwrap();
         assert_eq!(state.mode(), PlanMode::Approved);
-        assert_eq!(handle.session().agent.system_prompt(), Some(prompt.as_str()));
+        assert_eq!(
+            handle.session().agent.system_prompt(),
+            Some(prompt.as_str())
+        );
 
         run(handle.switch_to_entry(&planning_leaf)).unwrap();
         assert_eq!(state.mode(), PlanMode::Planning);
@@ -356,7 +359,14 @@ fn retry_and_user_rewind_remove_approval_from_the_abandoned_context() {
     let review = submit(&handle);
     let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
     let _ = run(handle.prepare_retry_content()).unwrap();
-    assert!(handle.session_store().try_lock().unwrap().leaf_id().is_none());
+    assert!(
+        handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .leaf_id()
+            .is_none()
+    );
     assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Off);
     assert_eq!(
         handle.session().agent.system_prompt(),
@@ -397,10 +407,21 @@ fn append_only_context_replacement_keeps_the_current_plan_and_prompt() {
             .await
             .unwrap();
     });
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Approved);
-    assert_eq!(handle.session().agent.system_prompt(), Some(prompt.as_str()));
     assert_eq!(
-        handle.session().agent.plan_state().approved_plan().as_deref(),
+        handle.session().agent.plan_state().mode(),
+        PlanMode::Approved
+    );
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some(prompt.as_str())
+    );
+    assert_eq!(
+        handle
+            .session()
+            .agent
+            .plan_state()
+            .approved_plan()
+            .as_deref(),
         Some(review.text())
     );
 }
@@ -435,8 +456,14 @@ fn failed_branch_installation_preserves_live_plan_prompt_and_selection() {
         handle.session_store().try_lock().unwrap().leaf_id(),
         Some(source.as_str())
     );
-    assert_eq!(handle.session().agent.system_prompt(), Some("rewritten pin"));
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Approved);
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some("rewritten pin")
+    );
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::Approved
+    );
 
     handle
         .session_mut()
@@ -449,8 +476,14 @@ fn failed_branch_installation_preserves_live_plan_prompt_and_selection() {
         handle.session_store().try_lock().unwrap().leaf_id(),
         Some(source.as_str())
     );
-    assert_eq!(handle.session().agent.system_prompt(), Some(prompt.as_str()));
-    assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Approved);
+    assert_eq!(
+        handle.session().agent.system_prompt(),
+        Some(prompt.as_str())
+    );
+    assert_eq!(
+        handle.session().agent.plan_state().mode(),
+        PlanMode::Approved
+    );
     assert!(handle.session().ensure_provider_reentry_allowed().is_err());
 }
 

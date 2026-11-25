@@ -456,7 +456,7 @@ mod tests {
             "encrypted_content": "opaque-continuation"
         });
         let body = reply(json!([
-            reasoning.clone(),
+            reasoning,
             text_item(),
             call("fc_1", "call_1", r#"{"path":"a.rs"}"#),
             call("fc_2", "call_2", r#"{"path":"b.rs"}"#)
@@ -601,7 +601,7 @@ mod tests {
             "content":[{"type":"refusal", "refusal":"Cannot do that."}]
         });
         let mut state = state();
-        let body = reply(json!([refusal.clone()]));
+        let body = reply(json!([refusal]));
         process_response(&mut state, &serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(terminal(&state).stop_reason, StopReason::Refusal);
         assert!(matches!(terminal(&state).content.as_slice(),

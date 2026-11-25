@@ -6483,7 +6483,7 @@ mod tests {
                     .await
             });
             server.join().expect("fixture server");
-            assert!(events.iter().any(|event| event.is_err()));
+            assert!(events.iter().any(std::result::Result::is_err));
             assert!(!events.iter().any(|event| matches!(
                 event,
                 Ok(StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. })
@@ -6553,7 +6553,7 @@ mod tests {
                 .await
         });
         server.join().expect("fixture server");
-        assert!(events.iter().any(|event| event.is_err()));
+        assert!(events.iter().any(std::result::Result::is_err));
         assert!(!events.iter().any(|event| matches!(
             event,
             Ok(StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. })
