@@ -1,9 +1,9 @@
 {
   "schema": "pi.ext.must_pass_gate.v1",
-  "generated_at": "2026-11-25T07:19:29.770Z",
-  "run_id": "local-20261125T071929770Z",
-  "correlation_id": "must-pass-gate-local-20261125T071929770Z",
-  "git_commit": "0d12b6e3e036bd75925053fca918da638ce96f25",
+  "generated_at": "2026-11-25T07:26:41.796Z",
+  "run_id": "local-20261125T072641796Z",
+  "correlation_id": "must-pass-gate-local-20261125T072641796Z",
+  "git_commit": "a6ce8700d9c0ca853bc336be4658dd6ad73b0989",
   "source_tree_sha256": "1792e8dc214f52867c9888aef1f9b18057e65eefdda4982eaaea53b0f04125bd",
   "inclusion_sha256": "8801e2f1193105778cd0f88a0892c4699f2fbf1ff42fc87590b8e7fa88f51fe4",
   "manifest_sha256": "eab748bba758eeb1de7f83bba39fd3173bc52901706d42e12df1519ab7ea237e",
