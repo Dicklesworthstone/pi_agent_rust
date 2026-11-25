@@ -18740,19 +18740,52 @@ class Writable extends Stream {
     }
     let controller;
     let completed = false;
+    let failure = null;
+    let pendingWrite = null;
     let pendingClose = null;
+    let cancellation = null;
     const cleanup = () => {
       nodeWritable.removeListener?.("error", onError);
       nodeWritable.removeListener?.("close", onClose);
+      nodeWritable.removeListener?.("drain", onDrain);
+      controller.signal?.removeEventListener("abort", onAbort);
     };
-    const onError = (error) => {
-      const failure = __streamToError(error);
-      controller.error(failure);
+    const rejectPending = (error) => {
+      if (pendingWrite) {
+        const pending = pendingWrite;
+        pendingWrite = null;
+        pending.reject(error);
+      }
       if (pendingClose) {
         const pending = pendingClose;
         pendingClose = null;
-        pending.reject(failure);
+        pending.reject(error);
       }
+    };
+    const onError = (error) => {
+      if (cancellation) {
+        if (error !== cancellation.reason && !cancellation.failure) {
+          cancellation.failure = __streamToError(error);
+        }
+        return;
+      }
+      failure = failure || __streamToError(error);
+      controller.error(failure);
+      // A foreign Node stream may emit error/close without ever invoking its
+      // write callback. Those events must release the active Web write too.
+      rejectPending(failure);
+    };
+    const finishWrite = () => {
+      const pending = pendingWrite;
+      if (!pending || !pending.started || !pending.written || pending.needsDrain) return;
+      pendingWrite = null;
+      pending.resolve();
+    };
+    const onDrain = () => {
+      if (!pendingWrite) return;
+      pendingWrite.drained = true;
+      pendingWrite.needsDrain = false;
+      finishWrite();
     };
     const finishClose = () => {
       completed = true;
@@ -18763,39 +18796,96 @@ class Writable extends Stream {
       }
       cleanup();
     };
+    const finishCancellation = () => {
+      if (!cancellation || cancellation.settled) return;
+      cancellation.settled = true;
+      if (nodeWritable.errored && nodeWritable.errored !== cancellation.reason && !cancellation.failure) {
+        cancellation.failure = __streamToError(nodeWritable.errored);
+      }
+      cleanup();
+      if (cancellation.failure) cancellation.reject(cancellation.failure);
+      else cancellation.resolve();
+    };
     const onClose = () => {
+      if (cancellation) { finishCancellation(); return; }
       if (nodeWritable.errored) onError(nodeWritable.errored);
-      else if (!completed && !nodeWritable.writableFinished && !nodeWritable._writableState?.finished) {
-        onError(nodeWritable.errored || __streamError("ERR_STREAM_PREMATURE_CLOSE", "premature stream close"));
+      else if (pendingWrite || (!completed && !__streamWriteComplete(nodeWritable))) {
+        onError(__streamError("ERR_STREAM_PREMATURE_CLOSE", "premature stream close"));
       } else finishClose();
       cleanup();
+    };
+    const cancel = (reason) => {
+      if (cancellation) return cancellation.promise;
+      let resolve, reject;
+      const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      cancellation = {
+        promise, resolve, reject, settled: false, failure: null,
+        // An omitted abort reason must not mask an asynchronous destroy-hook
+        // failure behind a synthetic error passed to Stream.destroy().
+        reason: reason == null ? null : __streamToError(reason),
+      };
+      promise.catch(() => {});
+      rejectPending(cancellation.reason || __streamError("ABORT_ERR", "stream aborted"));
+      if (nodeWritable.closed || typeof nodeWritable.destroy !== "function") {
+        finishCancellation();
+      } else {
+        try {
+          nodeWritable.destroy(cancellation.reason);
+          if (nodeWritable.closed) finishCancellation();
+        } catch (error) {
+          cancellation.failure = __streamToError(error);
+          finishCancellation();
+        }
+      }
+      return promise;
+    };
+    const onAbort = () => {
+      // AbortSignal invents an AbortError for an omitted reason. Only release
+      // the in-flight Web operation here; sink.abort receives the original
+      // reason and owns destruction without that synthetic error masking a
+      // real cleanup failure. A late Node callback can no longer revive it.
+      rejectPending(failure || controller.signal.reason);
     };
     return new WritableStream({
       start(value) {
         controller = value;
         nodeWritable.on?.("error", onError);
         nodeWritable.on?.("close", onClose);
+        nodeWritable.on?.("drain", onDrain);
+        // Web abort waits for an in-flight sink.write before invoking sink.abort.
+        // The signal is the earlier cancellation seam that can release a stuck
+        // Web write and let sink.abort take ownership of the Node resource.
+        controller.signal?.addEventListener("abort", onAbort);
         if (nodeWritable.errored) onError(nodeWritable.errored);
         else if (nodeWritable.closed) onClose();
       },
       write(chunk) {
         return new Promise((resolve, reject) => {
+          if (failure) { reject(failure); return; }
+          if (controller.signal?.aborted) { reject(controller.signal.reason); return; }
+          const pending = { resolve, reject, started: false, written: false, drained: false, needsDrain: false };
+          pendingWrite = pending;
           try {
             const ok = nodeWritable.write(chunk, (err) => {
-              if (err) {
-                onError(err);
-                reject(__streamToError(err));
-              }
-              else resolve();
+              if (pendingWrite !== pending) return;
+              if (err) onError(err);
+              else { pending.written = true; finishWrite(); }
             });
-            if (ok === true) resolve();
+            if (pendingWrite !== pending) return;
+            // true reports queue capacity, not completion. A false return also
+            // owns its drain notification; neither signal replaces the callback.
+            pending.started = true;
+            pending.needsDrain = ok === false && !pending.drained;
+            finishWrite();
           } catch (err) {
-            reject(__streamToError(err));
+            onError(err);
           }
         });
       },
       close() {
         return new Promise((resolve, reject) => {
+          if (failure) { reject(failure); return; }
+          if (controller.signal?.aborted) { reject(controller.signal.reason); return; }
           pendingClose = { resolve, reject };
           try {
             nodeWritable.end((err) => {
@@ -18818,20 +18908,7 @@ class Writable extends Stream {
         });
       },
       abort(reason) {
-        return new Promise((resolve, reject) => {
-          const done = () => { cleanup(); resolve(); };
-          if (nodeWritable.closed || typeof nodeWritable.destroy !== "function") {
-            done();
-            return;
-          }
-          nodeWritable.once?.("close", done);
-          try { nodeWritable.destroy(__streamToError(reason ?? "stream aborted")); }
-          catch (error) {
-            nodeWritable.removeListener?.("close", done);
-            cleanup();
-            reject(__streamToError(error));
-          }
-        });
+        return cancel(reason);
       },
     });
   }
@@ -33081,10 +33158,11 @@ mod tests {
         // iterators retain terminal-error ownership through asynchronous cleanup.
         // Iterable adapters also own pending next/value and return cleanup.
         // Pipe fanout waits for every sink and retains asynchronous teardown errors.
+        // Web writable bridges await write callbacks and own abort cleanup.
         (
             "node:stream",
-            61_195,
-            "d599fa6eddcf7c7afce64df20b52dc3840523dee3db56269cc6bc97ed36ec69f",
+            64_783,
+            "3e7b1706a96c120e2b19c7940e2b256a82fe786db241a82005ad7de0b16960bf",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -49196,6 +49274,157 @@ globalThis.__spawn_abort_result = result;
             );
             assert_eq!(result["errors"], json!([]));
         });
+    }
+
+    #[test]
+    fn pijs_writable_to_web_waits_for_write_callbacks_and_drain() {
+        assert_web_stream_fixture(
+            r"
+const { Writable } = await import('node:stream');
+for (const highWaterMark of [1, 64]) {
+    const writes = [], callbacks = [], outcomes = [];
+    let closing = 'pending';
+    const sink = new Writable({ highWaterMark,
+        write(chunk, _encoding, callback) { writes.push(String(chunk)); callbacks.push(callback); },
+    });
+    const writer = Writable.toWeb(sink).getWriter();
+    writer.closed.catch(() => {});
+    const first = writer.write('first').then(() => outcomes.push('first'));
+    const second = writer.write('second').then(() => outcomes.push('second'));
+    const close = writer.close().then(() => { closing = 'closed'; });
+    await tick();
+    check(writes.join(',') === 'first', 'Web writes admit only one active Node write');
+    check(outcomes.length === 0 && closing === 'pending', 'queue capacity never acknowledges an incomplete write');
+    callbacks[0](null);
+    await tick();
+    check(outcomes.join(',') === 'first' && writes.join(',') === 'first,second', 'callback and drain release only the completed write');
+    check(closing === 'pending', 'Web close waits for the last write callback');
+    callbacks[1](null);
+    await success(Promise.all([first, second, close]), 'ordered write and close');
+    check(outcomes.join(',') === 'first,second' && closing === 'closed', 'both capacity paths preserve completion order');
+    check(sink.closed && sink.listenerCount('error') === 0 && sink.listenerCount('drain') === 0,
+        'successful writer retirement releases its listeners');
+    writer.releaseLock();
+}
+let finish;
+const reason = new Error('asynchronous write failure');
+const failed = new Writable({ write(_chunk, _encoding, callback) { finish = callback; } });
+const writer = Writable.toWeb(failed).getWriter();
+writer.closed.catch(() => {});
+let outcome = 'pending';
+const write = writer.write('never acknowledged');
+write.then(() => { outcome = 'success'; }, () => { outcome = 'failed'; });
+await tick();
+check(outcome === 'pending', 'async failure remains observable while the Node callback is outstanding');
+finish(reason);
+await rejectsWith(write, reason, 'write rejects its originating callback failure');
+check(outcome === 'failed' && failed.closed, 'failed work is never acknowledged as successful');
+writer.releaseLock();
+return checks;
+",
+            15,
+        );
+    }
+
+    #[test]
+    fn pijs_writable_to_web_abort_interrupts_writes_and_retains_cleanup() {
+        assert_web_stream_fixture(
+            r"
+const { Writable } = await import('node:stream');
+for (const failCleanup of [false, true]) {
+    const writes = [], outcomes = [];
+    let finishWrite, finishDestroy, destroyReason, destroys = 0, closes = 0, aborted = 'pending';
+    const sink = new Writable({
+        write(chunk, _encoding, callback) { writes.push(String(chunk)); finishWrite = callback; },
+        destroy(reason, callback) { destroys++; destroyReason = reason; finishDestroy = callback; },
+    });
+    sink.on('close', () => closes++);
+    const writer = Writable.toWeb(sink).getWriter();
+    writer.closed.catch(() => {});
+    for (const chunk of ['active', 'queued']) {
+        writer.write(chunk).then(() => outcomes.push('success'), () => outcomes.push('failed'));
+    }
+    await tick();
+    check(writes.join(',') === 'active' && outcomes.length === 0, 'abort fixture starts with one uncompleted write');
+    const abort = writer.abort();
+    abort.then(() => { aborted = 'success'; }, () => { aborted = 'failed'; });
+    await tick();
+    check(destroys === 1 && !sink.closed && aborted === 'pending', 'abort reaches a blocked writer and waits for destroy cleanup');
+    check(destroyReason === null, 'omitted abort reason cannot mask a cleanup error');
+    check(outcomes.join(',') === 'failed,failed' && writes.join(',') === 'active', 'aborting rejects active and queued writes without dispatching more work');
+    const reason = new Error('owned abort cleanup failed');
+    finishDestroy(failCleanup ? reason : null);
+    const result = await settle(abort, 'owned writer abort');
+    check(failCleanup ? !result.ok && result.error === reason : result.ok, 'abort reports its actual cleanup result');
+    finishWrite(null);
+    finishWrite(new Error('late callback must stay retired'));
+    finishDestroy(new Error('duplicate cleanup must stay retired'));
+    await tick();
+    check(closes === 1 && destroys === 1 && sink.listenerCount('error') === 0 && sink.listenerCount('drain') === 0,
+        'late callbacks do not resurrect writes or retain cleanup listeners');
+    writer.releaseLock();
+}
+let passedReason, complete;
+const requested = new Error('caller cancellation');
+const explicit = new Writable({ destroy(reason, callback) { passedReason = reason; complete = callback; } });
+const writer = Writable.toWeb(explicit).getWriter();
+writer.closed.catch(() => {});
+const abort = writer.abort(requested);
+await tick();
+check(passedReason === requested, 'explicit abort reason reaches its Node owner');
+complete(requested);
+await success(abort, 'expected cancellation reason');
+check(explicit.closed && explicit.listenerCount('error') === 0, 'the expected cancellation reason does not become a cleanup failure');
+writer.releaseLock();
+let dispatched = 0;
+const early = new Writable({ write(_chunk, _encoding, callback) { dispatched++; callback(null); } });
+const earlyWriter = Writable.toWeb(early).getWriter();
+earlyWriter.closed.catch(() => {});
+earlyWriter.write('cancel before sink admission').catch(() => {});
+await success(earlyWriter.abort(), 'abort before write dispatch');
+check(dispatched === 0 && early.closed, 'abort before the sink microtask cannot start Node work afterward');
+earlyWriter.releaseLock();
+return checks;
+",
+            15,
+        );
+    }
+
+    #[test]
+    fn pijs_writable_to_web_terminal_events_retire_missing_callbacks() {
+        assert_web_stream_fixture(
+            r"
+const { Writable } = await import('node:stream');
+for (const event of ['error', 'close']) {
+    const sink = new Writable();
+    let callback, outcome = 'pending';
+    // Foreign writers may report terminal state without completing write().
+    // Keep the real stream's event/destruction machinery for this seam.
+    sink.write = (_chunk, done) => { callback = done; return true; };
+    const writer = Writable.toWeb(sink).getWriter();
+    writer.closed.catch(() => {});
+    const write = writer.write('pending');
+    write.then(() => { outcome = 'success'; }, () => { outcome = 'failed'; });
+    await tick();
+    check(outcome === 'pending', 'a foreign writer must acknowledge through its callback');
+    const reason = new Error('foreign write failure');
+    if (event === 'error') sink.emit('error', reason);
+    else sink.destroy();
+    const result = await settle(write, 'terminal event without callback');
+    check(!result.ok && (event === 'error' ? result.error === reason : result.error.code === 'ERR_STREAM_PREMATURE_CLOSE'),
+        'terminal events reject the otherwise stranded Web write');
+    callback(null);
+    callback(new Error('late error'));
+    if (!sink.destroyed) sink.destroy();
+    await tick();
+    check(outcome === 'failed' && sink.listenerCount('error') === 0 && sink.listenerCount('drain') === 0,
+        'late foreign callbacks cannot change the terminal result');
+    writer.releaseLock();
+}
+return checks;
+",
+            6,
+        );
     }
 
     #[test]
