@@ -500,6 +500,7 @@ impl PiApp {
         }
 
         agent_guard.stream_options_mut().thinking_level = Some(next);
+        agent_guard.plans.forget_model_restore();
         drop(session_guard);
         drop(agent_guard);
 

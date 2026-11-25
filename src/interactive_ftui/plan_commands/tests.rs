@@ -145,9 +145,10 @@ fn approval_without_display_id_and_trailing_arguments_are_rejected() {
     }
 }
 
+#[cfg(feature = "ftui")]
 #[test]
 fn default_ftui_routes_plan_and_preserves_extension_prefixes() {
-    use super::super::{PiFtuiModel, UiCommand};
+    use crate::interactive_ftui::{PiFtuiModel, UiCommand};
     let (_agent_tx, agent_rx) = std::sync::mpsc::channel();
     let (submit_tx, submit_rx) = std::sync::mpsc::channel();
     let mut model = PiFtuiModel::new(agent_rx).with_submit_channel(submit_tx);
@@ -719,6 +720,7 @@ fn cli_execution_key_stays_with_its_provider_and_returns_after_planning() {
     );
 }
 
+#[cfg(feature = "ftui")]
 #[test]
 fn explicit_same_model_or_thinking_selection_retires_automatic_restore() {
     for thinking in [false, true] {
@@ -727,13 +729,13 @@ fn explicit_same_model_or_thinking_selection_retires_automatic_restore() {
         run(controller.execute(&mut handle, "enter")).unwrap();
         let (send, _receive) = std::sync::mpsc::channel();
         let selected = if thinking {
-            run(super::super::run_set_thinking_command(
+            run(crate::interactive_ftui::run_set_thinking_command(
                 &mut handle,
                 Some(ThinkingLevel::Low),
                 &send,
             ))
         } else {
-            run(super::super::run_set_model_command(
+            run(crate::interactive_ftui::run_set_model_command(
                 &mut handle,
                 "anthropic",
                 "plan-role-fixture",
@@ -752,19 +754,20 @@ fn explicit_same_model_or_thinking_selection_retires_automatic_restore() {
     }
 }
 
+#[cfg(feature = "ftui")]
 #[test]
 fn failed_manual_selection_and_thinking_query_do_not_retire_restore() {
     let (mut handle, _) = role_fixture(Session::in_memory(), false);
     let mut controller = role_controller();
     run(controller.execute(&mut handle, "enter")).unwrap();
     let (send, _receive) = std::sync::mpsc::channel();
-    assert!(!run(super::super::run_set_model_command(
+    assert!(!run(crate::interactive_ftui::run_set_model_command(
         &mut handle,
         "anthropic",
         "missing-model",
         &send,
     )));
-    assert!(!run(super::super::run_set_thinking_command(
+    assert!(!run(crate::interactive_ftui::run_set_thinking_command(
         &mut handle,
         None,
         &send
@@ -924,6 +927,7 @@ fn indeterminate_model_save_requires_session_recovery_not_a_plan_save() {
     assert_eq!(std::fs::read(&blocker).unwrap(), b"sentinel");
 }
 
+#[cfg(feature = "ftui")]
 #[test]
 fn saving_a_failed_entry_checkpoint_completes_the_planning_model_selection() {
     for explicit_selection in [false, true] {
@@ -946,7 +950,7 @@ fn saving_a_failed_entry_checkpoint_completes_the_planning_model_selection() {
         handle.session_store().try_lock().unwrap().path = Some(path);
         if explicit_selection {
             let (send, _receive) = std::sync::mpsc::channel();
-            assert!(run(super::super::run_set_thinking_command(
+            assert!(run(crate::interactive_ftui::run_set_thinking_command(
                 &mut handle,
                 Some(ThinkingLevel::High),
                 &send,

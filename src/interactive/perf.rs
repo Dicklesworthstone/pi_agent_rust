@@ -6,7 +6,7 @@ use asupersync::sync::{Mutex, OwnedMutexGuard};
 use serde_json::{Value, json};
 
 use super::{
-    AgentState, Cmd, ConversationMessage, EXTENSION_EVENT_TIMEOUT_MS, PiApp, PiMsg,
+    AgentState, Cmd, ConversationMessage, EXTENSION_EVENT_TIMEOUT_MS, InteractiveAgent, PiApp, PiMsg,
     conversation_from_session,
 };
 use crate::checkpoint::RetryPlan;
@@ -173,49 +173,27 @@ async fn stage_and_commit_compaction_session(
 enum RetryPersistenceOutcome {
     Confirmed,
     Disabled,
-    ReconciledButUnconfirmed,
 }
 
 #[derive(Debug)]
 struct RetrySessionCommit {
-    messages_for_agent: Vec<Message>,
     messages_for_ui: Vec<ConversationMessage>,
     usage: Usage,
     plan: RetryPlan,
     persistence: RetryPersistenceOutcome,
 }
 
-async fn confirm_exact_retry_after_save_error(
-    candidate: &Session,
-    expected_leaf_id: Option<&str>,
-) -> Option<()> {
-    let path = candidate.path.as_ref()?;
-    let (reopened, diagnostics) = Session::open_with_diagnostics(path.to_string_lossy().as_ref())
-        .await
-        .ok()?;
-    if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty() {
-        return None;
-    }
-    if reopened.header.id != candidate.header.id || reopened.leaf_id() != expected_leaf_id {
-        return None;
-    }
-    if serde_json::to_vec(&reopened.header).ok()? != serde_json::to_vec(&candidate.header).ok()?
-        || serde_json::to_vec(&reopened.entries).ok()?
-            != serde_json::to_vec(&candidate.entries).ok()?
-    {
-        return None;
-    }
-    Some(())
-}
-
 async fn stage_and_commit_retry(
-    session: Arc<Mutex<Session>>,
+    agent: &mut InteractiveAgent,
     expected_session_id: &str,
     expected_leaf_id: Option<&str>,
-    save_enabled: bool,
     cx: &Cx,
 ) -> crate::error::Result<RetrySessionCommit> {
-    let mut live = OwnedMutexGuard::lock(session, cx)
+    let admission = agent.handle.session().provider_admission_gate();
+    let _provider_authority = admission.acquire_transition_authority(cx).await?;
+    let session_actions = agent.handle.session().session_action_admission_gate();
+    let _session_action_permit = session_actions.acquire(cx).await?;
+    let mut live = OwnedMutexGuard::lock(agent.handle.session_store(), cx)
         .await
         .map_err(|err| crate::error::Error::session(err.to_string()))?;
     if live.header.id != expected_session_id || live.leaf_id() != expected_leaf_id {
@@ -226,37 +204,27 @@ async fn stage_and_commit_retry(
     let plan = crate::checkpoint::plan_retry(&live)
         .ok_or_else(|| crate::error::Error::session("No user turn to retry".to_string()))?;
     let mut candidate = live.clone();
+    candidate.ensure_full_v2_hydration_before_save()?;
     crate::checkpoint::apply_retry_plan(&mut candidate, &plan).map_err(|err| {
         crate::error::Error::session(format!("Retry plan could not be applied: {err}"))
     })?;
 
-    let new_leaf_id = candidate.leaf_id().map(str::to_string);
-    let persistence = if !save_enabled {
-        RetryPersistenceOutcome::Disabled
-    } else if let Err(err) = candidate.save().await {
-        tracing::error!(
-            error = %err,
-            ?new_leaf_id,
-            "retry save failed; reconciling the exact operation against current disk state"
-        );
-        if confirm_exact_retry_after_save_error(&candidate, new_leaf_id.as_deref())
-            .await
-            .is_none()
-        {
-            return Err(crate::error::Error::session(format!(
-                "Retry persistence was not confirmed ({err}), current disk state could not be reconciled, and the active in-memory session was left unchanged"
-            )));
-        }
-        RetryPersistenceOutcome::ReconciledButUnconfirmed
-    } else {
+    let persistence = if agent.handle.session().save_enabled() {
         RetryPersistenceOutcome::Confirmed
+    } else {
+        RetryPersistenceOutcome::Disabled
     };
-
-    let messages_for_agent = candidate.to_messages_for_current_path();
-    let (messages_for_ui, usage) = conversation_from_session(&candidate);
-    *live = candidate;
+    // Retry is a branch departure. Use the same persistence and plan-context
+    // transaction as SDK retries rather than replacing just the transcript.
+    agent
+        .handle
+        .session_mut()
+        .install_context_candidate(&mut live, candidate, true, &admission, "retry", cx)
+        .await?;
+    agent.plans.clear_review();
+    agent.plans.forget_model_restore();
+    let (messages_for_ui, usage) = conversation_from_session(&live);
     Ok(RetrySessionCommit {
-        messages_for_agent,
         messages_for_ui,
         usage,
         plan,
@@ -1222,11 +1190,9 @@ impl PiApp {
         self.agent_state = AgentState::Processing;
         self.status_message = Some("Retrying last turn...".to_string());
 
-        let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
         let event_tx = self.event_tx.clone();
         let extensions = self.extensions.clone();
-        let save_enabled = self.save_enabled;
         let runtime_handle = self.runtime_handle.clone();
 
         runtime_handle.spawn_with_cx(move |cx| async move {
@@ -1266,10 +1232,9 @@ impl PiApp {
                 }
             };
             let commit = match stage_and_commit_retry(
-                Arc::clone(&session),
+                &mut agent_guard,
                 &session_id,
                 expected_leaf_id.as_deref(),
-                save_enabled,
                 &cx,
             )
             .await
@@ -1286,16 +1251,13 @@ impl PiApp {
                     return;
                 }
             };
-            agent_guard.replace_messages(commit.messages_for_agent);
             drop(agent_guard);
 
             let status = match commit.persistence {
-                RetryPersistenceOutcome::Confirmed | RetryPersistenceOutcome::Disabled => {
-                    Some("Retrying last turn".to_string())
+                RetryPersistenceOutcome::Confirmed => Some("Retrying last turn".to_string()),
+                RetryPersistenceOutcome::Disabled => {
+                    Some("Retrying last turn (memory only)".to_string())
                 }
-                RetryPersistenceOutcome::ReconciledButUnconfirmed => Some(
-                    "Persistence warning: retry branch is present in the current disk and active session state, but final durability was not confirmed".to_string(),
-                ),
             };
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
@@ -2281,6 +2243,35 @@ mod tests {
         (session, first_answer, abandoned)
     }
 
+    fn retry_agent(session: Arc<Mutex<Session>>, save_enabled: bool) -> InteractiveAgent {
+        let provider = Arc::new(
+            crate::providers::openai::OpenAIProvider::new("classic-plan-retry")
+                .with_base_url("http://127.0.0.1:1/v1"),
+        );
+        let mut agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+            crate::agent::AgentConfig {
+                system_prompt: Some("Independent instructions".to_string()),
+                ..crate::agent::AgentConfig::default()
+            },
+        );
+        agent.replace_messages(session.try_lock().unwrap().to_messages_for_current_path());
+        let session = crate::agent::AgentSession::new(
+            agent,
+            session,
+            save_enabled,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        InteractiveAgent {
+            handle: crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                session,
+                crate::sdk::EventListeners::default(),
+            ),
+            plans: Default::default(),
+        }
+    }
+
     #[test]
     fn staged_retry_save_failure_leaves_live_session_exact() {
         let temp = TempDir::new().expect("tempdir");
@@ -2294,14 +2285,14 @@ mod tests {
         let expected_entries =
             serde_json::to_value(&raw_session.entries).expect("serialize entries");
         let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = retry_agent(Arc::clone(&session), true);
         let cx = Cx::for_testing();
 
         let error = runtime()
             .block_on(stage_and_commit_retry(
-                Arc::clone(&session),
+                &mut agent,
                 &expected_session_id,
                 expected_leaf_id.as_deref(),
-                true,
                 &cx,
             ))
             .expect_err("directory session path must reject retry save");
@@ -2329,14 +2320,14 @@ mod tests {
         let expected_session_id = raw_session.header.id.clone();
         let expected_leaf_id = raw_session.leaf_id().map(str::to_string);
         let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = retry_agent(Arc::clone(&session), false);
         let cx = Cx::for_testing();
 
         let commit = runtime()
             .block_on(stage_and_commit_retry(
-                Arc::clone(&session),
+                &mut agent,
                 &expected_session_id,
                 expected_leaf_id.as_deref(),
-                false,
                 &cx,
             ))
             .expect("memory-only retry");
@@ -2378,13 +2369,13 @@ mod tests {
             .block_on(raw_session.save())
             .expect("pin baseline retry session");
         let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = retry_agent(Arc::clone(&session), true);
 
         let commit = runtime()
             .block_on(stage_and_commit_retry(
-                Arc::clone(&session),
+                &mut agent,
                 &expected_session_id,
                 expected_leaf_id.as_deref(),
-                true,
                 &cx,
             ))
             .expect("durable retry");
@@ -2414,6 +2405,101 @@ mod tests {
             .get_entry(&retried)
             .and_then(|entry| entry.base().parent_id.clone());
         assert_eq!(retried_parent.as_deref(), Some(first_answer.as_str()));
+    }
+
+    fn prepare_retry_plan(
+        agent: &mut InteractiveAgent,
+        approve: bool,
+    ) -> crate::plan::SessionPlanReview {
+        let owner = crate::agent_cx::AgentCx::for_request();
+        let entered = runtime().block_on(agent.handle.enter_plan_mode(&owner)).unwrap();
+        assert!(!matches!(
+            entered.persistence,
+            crate::plan::PlanPersistence::Unconfirmed { .. }
+        ));
+        assert!(agent.plan_state().submit_plan("Inspect then implement".to_string()));
+        let review = agent.handle.pending_plan_review().unwrap().unwrap();
+        if approve {
+            let approved = runtime()
+                .block_on(agent.handle.approve_plan_review(&owner, &review))
+                .unwrap();
+            assert!(!matches!(
+                approved.persistence,
+                crate::plan::PlanPersistence::Unconfirmed { .. }
+            ));
+        }
+        review
+    }
+
+    #[test]
+    fn staged_retry_retires_pending_and_approved_branch_authority() {
+        for approved in [false, true] {
+            let (raw_session, parent, _) = linear_retry_session(None);
+            let session = Arc::new(Mutex::new(raw_session));
+            let mut agent = retry_agent(Arc::clone(&session), false);
+            let review = prepare_retry_plan(&mut agent, approved);
+            let (id, leaf) = {
+                let live = session.try_lock().unwrap();
+                (live.header.id.clone(), live.leaf_id().map(str::to_string))
+            };
+            let commit = runtime()
+                .block_on(stage_and_commit_retry(
+                    &mut agent,
+                    &id,
+                    leaf.as_deref(),
+                    &Cx::for_testing(),
+                ))
+                .unwrap();
+            assert_eq!(commit.plan.text, "second question");
+            assert_eq!(session.try_lock().unwrap().leaf_id(), Some(parent.as_str()));
+            assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Off);
+            assert_eq!(agent.system_prompt(), Some("Independent instructions"));
+            assert!(runtime()
+                .block_on(agent.handle.approve_plan_review(
+                    &crate::agent_cx::AgentCx::for_request(),
+                    &review,
+                ))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn staged_retry_failed_save_preserves_owned_plan_and_fences_reentry() {
+        let temp = TempDir::new().unwrap();
+        let (mut raw_session, _, _) = linear_retry_session(Some(temp.path().join("sessions")));
+        raw_session.path = Some(temp.path().join("source.jsonl"));
+        let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = retry_agent(Arc::clone(&session), true);
+        let _ = prepare_retry_plan(&mut agent, true);
+        let prompt = agent.system_prompt().map(str::to_string);
+        let messages = serde_json::to_value(agent.messages()).unwrap();
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).unwrap();
+        let (id, leaf, entries) = {
+            let mut live = session.try_lock().unwrap();
+            live.path = Some(blocked_path);
+            (
+                live.header.id.clone(),
+                live.leaf_id().map(str::to_string),
+                serde_json::to_value(&live.entries).unwrap(),
+            )
+        };
+        let error = runtime()
+            .block_on(stage_and_commit_retry(
+                &mut agent,
+                &id,
+                leaf.as_deref(),
+                &Cx::for_testing(),
+            ))
+            .unwrap_err();
+        assert!(error.is_session_persistence());
+        assert!(agent.handle.session().ensure_provider_reentry_allowed().is_err());
+        assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Approved);
+        assert_eq!(agent.system_prompt(), prompt.as_deref());
+        assert_eq!(serde_json::to_value(agent.messages()).unwrap(), messages);
+        let live = session.try_lock().unwrap();
+        assert_eq!(live.leaf_id(), leaf.as_deref());
+        assert_eq!(serde_json::to_value(&live.entries).unwrap(), entries);
     }
 
     // ========================================================================

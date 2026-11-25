@@ -1,4 +1,4 @@
-//! Default-FTUI access to the SDK's session-bound plan lifecycle.
+//! Shared terminal access to the SDK's session-bound plan lifecycle.
 //!
 //! The driver owns the review capability. Commands contain only a display ID;
 //! approving never substitutes a freshly fetched proposal for the one shown.
@@ -6,19 +6,21 @@
 
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
+#[cfg(any(feature = "ftui", test))]
 use crate::interactive::PiMsg;
 use crate::model::ThinkingLevel;
 use crate::plan::{PlanChange, PlanMode, PlanPersistence, SessionPlanReview};
 use crate::sdk::AgentSessionHandle;
 use std::fmt::Write as _;
+#[cfg(any(feature = "ftui", test))]
 use std::sync::mpsc::Sender;
 use uuid::Uuid;
 
-pub(super) const USAGE: &str =
+pub(crate) const USAGE: &str =
     "usage: /plan [enter|status|review|approve <review-id>|reject <review-id>|off|save|restore]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PlanCommand {
+pub(crate) enum PlanCommand {
     Enter,
     Status,
     Review,
@@ -31,11 +33,11 @@ pub(super) enum PlanCommand {
 
 /// Token-exact admission shared by UI routing and the driver. In particular,
 /// a bare approval or a pasted command with extra words cannot authorize work.
-pub(super) fn parse(args: &str) -> Result<PlanCommand> {
+pub(crate) fn parse(args: &str) -> Result<PlanCommand> {
     let mut words = args.split_whitespace();
     let action = words.next().unwrap_or("enter");
     let command = match action.to_ascii_lowercase().as_str() {
-        "enter" => PlanCommand::Enter,
+        "enter" | "on" | "start" => PlanCommand::Enter,
         "status" => PlanCommand::Status,
         "review" => PlanCommand::Review,
         "off" | "exit" => PlanCommand::Exit,
@@ -152,7 +154,7 @@ impl PlanModelRestore {
 }
 
 #[derive(Default)]
-pub(super) struct PlanController {
+pub(crate) struct PlanController {
     displayed: Option<DisplayedPlan>,
     model_spec: Option<String>,
     disabled_providers: Vec<String>,
@@ -162,14 +164,14 @@ pub(super) struct PlanController {
 }
 
 impl PlanController {
-    pub(super) fn new(model_spec: Option<String>) -> Self {
+    pub(crate) fn new(model_spec: Option<String>) -> Self {
         Self {
             model_spec: model_spec.filter(|spec| !spec.trim().is_empty()),
             ..Self::default()
         }
     }
 
-    pub(super) fn with_provider_policy(
+    pub(crate) fn with_provider_policy(
         mut self,
         disabled_providers: Vec<String>,
         scope_overrides: Vec<crate::config::ModelScopeOverride>,
@@ -179,20 +181,25 @@ impl PlanController {
         self
     }
 
+    pub(crate) fn set_model_spec(&mut self, model_spec: Option<String>) {
+        self.model_spec = model_spec.filter(|spec| !spec.trim().is_empty());
+    }
+
     /// Successful explicit model/thinking selection owns the resulting model,
     /// even when the user selected the planner that was already active.
-    pub(super) fn forget_model_restore(&mut self) {
+    pub(crate) fn forget_model_restore(&mut self) {
         self.model_restore = None;
         self.pending_model_selection = None;
     }
 
     /// Session replacement and a disconnected UI retire the display capability.
     /// SDK session-incarnation checks independently reject foreign reviews.
-    pub(super) fn clear_review(&mut self) {
+    pub(crate) fn clear_review(&mut self) {
         self.displayed = None;
     }
 
-    pub(super) async fn run(
+    #[cfg(any(feature = "ftui", test))]
+    pub(crate) async fn run(
         &mut self,
         handle: &mut AgentSessionHandle,
         args: &str,
@@ -208,7 +215,11 @@ impl PlanController {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn execute(&mut self, handle: &mut AgentSessionHandle, args: &str) -> Result<String> {
+    pub(crate) async fn execute(
+        &mut self,
+        handle: &mut AgentSessionHandle,
+        args: &str,
+    ) -> Result<String> {
         // Invalid commands neither change live state nor replace the review.
         let command = parse(args)?;
         let restore_stale = match self.model_restore.as_ref() {

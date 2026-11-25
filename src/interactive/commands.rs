@@ -14,6 +14,76 @@ use arboard::Clipboard as ArboardClipboard;
 
 const BASH_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Resolve model-role and terminal selectors through one identity parser.
+/// Exact catalog identities win before interpreting a named thinking suffix;
+/// provider-qualified unknown models remain available for runtime validation.
+pub(crate) fn resolve_model_selector(
+    available: &[String],
+    selector: &str,
+) -> Result<(String, String, Option<ThinkingLevel>), String> {
+    let selector = selector.trim();
+    let id_of = |full: &str| {
+        full.split_once('/')
+            .map_or(full, |(_, id)| id)
+            .to_ascii_lowercase()
+    };
+    let names_available_model = |candidate: &str| {
+        let lower = candidate.to_ascii_lowercase();
+        available
+            .iter()
+            .any(|full| full.to_ascii_lowercase() == lower || id_of(full) == lower)
+    };
+    let (spec, level) = match selector.rsplit_once(':') {
+        Some((spec, level))
+            if !spec.is_empty()
+                && !level.bytes().all(|byte| byte.is_ascii_digit())
+                && !names_available_model(selector) =>
+        {
+            level
+                .parse::<ThinkingLevel>()
+                .map_or((selector, None), |level| (spec, Some(level)))
+        }
+        _ => (selector, None),
+    };
+    let lower = spec.to_ascii_lowercase();
+    let mut matches: Vec<&String> = available
+        .iter()
+        .filter(|full| full.to_ascii_lowercase() == lower || id_of(full) == lower)
+        .collect();
+    if matches.is_empty() {
+        matches = available
+            .iter()
+            .filter(|full| full.to_ascii_lowercase().contains(&lower))
+            .collect();
+    }
+    let split = |full: &str| {
+        full.split_once('/')
+            .map(|(provider, id)| (provider.to_string(), id.to_string()))
+    };
+    match matches.as_slice() {
+        [one] => split(one)
+            .map(|(provider, id)| (provider, id, level))
+            .ok_or_else(|| format!("malformed model entry: {one}")),
+        [] => match split(spec) {
+            Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
+                Ok((provider, id, level))
+            }
+            _ => Err(format!("Model not found: {spec}")),
+        },
+        many => {
+            let preview = many
+                .iter()
+                .take(8)
+                .map(|model| format!("  - {model}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(format!(
+                "Ambiguous model \"{spec}\". Matches:\n{preview}\nUse provider/id for an exact match."
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BashPersistenceOutcome {
     Saved,
@@ -426,7 +496,7 @@ impl SlashCommand {
   /template <name> [args] - Expand a prompt template by name
   /share             - Upload current branch to an unlisted gist (not private; inspect sensitive context)
   /mcp               - Manage MCP servers: list, add, remove, test, trust, reauth, unauth
-  /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
+  /plan [enter|status|review|approve <id>|reject <id>|off|save|restore] - Review plans
   /goal              - Review goals, manage budgets, and run bounded goal work
   /prewalk [into]    - Arm a model handoff; restart [from] [into], status, off
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode
@@ -1563,6 +1633,7 @@ impl PiApp {
                 if error.is_none() {
                     // An explicit choice also retires plan-mode restoration.
                     agent.plan_state().take_previous_model();
+                    agent.plans.forget_model_restore();
                 }
                 drop(agent);
                 enqueue_pi_event(
@@ -2550,6 +2621,19 @@ impl PiApp {
                         self.status_message = Some("Session busy; try again".to_string());
                         return None;
                     };
+                    let replacement_prompt = match crate::plan::replacement_system_prompt(
+                        &agent_guard,
+                        &self.session,
+                        &session_guard,
+                    ) {
+                        Ok(prompt) => prompt,
+                        Err(error) => {
+                            self.status_message = Some(format!(
+                                "Plan context cleanup failed; session change was not applied: {error}"
+                            ));
+                            return None;
+                        }
+                    };
                     let reset_thinking = self.new_session_thinking_level();
                     let departing_services =
                         agent_guard.service_owner(session_guard.header.id.clone());
@@ -2563,6 +2647,7 @@ impl PiApp {
                     agent_guard.replace_messages(Vec::new());
                     agent_guard.stream_options_mut().thinking_level = Some(reset_thinking);
                     agent_guard.session_was_replaced(crate::plan::PlanMode::Off);
+                    agent_guard.set_system_prompt(replacement_prompt);
                     self.session_action_admission.advance_generation();
                     let shutdown = crate::hub::begin_session_shutdown(&departing_services);
                     drop(session_guard);
@@ -2581,7 +2666,9 @@ impl PiApp {
                     self.abort_handle = None;
                     self.retire_login();
                     self.model_selection = None;
+                    self.plan_request = None;
                     self.pending_inputs_paused_by_model_selection = false;
+                    self.pending_inputs_paused_by_plan_control = false;
                     self.title_cancellation = None;
                     self.title_requested = false;
                     self.role_model_overrides.clear();
@@ -3670,6 +3757,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                     {
                         Ok(note) if restarting => {
                             agent.plan_state().take_previous_model();
+                            agent.plans.forget_model_restore();
                             PiMsg::SessionModelChanged {
                                 owner_session_id: current,
                                 message: note,
@@ -3694,60 +3782,114 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     fn handle_slash_plan(&mut self, args: &str) -> Option<Cmd> {
-        let sub = args.trim().to_ascii_lowercase();
-        let (plan_state, builtins_disabled) = {
-            let Ok(agent_guard) = self.agent.try_lock() else {
-                self.status_message = Some("Agent busy; try again".to_string());
-                return None;
-            };
-            (
-                agent_guard.plan_state(),
-                agent_guard.shared_tools().snapshot().builtins_disabled(),
-            )
-        };
-        if builtins_disabled && matches!(sub.as_str(), "" | "on" | "start") {
-            self.status_message = Some(
-                "[PLAN_TOOLS_DISABLED] Plan mode is unavailable while built-in tools are disabled"
-                    .to_string(),
-            );
+        if let Err(error) = plan_commands::parse(args) {
+            self.status_message = Some(error.to_string());
             return None;
         }
-        match sub.as_str() {
-            "" | "on" | "start" => self.enter_plan_mode(&plan_state),
-            "status" => {
-                self.status_message = Some(format!("Plan mode: {}", plan_state.mode().as_str()));
+        if self.plan_request.is_some() {
+            self.status_message = Some("Plan control is still settling; try again".to_string());
+            return None;
+        }
+        // Reviewing a plan may retain queued input. Only an active foreground
+        // owner blocks admission; the queue stays paused after the decision.
+        if self.agent_state != AgentState::Idle
+            || self.model_selection.is_some()
+            || self.goal_invocation.is_some()
+            || self.handoff_request_id.is_some()
+            || self.mcp_auth_request_id.is_some()
+            || self.bash_running
+            || self.login_attempt.is_some()
+            || self.fork_draft.is_some()
+        {
+            self.status_message = Some("Finish the current operation before using /plan".to_string());
+            return None;
+        }
+        let cx = Cx::current().unwrap_or_else(Cx::for_request);
+        if cx.is_cancel_requested() {
+            self.status_message = Some("Cancelled: no plan operation was started".to_string());
+            return None;
+        }
+        // Retain the actual SDK owner before scheduling. A delayed command
+        // cannot acquire a replacement session and approve its proposal.
+        let Ok(mut agent) = OwnedMutexGuard::try_lock(Arc::clone(&self.agent)) else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let owner_session_id = match self.session.try_lock() {
+            Ok(session) => session.header.id.clone(),
+            Err(_) => {
+                self.status_message = Some("Session busy; try again".to_string());
+                return None;
             }
-            "approve" => self.approve_plan_mode(&plan_state),
-            "reject" => {
-                if plan_state.reject() {
-                    Self::log_plan_transition(&self.session, "rejected");
-                    self.status_message =
-                        Some("Plan rejected — still planning; revise and resubmit".to_string());
+        };
+        if self.displayed_session_id.as_deref() != Some(owner_session_id.as_str()) {
+            self.status_message = Some("Session display is catching up; try again".to_string());
+            return None;
+        }
+        let model_spec = self
+            .role_model_overrides
+            .get(&ModelRole::Plan)
+            .map(|(provider, model)| format!("{provider}/{model}"))
+            .or_else(|| {
+                self.config
+                    .model_roles
+                    .as_ref()
+                    .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Plan))
+                    .map(str::to_string)
+            });
+        agent.plans.set_model_spec(model_spec);
+        let origin = self.session_action_admission.capture_origin();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.plan_request = Some(PlanCommandRequest {
+            id: request_id.clone(),
+            owner_session_id: owner_session_id.clone(),
+            origin: origin.clone(),
+        });
+        let previous_queue_pause = self.pending_inputs_paused_by_plan_control;
+        self.pending_inputs_paused_by_plan_control = true;
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some("Updating plan control...".to_string());
+        let args = args.to_string();
+        let event_tx = self.event_tx.clone();
+        if let Err(error) = self
+            .runtime_handle
+            .try_spawn_with_cx(move |_task_cx| async move {
+                let message = if agent
+                    .handle
+                    .session()
+                    .session_action_admission_gate()
+                    .origin_source()
+                    .accepts(&origin)
+                {
+                    agent
+                        .execute_plan_command(&args)
+                        .await
+                        .unwrap_or_else(|error| format!("Plan: {error}"))
                 } else {
-                    self.status_message = Some("No submitted plan to reject".to_string());
-                }
-            }
-            "off" | "exit" => {
-                plan_state.exit();
-                Self::log_plan_transition(&self.session, "off");
-                self.status_message = Some("Plan mode off".to_string());
-            }
-            other => {
-                self.status_message = Some(format!(
-                    "Unknown /plan subcommand {other:?}: use /plan [approve|reject|off|status]"
-                ));
-            }
+                    "Plan request belongs to an earlier session; nothing was changed".to_string()
+                };
+                drop(agent);
+                // Once a decision has begun saving, drain it to its reported
+                // outcome. Cancelling the display must not replay the decision.
+                enqueue_pi_event(
+                    &event_tx,
+                    &Cx::for_request(),
+                    PiMsg::PlanCommandFinished {
+                        owner_session_id,
+                        request_id,
+                        message,
+                    },
+                )
+                .await;
+            })
+        {
+            self.plan_request = None;
+            self.agent_state = AgentState::Idle;
+            self.pending_inputs_paused_by_plan_control = previous_queue_pause;
+            self.status_message = Some(format!("Could not start plan control: {error}"));
         }
+        self.scroll_to_bottom();
         None
-    }
-
-    fn log_plan_transition(session: &Arc<Mutex<crate::session::Session>>, mode: &str) {
-        if let Ok(mut guard) = session.try_lock() {
-            guard.append_custom_entry(
-                "plan_mode".to_string(),
-                Some(serde_json::json!({"mode": mode})),
-            );
-        }
     }
 
     fn handle_slash_approval(&mut self, args: &str) -> Option<Cmd> {
@@ -4393,6 +4535,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     /// Switch the active model to a role-resolved spec when one is configured.
+    #[cfg(test)]
     fn switch_to_role_spec(&mut self, spec: &str, source: &str) -> Result<(), String> {
         let (provider, model_id) = split_provider_model_spec(spec).ok_or_else(|| {
             format!("Invalid model {spec}. Use /model to choose a provider/model pair")
@@ -4412,84 +4555,6 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let provider_impl = create_runtime_provider(&entry, self.extensions.as_ref(), &self.cwd)
             .map_err(|error| error.to_string())?;
         self.switch_active_model(&entry, provider_impl, key.as_deref(), source)
-    }
-
-    fn enter_plan_mode(&mut self, plan_state: &crate::plan::PlanState) {
-        if plan_state.mode() != crate::plan::PlanMode::Off {
-            self.status_message = Some(format!(
-                "Already in plan mode ({})",
-                plan_state.mode().as_str()
-            ));
-            return;
-        }
-        plan_state.enter_planning();
-        plan_state
-            .stash_previous_model(&self.model_entry.model.provider, &self.model_entry.model.id);
-        let model_warning = self
-            .config
-            .model_roles
-            .as_ref()
-            .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Plan))
-            .map(str::to_string)
-            .and_then(|spec| self.switch_to_role_spec(&spec, "plan-role").err());
-        Self::log_plan_transition(&self.session, "planning");
-        self.messages.push(ConversationMessage {
-            role: MessageRole::System,
-            content: "Plan mode: read-only. Inspect with read/grep/find/ls, then call submit_plan with the full plan for review.".to_string(),
-            thinking: None,
-            collapsed: false,
-        });
-        self.status_message = Some(model_warning.map_or_else(
-            || "Plan mode: planning (read-only)".to_string(),
-            |error| {
-                format!(
-                    "Plan mode: planning (read-only). {error}. Continuing with {}",
-                    session_model_line(&self.model_entry)
-                )
-            },
-        ));
-        self.scroll_to_bottom();
-    }
-
-    fn approve_plan_mode(&mut self, plan_state: &crate::plan::PlanState) {
-        match plan_state.approve() {
-            Some(plan) => {
-                // Pin the plan into the agent's system context for the
-                // execution turns (bd-cv653.3.5).
-                if let Ok(mut agent_guard) = self.agent.try_lock() {
-                    let existing = agent_guard
-                        .system_prompt()
-                        .map(str::to_string)
-                        .unwrap_or_default();
-                    agent_guard.set_system_prompt(Some(format!(
-                        "{existing}\n\n## Approved Plan (execute this)\n\n{plan}"
-                    )));
-                }
-                let model_warning =
-                    plan_state
-                        .take_previous_model()
-                        .and_then(|(provider, model_id)| {
-                            self.switch_to_role_spec(
-                                &format!("{provider}/{model_id}"),
-                                "plan-restore",
-                            )
-                            .err()
-                        });
-                Self::log_plan_transition(&self.session, "approved");
-                self.status_message = Some(model_warning.map_or_else(
-                    || "Plan approved — execute it.".to_string(),
-                    |error| {
-                        format!(
-                            "Plan approved. {error}. Continuing with {}",
-                            session_model_line(&self.model_entry)
-                        )
-                    },
-                ));
-            }
-            None => {
-                self.status_message = Some("No submitted plan to approve".to_string());
-            }
-        }
     }
 
     /// `/advisor` (bd-cv653.3.3): status + pause/resume for the turn-review
@@ -4549,6 +4614,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         };
 
         let effective_level = self.model_entry.clamp_thinking_level(level);
+        let Ok(mut agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
         let Ok(mut session_guard) = self.session.try_lock() else {
             self.status_message = Some("Session busy; try again".to_string());
             return None;
@@ -4559,14 +4628,13 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         if changed {
             session_guard.append_thinking_level_change(effective_level.to_string());
         }
+        agent_guard.stream_options_mut().thinking_level = Some(effective_level);
+        agent_guard.clear_retry_keyword_effort();
+        agent_guard.plans.forget_model_restore();
         drop(session_guard);
+        drop(agent_guard);
         if changed {
             self.spawn_save_session();
-        }
-
-        if let Ok(mut agent_guard) = self.agent.try_lock() {
-            agent_guard.stream_options_mut().thinking_level = Some(effective_level);
-            agent_guard.clear_retry_keyword_effort();
         }
 
         self.status_message = Some(format!("Thinking level: {effective_level}"));

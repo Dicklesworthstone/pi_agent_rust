@@ -986,6 +986,7 @@ impl PiApp {
             || self.capability_prompt.is_some()
             || self.extension_custom_active
             || self.model_selection.is_some()
+            || self.plan_request.is_some()
             || self.goal_invocation.is_some()
             || self.handoff_request_id.is_some()
             || self.mcp_auth_request_id.is_some()
@@ -1157,7 +1158,7 @@ impl PiApp {
         // These unscoped completions may have been queued by an older
         // operation. Session replacement already requires the agent owner,
         // which the goal holds; a late display reset must not bypass it.
-        if self.goal_invocation.is_some()
+        if (self.goal_invocation.is_some() || self.plan_request.is_some())
             && matches!(
                 &msg,
                 PiMsg::ConversationReset { .. } | PiMsg::BashResult { .. }
@@ -1176,6 +1177,7 @@ impl PiApp {
             PiMsg::System(message) | PiMsg::AgentError(message)
                 if self.handoff_request_id.is_some()
                     || self.mcp_auth_request_id.is_some()
+                    || self.plan_request.is_some()
                     || self.goal_invocation.is_some()
                     || self.bash_running
                     || self.login_attempt.is_some() =>
@@ -1233,7 +1235,7 @@ impl PiApp {
                 return self.run_next_pending();
             }
             PiMsg::EnqueuePendingInput { session_id, input } => {
-                if self.agent_state != AgentState::Idle {
+                if self.agent_state != AgentState::Idle && self.plan_request.is_none() {
                     return None;
                 }
                 match self.session_event_ownership(&session_id) {
@@ -1461,6 +1463,7 @@ impl PiApp {
                 if self.handoff_request_id.is_some()
                     || self.mcp_auth_request_id.is_some()
                     || self.goal_invocation.is_some()
+                    || self.plan_request.is_some()
                     || self.bash_running
                 {
                     // A delayed terminal from an earlier turn may finalize its
@@ -1703,6 +1706,86 @@ impl PiApp {
                     PiMsg::System(message),
                     attempts_remaining,
                 );
+            }
+            PiMsg::PlanCommandFinished {
+                owner_session_id,
+                request_id,
+                message,
+            } => {
+                let Some(request) = self.plan_request.as_ref().filter(|request| {
+                    request.id == request_id && request.owner_session_id == owner_session_id
+                }) else {
+                    return None;
+                };
+                if self.displayed_session_id.as_deref() != Some(owner_session_id.as_str())
+                    || !self
+                        .session_action_admission
+                        .origin_source()
+                        .accepts(&request.origin)
+                {
+                    self.plan_request = None;
+                    return None;
+                }
+                let selection = (|| {
+                    let agent = self.agent.try_lock().ok()?;
+                    let session = self.session.try_lock().ok()?;
+                    Some((
+                        session.header.id == owner_session_id
+                            && self
+                                .session_action_admission
+                                .origin_source()
+                                .accepts(&request.origin),
+                        agent.handle.model(),
+                        agent.handle.session().current_model_entry(),
+                    ))
+                })();
+                let Some((is_current, (provider, model), entry)) = selection else {
+                    if attempts_remaining == 0 {
+                        self.plan_request = None;
+                        self.agent_state = AgentState::Idle;
+                        self.messages.push(ConversationMessage::new(
+                            MessageRole::System,
+                            message,
+                            None,
+                        ));
+                        self.status_message = Some(
+                            "Plan control finished; the busy session prevented a model display refresh"
+                                .to_string(),
+                        );
+                        self.scroll_to_bottom();
+                        return None;
+                    }
+                    return self.retry_busy_session_event(
+                        PiMsg::PlanCommandFinished {
+                            owner_session_id,
+                            request_id,
+                            message,
+                        },
+                        attempts_remaining,
+                    );
+                };
+                self.plan_request = None;
+                if !is_current {
+                    return None;
+                }
+                self.model = format!("{provider}/{model}");
+                if let Some(entry) = entry {
+                    self.model_entry = entry.clone();
+                    if let Ok(mut shared) = self.model_entry_shared.lock() {
+                        *shared = entry;
+                    }
+                }
+                self.agent_state = AgentState::Idle;
+                self.status_message = None;
+                self.messages.push(ConversationMessage::new(
+                    MessageRole::System,
+                    message,
+                    None,
+                ));
+                self.scroll_to_bottom();
+                // Plan approval is a review boundary, never an instruction to
+                // drain a queued prompt into an execution turn.
+                return None;
             }
             PiMsg::ModelSelectionFinished { request_id, error } => {
                 let Some(request) = self
@@ -2063,6 +2146,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 let retry_input = PendingInput::GeneratedText(text);
                 if self.pending_inputs_paused_by_time_cap
                     || self.pending_inputs_paused_by_model_selection
+                    || self.pending_inputs_paused_by_plan_control
                 {
                     // A committed /retry owns the next foreground budget;
                     // earlier unclaimed work stays queued behind that target.
@@ -2072,6 +2156,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 }
                 self.pending_inputs_paused_by_time_cap = false;
                 self.pending_inputs_paused_by_model_selection = false;
+                self.pending_inputs_paused_by_plan_control = false;
                 return self.run_next_pending();
             }
             PiMsg::ConversationReset {
@@ -2144,8 +2229,10 @@ After approving access in the browser, press Enter in Pi to complete login."
                     self.mcp_auth_request_id = None;
                     self.model_selection = None;
                     self.title_cancellation = None;
+                    self.plan_request = None;
                     self.pending_inputs_paused_by_time_cap = false;
                     self.pending_inputs_paused_by_model_selection = false;
+                    self.pending_inputs_paused_by_plan_control = false;
                     self.title_requested = !self.messages.is_empty();
                     self.todo_summary = None;
                     self.retire_login();
@@ -3766,8 +3853,10 @@ After approving access in the browser, press Enter in Pi to complete login."
         loop {
             if self.agent_state != AgentState::Idle
                 || self.model_selection.is_some()
+                || self.plan_request.is_some()
                 || self.pending_inputs_paused_by_time_cap
                 || self.pending_inputs_paused_by_model_selection
+                || self.pending_inputs_paused_by_plan_control
             {
                 return None;
             }
@@ -3803,6 +3892,11 @@ After approving access in the browser, press Enter in Pi to complete login."
     }
 
     pub(super) fn queue_input(&mut self, kind: QueuedMessageKind) {
+        if self.plan_request.is_some() {
+            self.status_message =
+                Some("Plan control is still settling; your draft has been retained".to_string());
+            return;
+        }
         if self.fork_draft.is_some() {
             self.status_message = Some(
                 "Send the fork draft after the current turn finishes; its attachments are retained"
@@ -4120,6 +4214,10 @@ After approving access in the browser, press Enter in Pi to complete login."
     }
 
     fn submit_continue(&mut self) -> Option<Cmd> {
+        if self.plan_request.is_some() {
+            self.status_message = Some("Plan control is still settling; try again".to_string());
+            return None;
+        }
         if self.model_selection.is_some() {
             self.status_message = Some("Model selection is still saving; try again".to_string());
             return None;
@@ -4165,6 +4263,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         // Automatic queue processing cannot reach this point while paused.
         self.pending_inputs_paused_by_time_cap = false;
         self.pending_inputs_paused_by_model_selection = false;
+        self.pending_inputs_paused_by_plan_control = false;
         let extension_compacting = Arc::clone(&self.extension_compacting);
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.review_request_id = None;
@@ -4341,6 +4440,21 @@ After approving access in the browser, press Enter in Pi to complete login."
         if content.is_empty() {
             return None;
         }
+        if self.plan_request.is_some() {
+            let pending = match keyword_scan_source {
+                Some(keyword_scan_source) => PendingInput::ContentWithKeywordSource {
+                    content,
+                    keyword_scan_source,
+                },
+                None => PendingInput::Content(content),
+            };
+            self.pending_inputs.push_back(pending);
+            self.status_message = Some(
+                "Input retained while plan control settles; submit explicitly to continue"
+                    .to_string(),
+            );
+            return None;
+        }
         if self.model_selection.is_some() {
             let pending = match keyword_scan_source {
                 Some(keyword_scan_source) => PendingInput::ContentWithKeywordSource {
@@ -4441,12 +4555,12 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         }
 
-        if self.model_selection.is_some()
+        if (self.model_selection.is_some() || self.plan_request.is_some())
             && (self.fork_draft.is_some()
                 || !matches!(SlashCommand::parse(message), Some((SlashCommand::Exit, _))))
         {
             self.status_message =
-                Some("Model selection is still saving; your draft has been retained".to_string());
+                Some("Session control is still settling; your draft has been retained".to_string());
             return None;
         }
         if self.goal_invocation.is_some()
@@ -6675,6 +6789,7 @@ mod stream_delta_batcher_tests {
             Some(temp.path().join("sessions")),
         )));
         app.agent = Arc::new(asupersync::sync::Mutex::new(InteractiveAgent {
+            plans: super::plan_commands::PlanController::default(),
             handle: crate::sdk::AgentSessionHandle::from_session_with_listeners(
                 AgentSession::new(
                     agent,

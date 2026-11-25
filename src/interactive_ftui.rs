@@ -59,6 +59,7 @@ use crate::compaction::ManualCompactionMode;
 use crate::extensions::{ExtensionInteraction, ExtensionUiRequest, ExtensionUiResponse};
 use crate::interactive::{AutocompleteState, PiMsg, extension_commands_for_catalog};
 use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response};
+use crate::interactive::{plan_commands, resolve_model_selector};
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use crate::provider::ServiceTierCommand;
 use crate::web_remote::bridge::WebRemoteRedactionScope;
@@ -69,7 +70,6 @@ mod browser;
 mod console_input;
 mod goal_control;
 mod info_commands;
-mod plan_commands;
 mod queued_compaction;
 pub mod session_pins;
 mod settings;
@@ -943,81 +943,6 @@ fn last_url(transcript: &[TranscriptEntry]) -> Option<String> {
                     })
             })
     })
-}
-
-/// Resolve a `/model` or `/switch` selector (OMP) against the available
-/// `provider/id` list: an optional `:level` suffix sets thinking; then an
-/// exact `provider/id`, an exact id, or a unique substring match. A
-/// `provider/id` not in the list passes through, as `/model` always allowed
-/// (the driver reports an unknown model). Ambiguity lists the candidates.
-fn resolve_model_selector(
-    available: &[String],
-    selector: &str,
-) -> Result<(String, String, Option<crate::model::ThinkingLevel>), String> {
-    let selector = selector.trim();
-    let id_of = |full: &str| {
-        full.split_once('/')
-            .map_or(full, |(_, id)| id)
-            .to_ascii_lowercase()
-    };
-    let names_available_model = |candidate: &str| {
-        let lower = candidate.to_ascii_lowercase();
-        available
-            .iter()
-            .any(|full| full.to_ascii_lowercase() == lower || id_of(full) == lower)
-    };
-    // `spec:level` selects a thinking level by name only. Model ids can end in
-    // `:<digit>` (Bedrock's `...-v1:0`), and a selector that names an available
-    // model exactly is never split.
-    let (spec, level) = match selector.rsplit_once(':') {
-        Some((spec, level))
-            if !spec.is_empty()
-                && !level.bytes().all(|byte| byte.is_ascii_digit())
-                && !names_available_model(selector) =>
-        {
-            level
-                .parse::<crate::model::ThinkingLevel>()
-                .map_or((selector, None), |level| (spec, Some(level)))
-        }
-        _ => (selector, None),
-    };
-    let lower = spec.to_ascii_lowercase();
-    let mut matches: Vec<&String> = available
-        .iter()
-        .filter(|full| full.to_ascii_lowercase() == lower || id_of(full) == lower)
-        .collect();
-    if matches.is_empty() {
-        matches = available
-            .iter()
-            .filter(|full| full.to_ascii_lowercase().contains(&lower))
-            .collect();
-    }
-    let split = |full: &str| {
-        full.split_once('/')
-            .map(|(provider, id)| (provider.to_string(), id.to_string()))
-    };
-    match matches.as_slice() {
-        [one] => split(one)
-            .map(|(provider, id)| (provider, id, level))
-            .ok_or_else(|| format!("malformed model entry: {one}")),
-        [] => match split(spec) {
-            Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
-                Ok((provider, id, level))
-            }
-            _ => Err(format!("Model not found: {spec}")),
-        },
-        many => {
-            let preview = many
-                .iter()
-                .take(8)
-                .map(|m| format!("  - {m}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(format!(
-                "Ambiguous model \"{spec}\". Matches:\n{preview}\nUse provider/id for an exact match."
-            ))
-        }
-    }
 }
 
 /// The fenced code blocks in markdown `text`, in order, as `(language,
@@ -4349,6 +4274,7 @@ impl PiFtuiModel {
                     | PiMsg::ResourcesReloadedWithCatalog { .. }
                     | PiMsg::LoginPending { .. }
                     | PiMsg::SystemNote(_)
+                    | PiMsg::PlanCommandFinished { .. }
                     | PiMsg::ToolStart { .. }
                     | PiMsg::ToolInvocation { .. }
                     | PiMsg::ToolUpdate { .. }
@@ -4360,6 +4286,7 @@ impl PiFtuiModel {
         match msg {
             PiMsg::HandoffFinished { .. }
             | PiMsg::ModelSelectionFinished { .. }
+            | PiMsg::PlanCommandFinished { .. }
             | PiMsg::CompactionFinished { .. }
             | PiMsg::McpAuthFinished { .. }
             | PiMsg::GoalFinished { .. }
@@ -5640,7 +5567,7 @@ impl PiFtuiModel {
     /// Slash-command routing seed (mirrors submit_message's chain; only
     /// commands the preview can honor are wired). Returns true when the
     /// input was consumed as a command (including local errors).
-    fn route_slash_command(&mut self, clean: &str) -> bool {
+    pub(crate) fn route_slash_command(&mut self, clean: &str) -> bool {
         // Case-insensitive like SlashCommand::parse in the bubbletea stack.
         // Token-exact: /model and /m route here; /mode or /modelx fall
         // through to the tail (extension dispatch), matching bubbletea.
@@ -12170,7 +12097,7 @@ fn adopt_stored_credentials(
 }
 
 /// Handle a model switch in the driver, reporting the outcome to the UI.
-async fn run_set_model_command(
+pub(crate) async fn run_set_model_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     provider: &str,
     model: &str,
@@ -12956,7 +12883,7 @@ fn run_fast_command(
     )
 }
 
-async fn run_set_thinking_command(
+pub(crate) async fn run_set_thinking_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     level: Option<crate::model::ThinkingLevel>,
     agent_tx: &Sender<PiMsg>,

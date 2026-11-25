@@ -81,6 +81,9 @@ mod keybindings;
 pub(crate) mod login_flow;
 mod model_selector_ui;
 mod perf;
+// Both terminal stacks share the SDK-backed review and model-role lifecycle.
+#[path = "interactive_ftui/plan_commands.rs"]
+pub(crate) mod plan_commands;
 pub(crate) mod share;
 mod state;
 mod text_utils;
@@ -95,6 +98,7 @@ pub(crate) use self::agent::extension_commands_for_catalog;
 /// Shared with the ftui stack so `/copy` behaves and reports identically on
 /// both; see the function's own note.
 pub(crate) use self::commands::copy_text_to_clipboard;
+pub(crate) use self::commands::resolve_model_selector;
 pub(crate) use self::commands::running_under_wsl;
 pub use self::commands::{
     SlashCommand, model_entry_matches, parse_scoped_model_patterns, resolve_scoped_model_entries,
@@ -653,6 +657,9 @@ impl PiApp {
     }
 
     fn session_transition_blocker(&self) -> Option<&'static str> {
+        if self.plan_request.is_some() {
+            return Some("Plan control is still settling; try again when it finishes");
+        }
         if self.model_selection.is_some() {
             return Some("Model selection is still saving; try again when it finishes");
         }
@@ -714,6 +721,9 @@ impl PiApp {
         let Ok(mut session_guard) = OwnedMutexGuard::try_lock(Arc::clone(session)) else {
             return Err("Session busy; session change was not applied");
         };
+        let replacement_prompt =
+            crate::plan::replacement_system_prompt(&agent_guard, session, &session_guard)
+                .map_err(|_| "Plan context cleanup failed; session change was not applied")?;
 
         let departing_services = (session_guard.header.id != new_session.header.id)
             .then(|| agent_guard.service_owner(session_guard.header.id.clone()));
@@ -818,6 +828,7 @@ impl PiApp {
             agent_guard.stream_options_mut().thinking_level = Some(level);
         }
         agent_guard.session_was_replaced(crate::plan::replayed_plan_mode(&session_guard));
+        agent_guard.set_system_prompt(replacement_prompt);
         admission.advance_generation();
         // Commit both views before fencing the departing service owner. A
         // failed candidate must retain its live services; cleanup after this
@@ -2402,6 +2413,12 @@ pub enum PiMsg {
         request_id: String,
         error: Option<String>,
     },
+    /// Only the classic plan request that owns this session may settle its UI.
+    PlanCommandFinished {
+        owner_session_id: String,
+        request_id: String,
+        message: String,
+    },
     /// Classic terminal review completion, scoped to its session and request.
     ReviewFinished {
         owner_session_id: String,
@@ -3140,6 +3157,12 @@ struct ManualModelSelection {
     status_prefix: Option<String>,
 }
 
+struct PlanCommandRequest {
+    id: String,
+    owner_session_id: String,
+    origin: crate::extensions::SessionActionOrigin,
+}
+
 /// The classic UI's live agent and its durable Session have one owner.
 ///
 /// Idle editor operations access the Agent through this owner; complete user
@@ -3147,12 +3170,19 @@ struct ManualModelSelection {
 /// admission authority and state for the lifetime of the UI.
 pub struct InteractiveAgent {
     handle: crate::sdk::AgentSessionHandle,
+    plans: plan_commands::PlanController,
 }
 
 impl InteractiveAgent {
+    async fn execute_plan_command(&mut self, args: &str) -> crate::error::Result<String> {
+        self.plans.execute(&mut self.handle, args).await
+    }
+
     /// Called only after a new, loaded, or durably forked Session and its
     /// matching transcript have been installed together under both locks.
     fn session_was_replaced(&mut self, plan_mode: crate::plan::PlanMode) {
+        self.plans.clear_review();
+        self.plans.forget_model_restore();
         self.handle.session_mut().invalidate_background_compaction();
         self.handle
             .session_mut()
@@ -3195,6 +3225,7 @@ pub struct PiApp {
     pending_inputs: VecDeque<PendingInput>,
     pending_inputs_paused_by_time_cap: bool,
     pending_inputs_paused_by_model_selection: bool,
+    pending_inputs_paused_by_plan_control: bool,
     message_queue: Arc<StdMutex<InteractiveMessageQueue>>,
     injected_queue: Arc<StdMutex<InjectedMessageQueue>>,
 
@@ -3283,6 +3314,7 @@ pub struct PiApp {
     abort_handle: Option<AbortHandle>,
     goal_invocation: Option<GoalInvocation>,
     review_request_id: Option<String>,
+    plan_request: Option<PlanCommandRequest>,
     model_selection: Option<ManualModelSelection>,
     handoff_request_id: Option<String>,
     mcp_auth_request_id: Option<String>,
@@ -3753,6 +3785,10 @@ impl PiApp {
             )
             .with_retry(crate::failover::RetryPolicy::from_config(&config))
             .with_failover(failover),
+            plans: plan_commands::PlanController::new(None).with_provider_policy(
+                config.disabled_providers.clone().unwrap_or_default(),
+                config.model_scope_overrides.clone().unwrap_or_default(),
+            ),
         };
         let mut app = Self {
             input,
@@ -3766,6 +3802,7 @@ impl PiApp {
             pending_inputs: VecDeque::from(pending_inputs),
             pending_inputs_paused_by_time_cap: false,
             pending_inputs_paused_by_model_selection: false,
+            pending_inputs_paused_by_plan_control: false,
             message_queue,
             injected_queue: Arc::clone(&injected_queue),
             conversation_viewport,
@@ -3830,6 +3867,7 @@ impl PiApp {
             abort_handle: None,
             goal_invocation: None,
             review_request_id: None,
+            plan_request: None,
             model_selection: None,
             handoff_request_id: None,
             mcp_auth_request_id: None,

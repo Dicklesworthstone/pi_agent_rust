@@ -3562,10 +3562,9 @@ impl AgentSessionHandle {
         Ok(())
     }
 
-    /// The terminal's plan role is an automatic temporary selection. Preserve
-    /// prewalk, but retire an older fallback cycle only after durable install:
-    /// its cooldown must not silently replace the newly selected planner.
-    #[cfg(feature = "ftui")]
+    /// Both terminal surfaces use the same automatic planning-role selection.
+    /// Preserve prewalk, but retire an older fallback cycle only after durable
+    /// install: its cooldown must not silently replace the selected planner.
     pub(crate) async fn set_plan_role_model(
         &mut self,
         provider: &str,

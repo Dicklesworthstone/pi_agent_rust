@@ -850,6 +850,7 @@ mod tests {
             AgentConfig::default(),
         );
         let agent = Arc::new(Mutex::new(InteractiveAgent {
+            plans: super::plan_commands::PlanController::default(),
             handle: crate::sdk::AgentSessionHandle::from_session_with_listeners(
                 AgentSession::new(
                     agent,

@@ -1530,3 +1530,405 @@ fn export_paths_are_chosen_the_same_way_for_both_stacks() {
         "whitespace is not a filename"
     );
 }
+
+const CLASSIC_PLAN_INSTRUCTIONS: &str =
+    "Original instructions.\nAn unrelated approved-plan heading stays.";
+const CLASSIC_PLAN_PROPOSAL: &str =
+    "Inspect the parser, update its validation, and verify behavior.";
+
+fn classic_plan_fixture(
+    cwd: PathBuf,
+    runtime: &asupersync::runtime::Runtime,
+    stored: Session,
+    save: bool,
+) -> (
+    PiApp,
+    mpsc::Receiver<PiMsg>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let config = Config::default();
+    // Use the native SDK owner and its actual registered submit_plan tool.
+    // No command in these tests may start a provider request.
+    let provider = Arc::new(
+        crate::providers::openai::OpenAIProvider::new("classic-plan-fixture")
+            .with_base_url("http://127.0.0.1:1/v1"),
+    );
+    let agent = Agent::new(
+        provider,
+        ToolRegistry::new(&[], &cwd, Some(&config)),
+        AgentConfig {
+            system_prompt: Some(CLASSIC_PLAN_INSTRUCTIONS.to_string()),
+            approval_state: Some(crate::approval::ApprovalState::default()),
+            ..AgentConfig::default()
+        },
+    );
+    let resources = ResourceLoader::empty(config.enable_skill_commands());
+    let resource_cli = ResourceCliOptions {
+        no_skills: false,
+        no_prompt_templates: false,
+        no_extensions: false,
+        no_themes: false,
+        skill_paths: Vec::new(),
+        prompt_paths: Vec::new(),
+        extension_paths: Vec::new(),
+        theme_paths: Vec::new(),
+    };
+    let mut entry = test_model_entry();
+    entry.model.id = "classic-plan-fixture".to_string();
+    entry.model.api = "openai-completions".to_string();
+    entry.model.base_url = "http://127.0.0.1:1/v1".to_string();
+    let (sender, receiver) = mpsc::channel(64);
+    let app = PiApp::new(
+        agent,
+        Arc::new(Mutex::new(stored)),
+        config,
+        resources,
+        resource_cli,
+        cwd,
+        entry.clone(),
+        vec![entry.clone()],
+        vec![entry],
+        None,
+        Vec::new(),
+        sender,
+        runtime.handle(),
+        save,
+        false,
+        None,
+        Some(KeyBindings::new()),
+        Vec::new(),
+        Usage::default(),
+        None,
+    );
+    let events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&events);
+    let _ = app.agent.try_lock().unwrap().handle.subscribe(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+    });
+    (app, receiver, events)
+}
+
+async fn classic_plan_event(receiver: &mut mpsc::Receiver<PiMsg>) -> PiMsg {
+    let cx = Cx::for_request();
+    asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        std::time::Duration::from_secs(10),
+        receiver.recv(&cx),
+    )
+    .await
+    .expect("plan control settles")
+    .expect("plan completion reaches the classic UI")
+}
+
+async fn classic_plan_command(
+    app: &mut PiApp,
+    receiver: &mut mpsc::Receiver<PiMsg>,
+    args: &str,
+) -> String {
+    assert!(app.submit_message(&format!("/plan {args}")).is_none());
+    assert!(app.plan_request.is_some(), "plan command was admitted");
+    assert_eq!(app.agent_state, AgentState::Processing);
+    let event = classic_plan_event(receiver).await;
+    let PiMsg::PlanCommandFinished { message, .. } = &event else {
+        panic!("plan controls must produce their own completion event");
+    };
+    let message = message.clone();
+    let previous_messages = app.messages.len();
+    assert!(app.handle_pi_message(event).is_none());
+    assert!(app.plan_request.is_none());
+    assert_eq!(app.agent_state, AgentState::Idle);
+    assert_eq!(app.messages.len(), previous_messages + 1);
+    assert!(app.agent.try_lock().is_ok(), "owner released before completion");
+    message
+}
+
+async fn classic_submit_plan(app: &PiApp, text: &str) -> crate::tools::ToolOutput {
+    let tools = app.agent.try_lock().unwrap().shared_tools().snapshot();
+    let output = tools
+        .get("submit_plan")
+        .expect("enter installs the SDK-bound native tool")
+        .execute("classic-proposal", json!({"plan": text}), None)
+        .await
+        .expect("submit_plan executes");
+    assert!(!output.is_error, "proposal accepted: {output:?}");
+    output
+}
+
+fn classic_review_id(report: &str) -> String {
+    report
+        .lines()
+        .find_map(|line| line.strip_prefix("Review ID: "))
+        .expect("the displayed proposal has a review capability")
+        .to_string()
+}
+
+#[test]
+fn classic_plan_commands_review_exact_submission_and_remove_only_owned_context() {
+    let dir = tempdir();
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+        .build()
+        .unwrap();
+    let (mut app, mut receiver, events) =
+        classic_plan_fixture(dir.path().to_path_buf(), &runtime, Session::in_memory(), false);
+    runtime.block_on(async {
+        let entered = classic_plan_command(&mut app, &mut receiver, "enter").await;
+        assert!(entered.contains("Memory-only"));
+        let state = app.agent.try_lock().unwrap().plan_state();
+        assert_eq!(state.mode(), crate::plan::PlanMode::Planning);
+        assert!(!state.allows_effects(crate::tools::ToolEffects::write()));
+        assert!(!state.allows_effects(crate::tools::ToolEffects::process()));
+        let _ = classic_submit_plan(&app, CLASSIC_PLAN_PROPOSAL).await;
+        assert_eq!(state.mode(), crate::plan::PlanMode::PendingApproval);
+
+        let report = classic_plan_command(&mut app, &mut receiver, "review").await;
+        assert!(report.contains(CLASSIC_PLAN_PROPOSAL));
+        let first_id = classic_review_id(&report);
+        assert!(app.submit_message("/plan approve").is_none());
+        assert!(app.plan_request.is_none());
+        assert!(receiver.try_recv().is_err());
+        assert!(app.status_message.as_deref().unwrap().contains("usage:"));
+        assert_eq!(state.mode(), crate::plan::PlanMode::PendingApproval);
+
+        let wrong = classic_plan_command(
+            &mut app,
+            &mut receiver,
+            &format!("approve {}", uuid::Uuid::new_v4()),
+        )
+        .await;
+        assert!(wrong.contains("does not match the displayed proposal"));
+        assert_eq!(state.mode(), crate::plan::PlanMode::PendingApproval);
+
+        // Another authorized SDK client replaces even identical proposal text.
+        // The old UI capability must not approve this new submission.
+        {
+            let mut agent = app.agent.try_lock().unwrap();
+            let review = agent.handle.pending_plan_review().unwrap().unwrap();
+            let rejected = agent
+                .handle
+                .reject_plan_review(&crate::agent_cx::AgentCx::for_request(), &review)
+                .await
+                .unwrap();
+            assert_eq!(rejected.mode, crate::plan::PlanMode::Planning);
+        }
+        let _ = classic_submit_plan(&app, CLASSIC_PLAN_PROPOSAL).await;
+        let stale =
+            classic_plan_command(&mut app, &mut receiver, &format!("approve {first_id}"))
+                .await;
+        assert!(stale.contains("PLAN_REVIEW_STALE"));
+        assert_eq!(state.mode(), crate::plan::PlanMode::PendingApproval);
+        assert_eq!(
+            app.agent.try_lock().unwrap().system_prompt(),
+            Some(CLASSIC_PLAN_INSTRUCTIONS)
+        );
+
+        let report = classic_plan_command(&mut app, &mut receiver, "review").await;
+        let reviewed_id = classic_review_id(&report);
+        assert_ne!(reviewed_id, first_id);
+        app.pending_inputs
+            .push_back(PendingInput::Text("execution still needs an explicit submit".to_string()));
+        let approved = classic_plan_command(
+            &mut app,
+            &mut receiver,
+            &format!("approve {reviewed_id}"),
+        )
+        .await;
+        assert!(approved.contains("No execution turn was started"));
+        assert_eq!(state.mode(), crate::plan::PlanMode::Approved);
+        let suffix = "\nAdditional instructions from an unrelated extension.";
+        {
+            let mut agent = app.agent.try_lock().unwrap();
+            let prompt = agent.system_prompt().unwrap().to_string();
+            assert!(prompt.starts_with(CLASSIC_PLAN_INSTRUCTIONS));
+            assert_eq!(prompt.matches(CLASSIC_PLAN_PROPOSAL).count(), 1);
+            assert_eq!(
+                agent.approval_state().unwrap().mode(),
+                crate::approval::ApprovalMode::AlwaysAsk
+            );
+            agent.set_system_prompt(Some(format!("{prompt}{suffix}")));
+        }
+        assert!(app.pending_inputs_paused_by_plan_control);
+        assert!(app.handle_pi_message(PiMsg::RunPending).is_none());
+        assert_eq!(app.pending_inputs.len(), 1);
+
+        let exited = classic_plan_command(&mut app, &mut receiver, "off").await;
+        assert!(exited.contains("Plan mode: off"));
+        assert_eq!(state.mode(), crate::plan::PlanMode::Off);
+        assert_eq!(
+            app.agent.try_lock().unwrap().system_prompt(),
+            Some(format!("{CLASSIC_PLAN_INSTRUCTIONS}{suffix}").as_str())
+        );
+        assert_eq!(app.pending_inputs.len(), 1);
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+        assert!(app.agent.try_lock().unwrap().messages().is_empty());
+    });
+}
+
+#[test]
+fn classic_plan_unconfirmed_approval_is_reported_and_saved_without_replaying_decision() {
+    let dir = tempdir();
+    let path = dir.path().join("plan.jsonl");
+    let blocked_parent = dir.path().join("not-a-directory");
+    std::fs::write(&blocked_parent, b"existing unrelated file").unwrap();
+    let mut stored = Session::in_memory();
+    stored.path = Some(path.clone());
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+        .build()
+        .unwrap();
+    let (mut app, mut receiver, events) =
+        classic_plan_fixture(dir.path().to_path_buf(), &runtime, stored, true);
+    runtime.block_on(async {
+        let entered = classic_plan_command(&mut app, &mut receiver, "enter").await;
+        assert!(entered.contains("Saved to the session"));
+        let submitted = classic_submit_plan(&app, CLASSIC_PLAN_PROPOSAL).await;
+        assert_eq!(submitted.details.unwrap()["checkpointPersistence"], "saved");
+        let report = classic_plan_command(&mut app, &mut receiver, "review").await;
+        let id = classic_review_id(&report);
+        let durable_pending = std::fs::read(&path).unwrap();
+        app.session.try_lock().unwrap().path = Some(blocked_parent.join("plan.jsonl"));
+
+        let report =
+            classic_plan_command(&mut app, &mut receiver, &format!("approve {id}")).await;
+        assert!(report.contains("Saving was NOT confirmed"));
+        assert!(report.contains("Live plan state was not rolled back"));
+        assert!(report.contains("/plan save"));
+        assert!(report.contains("do not repeat the approval decision"));
+        assert!(!report.contains("Saved to the session"));
+        assert_eq!(
+            app.agent.try_lock().unwrap().plan_state().mode(),
+            crate::plan::PlanMode::Approved
+        );
+        assert!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .system_prompt()
+                .unwrap()
+                .contains(CLASSIC_PLAN_PROPOSAL)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), durable_pending);
+        assert_eq!(
+            std::fs::read(&blocked_parent).unwrap(),
+            b"existing unrelated file"
+        );
+        let replay =
+            classic_plan_command(&mut app, &mut receiver, &format!("approve {id}")).await;
+        assert!(replay.contains("No displayed proposal"));
+
+        app.session.try_lock().unwrap().path = Some(path.clone());
+        let saved = classic_plan_command(&mut app, &mut receiver, "save").await;
+        assert!(saved.contains("Saved to the session"));
+        let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            crate::plan::replayed_plan_mode(&reopened),
+            crate::plan::PlanMode::Approved
+        );
+        assert_eq!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .system_prompt()
+                .unwrap()
+                .matches(CLASSIC_PLAN_PROPOSAL)
+                .count(),
+            1
+        );
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn classic_stale_plan_completion_cannot_release_newer_foreground_request() {
+    let dir = tempdir();
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+        .build()
+        .unwrap();
+    let (mut app, mut receiver, events) =
+        classic_plan_fixture(dir.path().to_path_buf(), &runtime, Session::in_memory(), false);
+    runtime.block_on(async {
+        assert!(app.submit_message("/plan enter").is_none());
+        let completion = classic_plan_event(&mut receiver).await;
+        let PiMsg::PlanCommandFinished { owner_session_id, .. } = &completion else {
+            panic!("expected a real plan completion");
+        };
+        let owner_session_id = owner_session_id.clone();
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(app.plan_request.is_some());
+        assert!(
+            app.handle_pi_message(PiMsg::EnqueuePendingInput {
+                session_id: owner_session_id.clone(),
+                input: PendingInput::GeneratedText(
+                    "arrived while plan control was settling".to_string(),
+                ),
+            })
+            .is_none()
+        );
+        assert!(
+            app.handle_pi_message(PiMsg::EnqueuePendingInput {
+                session_id: "a different session".to_string(),
+                input: PendingInput::GeneratedText("foreign queued input".to_string()),
+            })
+            .is_none()
+        );
+        assert_eq!(app.pending_inputs.len(), 1);
+        assert!(matches!(
+            app.pending_inputs.front(),
+            Some(PendingInput::GeneratedText(text))
+                if text == "arrived while plan control was settling"
+        ));
+        let newer_id = uuid::Uuid::new_v4().to_string();
+        app.plan_request = Some(PlanCommandRequest {
+            id: newer_id.clone(),
+            owner_session_id: owner_session_id.clone(),
+            origin: app.session_action_admission.capture_origin(),
+        });
+        app.pending_inputs
+            .push_back(PendingInput::Text("keep this queued".to_string()));
+        let before = app.messages.len();
+        assert!(app.handle_pi_message(completion).is_none());
+        assert!(
+            app.handle_pi_message(PiMsg::PlanCommandFinished {
+                owner_session_id: "a different session".to_string(),
+                request_id: newer_id.clone(),
+                message: "a stale completion must not appear".to_string(),
+            })
+            .is_none()
+        );
+        assert_eq!(app.messages.len(), before);
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert_eq!(app.plan_request.as_ref().unwrap().id, newer_id);
+        assert!(
+            app.handle_pi_message(PiMsg::AgentDone {
+                usage: None,
+                stop_reason: StopReason::Stop,
+                error_message: None,
+            })
+            .is_none()
+        );
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert_eq!(app.plan_request.as_ref().unwrap().id, newer_id);
+        assert_eq!(app.pending_inputs.len(), 2);
+
+        assert!(
+            app.handle_pi_message(PiMsg::PlanCommandFinished {
+                owner_session_id,
+                request_id: newer_id,
+                message: "the current request finished".to_string(),
+            })
+            .is_none()
+        );
+        assert!(app.plan_request.is_none());
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert_eq!(app.messages.len(), before + 1);
+        assert!(app.handle_pi_message(PiMsg::RunPending).is_none());
+        assert_eq!(app.pending_inputs.len(), 2);
+        assert!(matches!(
+            app.pending_inputs.front(),
+            Some(PendingInput::GeneratedText(text))
+                if text == "arrived while plan control was settling"
+        ));
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+    });
+}

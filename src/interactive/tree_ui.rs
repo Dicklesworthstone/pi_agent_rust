@@ -4,18 +4,10 @@ use super::*;
 enum TreeNavigationPersistenceOutcome {
     Confirmed,
     Disabled,
-    ReconciledButUnconfirmed,
-}
-
-impl TreeNavigationPersistenceOutcome {
-    const fn may_emit_success_event(self) -> bool {
-        matches!(self, Self::Confirmed | Self::Disabled)
-    }
 }
 
 #[derive(Debug)]
 struct TreeNavigationCommit {
-    messages_for_agent: Vec<crate::model::Message>,
     messages_for_ui: Vec<ConversationMessage>,
     usage: crate::model::Usage,
     new_leaf_id: Option<String>,
@@ -24,47 +16,19 @@ struct TreeNavigationCommit {
     persistence: TreeNavigationPersistenceOutcome,
 }
 
-async fn confirm_exact_tree_navigation_after_save_error(
-    candidate: &Session,
-    expected_leaf_id: Option<&str>,
-    expected_summary_entry: Option<&[u8]>,
-) -> Option<()> {
-    let path = candidate.path.as_ref()?;
-    let (reopened, diagnostics) = Session::open_with_diagnostics(path.to_string_lossy().as_ref())
-        .await
-        .ok()?;
-    if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty() {
-        return None;
-    }
-    if reopened.header.id != candidate.header.id || reopened.leaf_id() != expected_leaf_id {
-        return None;
-    }
-    if serde_json::to_vec(&reopened.header).ok()? != serde_json::to_vec(&candidate.header).ok()?
-        || serde_json::to_vec(&reopened.entries).ok()?
-            != serde_json::to_vec(&candidate.entries).ok()?
-    {
-        return None;
-    }
-    if let Some(expected_entry) = expected_summary_entry {
-        let entry_id = expected_leaf_id?;
-        let reopened_entry = reopened.get_entry(entry_id)?;
-        if serde_json::to_vec(reopened_entry).ok()?.as_slice() != expected_entry {
-            return None;
-        }
-    }
-    Some(())
-}
-
 async fn stage_and_commit_tree_navigation(
-    session: Arc<Mutex<Session>>,
+    agent: &mut InteractiveAgent,
     expected_session_id: &str,
     expected_leaf_id: Option<&str>,
     target_leaf_id: Option<&str>,
     summary: Option<(String, String)>,
-    save_enabled: bool,
     cx: &Cx,
 ) -> crate::error::Result<TreeNavigationCommit> {
-    let mut live = OwnedMutexGuard::lock(session, cx)
+    let admission = agent.handle.session().provider_admission_gate();
+    let _provider_authority = admission.acquire_transition_authority(cx).await?;
+    let session_actions = agent.handle.session().session_action_admission_gate();
+    let _session_action_permit = session_actions.acquire(cx).await?;
+    let mut live = OwnedMutexGuard::lock(agent.handle.session_store(), cx)
         .await
         .map_err(|err| crate::error::Error::session(err.to_string()))?;
     if live.header.id != expected_session_id || live.leaf_id() != expected_leaf_id {
@@ -74,6 +38,7 @@ async fn stage_and_commit_tree_navigation(
     }
 
     let mut candidate = live.clone();
+    candidate.ensure_full_v2_hydration_before_save()?;
     if let Some(target_id) = target_leaf_id {
         if !candidate.navigate_to(target_id) {
             return Err(crate::error::Error::session(format!(
@@ -84,64 +49,106 @@ async fn stage_and_commit_tree_navigation(
         candidate.reset_leaf();
     }
 
-    let (summary_entry_payload, summary_entry_id, expected_summary_entry) =
-        if let Some((from_id, summary_text)) = summary {
-            let summary_clone = summary_text.clone();
-            let entry_id =
-                candidate.append_branch_summary(from_id.clone(), summary_text, None, None);
-            let mut summary_entry = serde_json::Map::new();
-            summary_entry.insert(
-                "type".to_string(),
-                Value::String("branch_summary".to_string()),
-            );
-            summary_entry.insert("fromId".to_string(), Value::String(from_id));
-            summary_entry.insert("summary".to_string(), Value::String(summary_clone));
-            summary_entry.insert("fromHook".to_string(), Value::Bool(false));
-            let expected = candidate
-                .get_entry(&entry_id)
-                .and_then(|entry| serde_json::to_vec(entry).ok());
-            (Some(Value::Object(summary_entry)), Some(entry_id), expected)
-        } else {
-            (None, None, None)
-        };
-
-    let new_leaf_id = candidate.leaf_id().map(str::to_string);
-    let persistence = if !save_enabled {
-        TreeNavigationPersistenceOutcome::Disabled
-    } else if let Err(err) = candidate.save().await {
-        tracing::error!(
-            error = %err,
-            ?new_leaf_id,
-            "tree navigation save failed; reconciling the exact operation against current disk state"
+    let branch_changed = candidate.leaf_id() != live.leaf_id();
+    let (summary_entry_payload, summary_entry_id) = if let Some((from_id, summary_text)) = summary {
+        let summary_clone = summary_text.clone();
+        let entry_id = candidate.append_branch_summary(from_id.clone(), summary_text, None, None);
+        let mut summary_entry = serde_json::Map::new();
+        summary_entry.insert(
+            "type".to_string(),
+            Value::String("branch_summary".to_string()),
         );
-        if confirm_exact_tree_navigation_after_save_error(
-            &candidate,
-            new_leaf_id.as_deref(),
-            expected_summary_entry.as_deref(),
-        )
-        .await
-        .is_none()
-        {
-            return Err(crate::error::Error::session(format!(
-                "Branch switch persistence was not confirmed ({err}), current disk state could not be reconciled, and the active in-memory session was left unchanged"
-            )));
-        }
-        TreeNavigationPersistenceOutcome::ReconciledButUnconfirmed
+        summary_entry.insert("fromId".to_string(), Value::String(from_id));
+        summary_entry.insert("summary".to_string(), Value::String(summary_clone));
+        summary_entry.insert("fromHook".to_string(), Value::Bool(false));
+        (Some(Value::Object(summary_entry)), Some(entry_id))
     } else {
-        TreeNavigationPersistenceOutcome::Confirmed
+        (None, None)
     };
 
-    let messages_for_agent = candidate.to_messages_for_current_path();
-    let (messages_for_ui, usage) = conversation_from_session(&candidate);
-    *live = candidate;
+    let persistence = if agent.handle.session().save_enabled() {
+        TreeNavigationPersistenceOutcome::Confirmed
+    } else {
+        TreeNavigationPersistenceOutcome::Disabled
+    };
+    // Share the SDK's transaction: prepare removal of the departing plan pin,
+    // persist the candidate, then publish its transcript and authority together.
+    // An interrupted/failed save preserves the old view and fences later turns.
+    agent
+        .handle
+        .session_mut()
+        .install_context_candidate(&mut live, candidate, true, &admission, "tree navigation", cx)
+        .await?;
+    if branch_changed {
+        agent.plans.clear_review();
+        agent.plans.forget_model_restore();
+    }
+    let new_leaf_id = live.leaf_id().map(str::to_string);
+    let (messages_for_ui, usage) = conversation_from_session(&live);
     Ok(TreeNavigationCommit {
-        messages_for_agent,
         messages_for_ui,
         usage,
         new_leaf_id,
         summary_entry_id,
         summary_entry_payload,
         persistence,
+    })
+}
+
+fn install_memory_tree_navigation(
+    agent: &mut InteractiveAgent,
+    live: &mut Session,
+    expected_session_id: &str,
+    expected_leaf_id: Option<&str>,
+    target_leaf_id: Option<&str>,
+) -> crate::error::Result<TreeNavigationCommit> {
+    if live.header.id != expected_session_id || live.leaf_id() != expected_leaf_id {
+        return Err(crate::error::Error::session(
+            "Session changed while switching branches; the switch was not applied",
+        ));
+    }
+    agent.handle.session().ensure_provider_reentry_allowed()?;
+    let mut candidate = live.clone();
+    candidate.ensure_full_v2_hydration_before_save()?;
+    if let Some(target_id) = target_leaf_id {
+        if !candidate.navigate_to(target_id) {
+            return Err(crate::error::Error::session(format!(
+                "Branch target not found: {target_id}"
+            )));
+        }
+    } else {
+        candidate.reset_leaf();
+    }
+    let prompt = if candidate.leaf_id() != live.leaf_id() {
+        Some(crate::plan::replacement_system_prompt(
+            agent,
+            &agent.handle.session_store(),
+            live,
+        )?)
+    } else {
+        None
+    };
+    let (messages_for_ui, usage) = conversation_from_session(&candidate);
+    let agent_messages = candidate.to_messages_for_current_path();
+    let new_leaf_id = candidate.leaf_id().map(str::to_string);
+    *live = candidate;
+    agent.handle.session_mut().invalidate_background_compaction();
+    agent.replace_messages(agent_messages);
+    if let Some(prompt) = prompt {
+        agent
+            .plan_state()
+            .reset_for_session(crate::plan::replayed_plan_mode(live));
+        agent.set_system_prompt(prompt);
+        agent.plans.clear_review();
+        agent.plans.forget_model_restore();
+    }
+    Ok(TreeNavigationCommit {
+        messages_for_ui,
+        usage,
+        new_leaf_id,
+        summary_entry_id: None,
+        summary_entry_payload: None,
+        persistence: TreeNavigationPersistenceOutcome::Disabled,
     })
 }
 
@@ -465,29 +472,30 @@ impl PiApp {
                 self.status_message = Some("Session busy; try again".to_string());
                 return false;
             };
-
-            if let Some(target_id) = &pending.new_leaf_id {
-                if !session_guard.navigate_to(target_id) {
-                    self.status_message = Some(format!("Branch target not found: {target_id}"));
+            let commit = match install_memory_tree_navigation(
+                &mut agent_guard,
+                &mut session_guard,
+                &pending.session_id,
+                pending.old_leaf_id.as_deref(),
+                pending.new_leaf_id.as_deref(),
+            ) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    self.status_message = Some(error.to_string());
                     return false;
                 }
-            } else {
-                session_guard.reset_leaf();
-            }
+            };
 
-            let (messages, usage) = conversation_from_session(&session_guard);
-            let agent_messages = session_guard.to_messages_for_current_path();
             let status_leaf = pending
                 .new_leaf_id
                 .clone()
                 .unwrap_or_else(|| "root".to_string());
-            agent_guard.replace_messages(agent_messages);
             drop(session_guard);
             drop(agent_guard);
 
-            self.messages = messages;
+            self.messages = commit.messages_for_ui;
             self.message_render_cache.clear();
-            self.total_usage = usage;
+            self.total_usage = commit.usage;
             self.current_response.clear();
             self.current_thinking.clear();
             self.agent_state = AgentState::Idle;
@@ -508,18 +516,22 @@ impl PiApp {
         }
 
         let event_tx = self.event_tx.clone();
-        let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
         let extensions = self.extensions.clone();
         let reserve_tokens = self.config.branch_summary_reserve_tokens();
         let runtime_handle = self.runtime_handle.clone();
-        let save_enabled = self.save_enabled;
 
         let Ok(agent_guard) = self.agent.try_lock() else {
             self.status_message = Some("Agent busy; try again".to_string());
             self.agent_state = AgentState::Idle;
             return false;
         };
+        // Summary generation calls the provider before the candidate installer.
+        // A prior uncertain save must fence that request as well.
+        if let Err(error) = agent_guard.handle.session().ensure_provider_reentry_allowed() {
+            self.status_message = Some(format!("Branch switch is blocked: {error}"));
+            return false;
+        }
         let provider = agent_guard.provider();
         let stream_options = agent_guard.stream_options().clone();
         let privacy = agent_guard.compaction_privacy();
@@ -609,12 +621,11 @@ impl PiApp {
             let expected_leaf_id = pending.old_leaf_id.clone();
             let summary = summary_text.map(|text| (pending.summary_from_id.clone(), text));
             let commit = match stage_and_commit_tree_navigation(
-                Arc::clone(&session),
+                &mut agent_guard,
                 &pending.session_id,
                 expected_leaf_id.as_deref(),
                 pending.new_leaf_id.as_deref(),
                 summary,
-                save_enabled,
                 &cx,
             )
             .await
@@ -632,7 +643,6 @@ impl PiApp {
                 }
             };
             let TreeNavigationCommit {
-                messages_for_agent,
                 messages_for_ui: messages,
                 usage,
                 new_leaf_id,
@@ -640,20 +650,18 @@ impl PiApp {
                 summary_entry_payload,
                 persistence,
             } = commit;
-            agent_guard.replace_messages(messages_for_agent);
             drop(agent_guard);
 
             let switched_to = new_leaf_id
                 .clone()
                 .unwrap_or_else(|| to_id_for_event.clone());
             let status = match persistence {
-                TreeNavigationPersistenceOutcome::Confirmed
-                | TreeNavigationPersistenceOutcome::Disabled => {
+                TreeNavigationPersistenceOutcome::Confirmed => {
                     Some(format!("Switched to {switched_to}"))
                 }
-                TreeNavigationPersistenceOutcome::ReconciledButUnconfirmed => Some(format!(
-                    "Persistence warning: branch switch is present in the current disk and active session state, but final durability was not confirmed (switched to {switched_to})"
-                )),
+                TreeNavigationPersistenceOutcome::Disabled => {
+                    Some(format!("Switched to {switched_to} (memory only)"))
+                }
             };
 
             let delivered = crate::interactive::enqueue_pi_event(
@@ -680,10 +688,7 @@ impl PiApp {
                 .await;
             }
 
-            if delivered
-                && persistence.may_emit_success_event()
-                && let Some(manager) = extensions
-            {
+            if delivered && let Some(manager) = extensions {
                 let event_leaf_id = summary_entry_id
                     .clone()
                     .or(new_leaf_id)
@@ -739,6 +744,54 @@ mod tests {
         })
     }
 
+    fn test_agent(session: Arc<Mutex<Session>>, save_enabled: bool) -> InteractiveAgent {
+        let provider = Arc::new(
+            crate::providers::openai::OpenAIProvider::new("classic-plan-branch")
+                .with_base_url("http://127.0.0.1:1/v1"),
+        );
+        let mut agent = Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+            crate::agent::AgentConfig {
+                system_prompt: Some("Independent instructions".to_string()),
+                ..crate::agent::AgentConfig::default()
+            },
+        );
+        agent.replace_messages(session.try_lock().unwrap().to_messages_for_current_path());
+        let session = crate::agent::AgentSession::new(
+            agent,
+            session,
+            save_enabled,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        InteractiveAgent {
+            handle: crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                session,
+                crate::sdk::EventListeners::default(),
+            ),
+            plans: Default::default(),
+        }
+    }
+
+    fn approve_plan(agent: &mut InteractiveAgent) -> crate::plan::SessionPlanReview {
+        let owner = crate::agent_cx::AgentCx::for_request();
+        let entered = runtime().block_on(agent.handle.enter_plan_mode(&owner)).unwrap();
+        assert!(!matches!(
+            entered.persistence,
+            crate::plan::PlanPersistence::Unconfirmed { .. }
+        ));
+        assert!(agent.plan_state().submit_plan("Inspect then implement".to_string()));
+        let review = agent.handle.pending_plan_review().unwrap().unwrap();
+        let approved = runtime()
+            .block_on(agent.handle.approve_plan_review(&owner, &review))
+            .unwrap();
+        assert!(!matches!(
+            approved.persistence,
+            crate::plan::PlanPersistence::Unconfirmed { .. }
+        ));
+        review
+    }
+
     fn branched_session(session_dir: Option<std::path::PathBuf>) -> (Session, String, String) {
         let mut session = session_dir.map_or_else(Session::in_memory, |dir| {
             Session::create_with_dir(Some(dir))
@@ -772,16 +825,16 @@ mod tests {
         let expected_entries =
             serde_json::to_value(&raw_session.entries).expect("serialize entries");
         let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = test_agent(Arc::clone(&session), true);
         let cx = Cx::for_testing();
 
         let error = runtime()
             .block_on(stage_and_commit_tree_navigation(
-                Arc::clone(&session),
+                &mut agent,
                 &expected_session_id,
                 Some(&current_leaf_id),
                 Some(&target_leaf_id),
                 None,
-                true,
                 &cx,
             ))
             .expect_err("directory session path must reject tree navigation save");
@@ -807,16 +860,16 @@ mod tests {
         let (raw_session, current_leaf_id, target_leaf_id) = branched_session(None);
         let expected_session_id = raw_session.header.id.clone();
         let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = test_agent(Arc::clone(&session), false);
         let cx = Cx::for_testing();
 
         let commit = runtime()
             .block_on(stage_and_commit_tree_navigation(
-                Arc::clone(&session),
+                &mut agent,
                 &expected_session_id,
                 Some(&current_leaf_id),
                 Some(&target_leaf_id),
                 None,
-                false,
                 &cx,
             ))
             .expect("memory-only tree navigation");
@@ -853,16 +906,16 @@ mod tests {
             .unwrap_or_else(|err| panic!("baseline save must pin a path: {err}"));
         let expected_session_id = raw_session.header.id.clone();
         let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = test_agent(Arc::clone(&session), true);
         let cx = Cx::for_testing();
 
         let persisted_path = runtime().block_on(async {
             let commit = stage_and_commit_tree_navigation(
-                Arc::clone(&session),
+                &mut agent,
                 &expected_session_id,
                 Some(&current_leaf_id),
                 Some(&target_leaf_id),
                 None,
-                true,
                 &cx,
             )
             .await
@@ -893,16 +946,16 @@ mod tests {
         let expected_entries =
             serde_json::to_value(&raw_session.entries).expect("serialize entries");
         let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = test_agent(Arc::clone(&session), false);
         let cx = Cx::for_testing();
 
         let error = runtime()
             .block_on(stage_and_commit_tree_navigation(
-                Arc::clone(&session),
+                &mut agent,
                 "replaced-session-id",
                 Some(&current_leaf_id),
                 Some(&target_leaf_id),
                 None,
-                false,
                 &cx,
             ))
             .expect_err("stale tree navigation must fail closed");
@@ -928,16 +981,16 @@ mod tests {
         let expected_entries =
             serde_json::to_value(&raw_session.entries).expect("serialize entries");
         let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = test_agent(Arc::clone(&session), false);
         let cx = Cx::for_testing();
 
         let error = runtime()
             .block_on(stage_and_commit_tree_navigation(
-                Arc::clone(&session),
+                &mut agent,
                 &session_id,
                 None,
                 Some(&target_leaf_id),
                 None,
-                false,
                 &cx,
             ))
             .expect_err("stale leaf must fail closed");
@@ -953,5 +1006,201 @@ mod tests {
                 expected_entries
             );
         });
+    }
+
+    #[test]
+    fn staged_tree_navigation_retires_approval_and_only_its_owned_prompt() {
+        let (raw_session, _, target) = branched_session(None);
+        let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = test_agent(Arc::clone(&session), false);
+        let old_review = approve_plan(&mut agent);
+        let pinned = agent.system_prompt().unwrap().to_string();
+        agent.set_system_prompt(Some(format!("prefix\n{pinned}\nsuffix")));
+        let (id, leaf) = {
+            let live = session.try_lock().unwrap();
+            (live.header.id.clone(), live.leaf_id().map(str::to_string))
+        };
+
+        runtime()
+            .block_on(stage_and_commit_tree_navigation(
+                &mut agent,
+                &id,
+                leaf.as_deref(),
+                Some(&target),
+                None,
+                &Cx::for_testing(),
+            ))
+            .unwrap();
+        assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Off);
+        assert_eq!(
+            agent.system_prompt(),
+            Some("prefix\nIndependent instructions\nsuffix")
+        );
+        let owner = crate::agent_cx::AgentCx::for_request();
+        let _ = runtime().block_on(agent.handle.enter_plan_mode(&owner)).unwrap();
+        assert!(agent.plan_state().submit_plan(old_review.text().to_string()));
+        let current = agent.handle.pending_plan_review().unwrap().unwrap();
+        assert!(!old_review.same_submission(&current));
+        assert!(runtime()
+            .block_on(agent.handle.approve_plan_review(&owner, &old_review))
+            .is_err());
+        assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::PendingApproval);
+    }
+
+    #[test]
+    fn staged_tree_noop_and_summary_append_preserve_live_approval() {
+        let (raw_session, _, _) = branched_session(None);
+        let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = test_agent(Arc::clone(&session), false);
+        let _ = approve_plan(&mut agent);
+        let prompt = agent.system_prompt().map(str::to_string);
+        for append_summary in [false, true] {
+            let (id, leaf) = {
+                let live = session.try_lock().unwrap();
+                (live.header.id.clone(), live.leaf_id().map(str::to_string))
+            };
+            let summary = append_summary.then(|| {
+                (leaf.clone().unwrap(), "Same-branch continuation".to_string())
+            });
+            runtime()
+                .block_on(stage_and_commit_tree_navigation(
+                    &mut agent,
+                    &id,
+                    leaf.as_deref(),
+                    leaf.as_deref(),
+                    summary,
+                    &Cx::for_testing(),
+                ))
+                .unwrap();
+            assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Approved);
+            assert_eq!(agent.system_prompt(), prompt.as_deref());
+        }
+    }
+
+    #[test]
+    fn staged_tree_failed_save_preserves_plan_but_fences_provider_reentry() {
+        let temp = TempDir::new().unwrap();
+        let (mut raw_session, _, target) =
+            branched_session(Some(temp.path().join("sessions")));
+        raw_session.path = Some(temp.path().join("source.jsonl"));
+        let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = test_agent(Arc::clone(&session), true);
+        let _ = approve_plan(&mut agent);
+        let prompt = agent.system_prompt().map(str::to_string);
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).unwrap();
+        let (id, leaf, entries) = {
+            let mut live = session.try_lock().unwrap();
+            live.path = Some(blocked_path);
+            (
+                live.header.id.clone(),
+                live.leaf_id().map(str::to_string),
+                serde_json::to_value(&live.entries).unwrap(),
+            )
+        };
+        let error = runtime()
+            .block_on(stage_and_commit_tree_navigation(
+                &mut agent,
+                &id,
+                leaf.as_deref(),
+                Some(&target),
+                None,
+                &Cx::for_testing(),
+            ))
+            .unwrap_err();
+        assert!(error.is_session_persistence());
+        assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Approved);
+        assert_eq!(agent.system_prompt(), prompt.as_deref());
+        assert!(agent.handle.session().ensure_provider_reentry_allowed().is_err());
+        let live = session.try_lock().unwrap();
+        assert_eq!(live.leaf_id(), leaf.as_deref());
+        assert_eq!(serde_json::to_value(&live.entries).unwrap(), entries);
+    }
+
+    #[test]
+    fn staged_tree_rejects_ambiguous_owned_prompt_before_saving() {
+        let (raw_session, _, target) = branched_session(None);
+        let session = Arc::new(Mutex::new(raw_session));
+        let mut agent = test_agent(Arc::clone(&session), false);
+        let _ = approve_plan(&mut agent);
+        let pinned = agent.system_prompt().unwrap().to_string();
+        let duplicated = format!("{pinned}\n{pinned}");
+        agent.set_system_prompt(Some(duplicated.clone()));
+        let (id, leaf) = {
+            let live = session.try_lock().unwrap();
+            (live.header.id.clone(), live.leaf_id().map(str::to_string))
+        };
+        let error = runtime()
+            .block_on(stage_and_commit_tree_navigation(
+                &mut agent,
+                &id,
+                leaf.as_deref(),
+                Some(&target),
+                None,
+                &Cx::for_testing(),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("PLAN_CONTEXT_CHANGED"));
+        assert_eq!(session.try_lock().unwrap().leaf_id(), leaf.as_deref());
+        assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Approved);
+        assert_eq!(agent.system_prompt(), Some(duplicated.as_str()));
+        assert!(agent.handle.session().ensure_provider_reentry_allowed().is_ok());
+    }
+
+    #[test]
+    fn memory_tree_navigation_preserves_noop_and_retires_departing_plan() {
+        for approved in [false, true] {
+            let (raw_session, _, target) = branched_session(None);
+            let session = Arc::new(Mutex::new(raw_session));
+            let mut agent = test_agent(Arc::clone(&session), false);
+            let owner = crate::agent_cx::AgentCx::for_request();
+            let _ = runtime().block_on(agent.handle.enter_plan_mode(&owner)).unwrap();
+            assert!(agent.plan_state().submit_plan("Inspect then implement".to_string()));
+            let review = agent.handle.pending_plan_review().unwrap().unwrap();
+            if approved {
+                let _ = runtime()
+                    .block_on(agent.handle.approve_plan_review(&owner, &review))
+                    .unwrap();
+            }
+            let mode = agent.plan_state().mode();
+            let prompt = agent.system_prompt().map(str::to_string);
+            let mut live = session.try_lock().unwrap();
+            let id = live.header.id.clone();
+            let leaf = live.leaf_id().map(str::to_string);
+            install_memory_tree_navigation(
+                &mut agent,
+                &mut live,
+                &id,
+                leaf.as_deref(),
+                leaf.as_deref(),
+            )
+            .unwrap();
+            assert_eq!(agent.plan_state().mode(), mode);
+            assert_eq!(agent.system_prompt(), prompt.as_deref());
+            assert!(install_memory_tree_navigation(
+                &mut agent,
+                &mut live,
+                &id,
+                leaf.as_deref(),
+                Some("missing-entry"),
+            )
+            .is_err());
+            assert_eq!(agent.plan_state().mode(), mode);
+            assert_eq!(agent.system_prompt(), prompt.as_deref());
+            install_memory_tree_navigation(
+                &mut agent,
+                &mut live,
+                &id,
+                leaf.as_deref(),
+                Some(&target),
+            )
+            .unwrap();
+            drop(live);
+            assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Off);
+            assert_eq!(agent.system_prompt(), Some("Independent instructions"));
+            assert!(runtime()
+                .block_on(agent.handle.approve_plan_review(&owner, &review))
+                .is_err());
+        }
     }
 }
