@@ -38024,7 +38024,7 @@ globalThis.fetchUploadState = {
     #[allow(clippy::too_many_lines)]
     fn pijs_fetch_body_values_are_immutable_and_request_ownership_is_enforced() {
         assert_web_stream_fixture(
-            r#"
+            r"
 const throwsType = (operation) => { try { operation(); return false; } catch (error) { return error instanceof TypeError; } };
 const originalBytes = new Uint8Array([8, 0, 255, 7, 128, 9]);
 const file = new File([new DataView(originalBytes.buffer, 1, 4)], 'report.bin',
@@ -38116,7 +38116,7 @@ const foreign = {
 check(await success(new Response(foreign).text(), 'foreign Response body') === 'ok' && !foreignLocked && foreignReleases === 1,
     'Accepted foreign reader bodies preserve existing consumption and release semantics');
 return checks;
-"#,
+",
             22,
         );
     }
@@ -38132,7 +38132,7 @@ return checks;
             let fixture = [
                 "globalThis.fetchRejectedBodyFixture = { done: false };\n(async () => {\n",
                 WEB_STREAM_TEST_HELPERS,
-                r#"
+                r"
 const reason = new Error('cancel before admission');
 const aborted = new AbortController();
 aborted.abort(reason);
@@ -38189,7 +38189,7 @@ await tick();
 check(cancelled === 1 && !stream.locked && response.bodyUsed,
     'Failed consumption requests cancellation once and releases its reader');
 return checks;
-"#,
+",
                 "\n})().then(checks => { globalThis.fetchRejectedBodyFixture = { done: true, checks }; }, error => { globalThis.fetchRejectedBodyFixture = { done: false, error: String(error) }; });",
             ]
             .concat();
@@ -42076,6 +42076,8 @@ globalThis.fsCallbackLifecycle = { done: false };
 
     #[test]
     fn pijs_fs_callback_exceptions_reach_host_console() {
+        use std::sync::Mutex as StdMutex;
+
         struct ConsoleCapture(Arc<StdMutex<Vec<String>>>);
 
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ConsoleCapture {
