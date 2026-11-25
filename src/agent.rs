@@ -1158,9 +1158,18 @@ impl RegisteredYieldCheck {
 
 type AgentEventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync + 'static>;
 
-/// Persists completed messages mid-run, resolving to whether they reached the
-/// session. Each pair carries whether the message is an authored queued input.
-type TurnCheckpoint = Arc<dyn Fn(Vec<(Message, bool)>) -> BoxFuture<'static, bool> + Send + Sync>;
+/// Retaining rows and acknowledging their save are separate operations. A
+/// failed save must stop the run, but its retained rows must not be appended
+/// again when the final persistence path retries them.
+struct TurnCheckpointReceipt {
+    accepted: bool,
+    persistence: Result<()>,
+}
+
+/// Each pair carries whether the message is an authored queued input.
+type TurnCheckpoint = Arc<
+    dyn Fn(Vec<(Message, bool)>) -> BoxFuture<'static, TurnCheckpointReceipt> + Send + Sync,
+>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMode {
@@ -2878,9 +2887,9 @@ impl Agent {
     /// At a turn boundary every message is complete. Stop at a failed or
     /// aborted assistant: the run's final save decides whether it is kept and
     /// where.
-    async fn checkpoint_completed_turns(&mut self) {
+    async fn checkpoint_completed_turns(&mut self) -> Result<()> {
         let Some(checkpoint) = self.turn_checkpoint.clone() else {
-            return;
+            return Ok(());
         };
         let start = self.turn_checkpoint_cursor.min(self.messages.len());
         let end = self.messages[start..]
@@ -2888,7 +2897,7 @@ impl Agent {
             .position(is_incomplete_assistant_message)
             .map_or(self.messages.len(), |offset| start + offset);
         if start == end {
-            return;
+            return Ok(());
         }
         let completed = (start..end)
             .map(|index| {
@@ -2898,16 +2907,17 @@ impl Agent {
                 )
             })
             .collect();
-        if !checkpoint(completed).await {
-            return;
+        let receipt = checkpoint(completed).await;
+        if receipt.accepted {
+            self.turn_checkpoint_cursor = end;
+            self.authored_queue_delivery_indices
+                .retain(|index| *index >= end);
+            if receipt.persistence.is_ok() && end == self.messages.len() {
+                self.unpersisted_tool_effects
+                    .store(false, Ordering::Release);
+            }
         }
-        self.turn_checkpoint_cursor = end;
-        self.authored_queue_delivery_indices
-            .retain(|index| *index >= end);
-        if end == self.messages.len() {
-            self.unpersisted_tool_effects
-                .store(false, Ordering::Release);
-        }
+        receipt.persistence
     }
 
     /// Add a message to the history.
@@ -4470,6 +4480,23 @@ impl Agent {
                     break 'agent;
                 }
 
+                if let Err(err) = self.checkpoint_completed_turns().await {
+                    // Preserve input already accepted from a steering source.
+                    // Staged follow-ups have not been consumed yet, and no new
+                    // provider or tool work may start after a failed save.
+                    self.message_queue
+                        .restore_steering_front_lossless(std::mem::take(&mut pending_messages));
+                    let agent_end_event = AgentEvent::AgentEnd {
+                        session_id: session_id.clone(),
+                        messages: std::mem::take(&mut new_messages),
+                        error: Some(err.to_string()),
+                    };
+                    self.dispatch_extension_lifecycle_event(&agent_end_event)
+                        .await;
+                    on_event(agent_end_event);
+                    return Err(err);
+                }
+
                 let delivering_follow_up = follow_up_staged && !cancelled_at_boundary;
                 if delivering_follow_up {
                     self.refresh_follow_up_session_ownership().await;
@@ -4520,7 +4547,6 @@ impl Agent {
                     pending_messages = current_follow_up;
                 }
 
-                self.checkpoint_completed_turns().await;
                 let current_turn_index = turn_index;
                 let turn_latency = Arc::new(StdMutex::new(TurnLatencyAccumulator::started()));
                 let turn_start_event = AgentEvent::TurnStart {
@@ -28315,14 +28341,27 @@ impl AgentSession {
         let cost_budget = self.agent.cost_budget().cloned();
         let reset_advisor = self.advisor.is_some();
         let checkpoint: TurnCheckpoint = Arc::new(
-            move |messages: Vec<(Message, bool)>| -> BoxFuture<'static, bool> {
+            move |messages: Vec<(Message, bool)>| -> BoxFuture<'static, TurnCheckpointReceipt> {
                 let session = Arc::clone(&session);
                 let admission = admission.clone();
                 let cost_budget = cost_budget.clone();
                 Box::pin(async move {
                     let cx = crate::agent_cx::AgentCx::for_request();
-                    let Ok(mut session) = OwnedMutexGuard::lock(session, cx.cx()).await else {
-                        return false;
+                    let mut session = match OwnedMutexGuard::lock(session, cx.cx()).await {
+                        Ok(session) => session,
+                        Err(error) => {
+                            if let Some(budget) = &cost_budget {
+                                budget.quarantine(&error.to_string());
+                            }
+                            return TurnCheckpointReceipt {
+                                accepted: false,
+                                persistence: finish_turn_persistence(
+                                    &admission,
+                                    Ok(()),
+                                    Err(Error::session(error.to_string())),
+                                ),
+                            };
+                        }
                     };
                     for (message, authored) in messages {
                         let authored_input = authored && matches!(&message, Message::User(_));
@@ -28346,33 +28385,35 @@ impl AgentSession {
                             );
                         }
                     }
-                    if session.autosave_durability_mode()
+                    let persist_result = if session.autosave_durability_mode()
                         == crate::session::AutosaveDurabilityMode::Throughput
                     {
-                        if let Some(budget) = &cost_budget
-                            && let Err(error) = budget.checkpoint(&mut session)
-                        {
-                            budget.quarantine(&error.to_string());
-                            tracing::warn!(%error, "mid-run cost checkpoint failed");
-                        }
+                        cost_budget.as_ref().map_or(Ok(()), |budget| {
+                            budget.checkpoint(&mut session).inspect_err(|error| {
+                                budget.quarantine(&error.to_string());
+                            })
+                        })
                     } else {
-                        let persist_result = flush_turn_autosave(
+                        flush_turn_autosave(
                             &mut session,
                             &admission,
                             AutosaveFlushTrigger::Periodic,
                             cost_budget.as_ref().map(|budget| (budget, cx.cx())),
                         )
-                        .await;
-                        if let Err(err) =
-                            finish_turn_persistence(&admission, Ok(()), persist_result)
-                        {
-                            // The rows stay queued and the cursor advances so
-                            // the final save can retry without duplicating them.
-                            // A failed durable account cannot admit more work.
-                            tracing::warn!(error = %err, "mid-run session checkpoint failed");
-                        }
+                        .await
+                    };
+                    let persistence =
+                        finish_turn_persistence(&admission, Ok(()), persist_result);
+                    if let Err(err) = &persistence {
+                        tracing::warn!(error = %err, "mid-run session checkpoint failed");
                     }
-                    true
+                    TurnCheckpointReceipt {
+                        // The rows stay queued even if saving failed. Advance
+                        // the cursor before propagating that error so final
+                        // persistence can retry without duplicating them.
+                        accepted: true,
+                        persistence,
+                    }
                 })
             },
         );

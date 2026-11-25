@@ -2033,6 +2033,186 @@ mod tests {
     }
 
     #[test]
+    fn failed_mid_run_checkpoint_stops_new_work_without_duplicating_retained_results() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for mode in [
+                crate::session::AutosaveDurabilityMode::Strict,
+                crate::session::AutosaveDurabilityMode::Balanced,
+            ] {
+                for repair_before_final_save in [false, true] {
+                    let temp = tempfile::tempdir().expect("workspace");
+                    let blocked = temp.path().join("directory-not-session.jsonl");
+                    std::fs::create_dir(&blocked).expect("persistence fault target");
+                    let mut first = assistant_message("Write the first file.");
+                    first.content.push(ContentBlock::ToolCall(batch_write_call(
+                        "checkpointed",
+                        "first.txt",
+                        "kept",
+                    )));
+                    let mut second = assistant_message("Write another file.");
+                    second.content.push(ContentBlock::ToolCall(batch_write_call(
+                        "must-not-run",
+                        "later.txt",
+                        "must not be written",
+                    )));
+                    let provider = Arc::new(RuleScriptProvider::new(vec![
+                        vec![StreamEvent::Done {
+                            reason: StopReason::ToolUse,
+                            message: first,
+                        }],
+                        vec![StreamEvent::Done {
+                            reason: StopReason::ToolUse,
+                            message: second,
+                        }],
+                        rule_done("Finished."),
+                    ]));
+                    // No cost account: persistence itself must stop the loop,
+                    // independently of the optional billing-admission fence.
+                    let mut agent = Agent::new(
+                        provider.clone(),
+                        ToolRegistry::new(&["write"], temp.path(), None),
+                        AgentConfig::default(),
+                    );
+                    let steering_ready = Arc::new(AtomicBool::new(false));
+                    let fetch_ready = Arc::clone(&steering_ready);
+                    agent.register_message_fetchers(
+                        Some(Arc::new(move || {
+                            let ready = fetch_ready.swap(false, Ordering::SeqCst);
+                            Box::pin(async move {
+                                if ready {
+                                    vec![queued_user_message("Accepted steering")]
+                                } else {
+                                    Vec::new()
+                                }
+                            })
+                        })),
+                        None,
+                    );
+                    let mut saved_session =
+                        Session::create_with_dir(Some(temp.path().join("sessions")));
+                    saved_session.set_autosave_durability_mode(mode);
+                    let saved = Arc::new(Mutex::new(saved_session));
+                    let mut session = AgentSession::new(
+                        agent,
+                        Arc::clone(&saved),
+                        true,
+                        ResolvedCompactionSettings {
+                            enabled: false,
+                            ..ResolvedCompactionSettings::default()
+                        },
+                    );
+                    let original = Arc::new(StdMutex::new(None::<std::path::PathBuf>));
+                    let captured_original = Arc::clone(&original);
+                    let captured_saved = Arc::clone(&saved);
+                    let events = Arc::new(StdMutex::new(Vec::new()));
+                    let captured_events = Arc::clone(&events);
+                    let result = session
+                        .run_text_with_abort("Write the files".to_string(), None, move |event| {
+                            if matches!(&event, AgentEvent::TurnEnd { .. }) {
+                                let mut original = captured_original.lock().unwrap();
+                                if original.is_none() {
+                                    let mut saved = captured_saved.try_lock().unwrap();
+                                    *original = Some(saved.path.clone().expect("saved prompt"));
+                                    saved.path = Some(blocked.clone());
+                                    steering_ready.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            if repair_before_final_save
+                                && matches!(&event, AgentEvent::AgentEnd { .. })
+                            {
+                                captured_saved.try_lock().unwrap().path =
+                                    captured_original.lock().unwrap().clone();
+                            }
+                            captured_events.lock().unwrap().push(event);
+                        })
+                        .await;
+                    assert!(
+                        result.as_ref().is_err_and(Error::is_session_persistence),
+                        "{mode:?}, repaired={repair_before_final_save}: {result:?}"
+                    );
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(provider.active_streams.load(Ordering::SeqCst), 0);
+                    assert_eq!(
+                        std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
+                        "kept"
+                    );
+                    assert!(!temp.path().join("later.txt").exists());
+                    let steering = session.agent.take_queued_steering_batch();
+                    assert_eq!(steering.len(), 1);
+                    let delivery = steering.into_iter().next().unwrap();
+                    assert_eq!(delivery.keyword_scan_source(), Some("Accepted steering"));
+                    assert_user_text(&delivery.into_message(), "Accepted steering");
+                    {
+                        let events = events.lock().unwrap();
+                        let ends = events
+                            .iter()
+                            .filter_map(|event| match event {
+                                AgentEvent::AgentEnd { error, .. } => Some(error),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(ends.len(), 1);
+                        assert!(
+                            ends[0]
+                                .as_ref()
+                                .unwrap()
+                                .contains(Error::SESSION_PERSISTENCE_PREFIX)
+                        );
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|event| matches!(event, AgentEvent::TurnStart { .. }))
+                                .count(),
+                            1
+                        );
+                    }
+                    let path = original.lock().unwrap().clone().expect("fault injected");
+                    {
+                        let cx = AgentCx::for_request();
+                        let mut saved = saved.lock(cx.cx()).await.unwrap();
+                        saved.path = Some(path.clone());
+                        saved.save().await.expect("recover retained rows on disk");
+                    }
+                    let reopened = Session::open(path.to_string_lossy().as_ref()).await.unwrap();
+                    let history = reopened.to_messages_for_current_path();
+                    assert_eq!(
+                        history.iter().filter(|message| matches!(message,
+                            Message::ToolResult(result) if result.tool_call_id == "checkpointed"
+                        )).count(),
+                        1,
+                        "a failed checkpoint and final save must not duplicate a tool result"
+                    );
+                    assert_eq!(
+                        history
+                            .iter()
+                            .filter(|message| matches!(message, Message::Assistant(_)))
+                            .count(),
+                        1
+                    );
+                    for entry in [
+                        NativeEffectEntry::Text,
+                        NativeEffectEntry::Content,
+                        NativeEffectEntry::Continue,
+                        NativeEffectEntry::Custom,
+                    ] {
+                        let error = run_native_effect_turn(
+                            &mut session,
+                            entry,
+                            None,
+                            Arc::new(|_| {}),
+                        )
+                        .await
+                        .expect_err("repairing the path must not clear admission");
+                        assert!(error.is_session_persistence());
+                    }
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                }
+            }
+        });
+    }
+
+    #[test]
     fn stream_rule_cap_survives_continuation_but_a_new_prompt_gets_an_allowance() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
