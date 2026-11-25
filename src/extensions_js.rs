@@ -18163,36 +18163,61 @@ class Readable extends Stream {
     }
     const readable = new Readable({ objectMode: true, ...opts });
     let complete = false;
-    let returned = false;
+    let closing = null;
+    let sourceFailure = null;
+    let finishReading;
+    const readingFinished = new Promise(resolve => { finishReading = resolve; });
     const closeIterator = () => {
-      if (complete || returned) return;
-      returned = true;
-      try { Promise.resolve(iterator.return?.()).catch(() => {}); } catch (_) {}
+      if (complete) return Promise.resolve();
+      if (!closing) closing = (async () => {
+        const result = await iterator.return?.();
+        // A synchronous iterator can return a promised value too. It stays
+        // owned by teardown just like the value from an in-flight next().
+        if (result != null) await result.value;
+      })();
+      return closing;
     };
-    const originalDestroy = readable.destroy.bind(readable);
-    readable.destroy = (error) => {
-      if (readable.destroyed) return readable;
-      closeIterator();
-      return originalDestroy(error);
+    const originalDestroy = readable._destroy.bind(readable);
+    readable._destroy = (error, callback) => {
+      const cleanup = async () => {
+        // Request cancellation before waiting for the pump: a custom return()
+        // can be what releases its pending next(). Neither owner may outlive
+        // close, and a cleanup rejection must not become silent success.
+        try { await closeIterator(); }
+        catch (cause) { sourceFailure = sourceFailure || __streamToError(cause); }
+        await readingFinished;
+        return error || sourceFailure;
+      };
+      cleanup().then(failure => {
+        const done = cause => callback(failure || cause);
+        try { originalDestroy(failure, done); }
+        catch (cause) { done(cause); }
+      }, cause => callback(error || __streamToError(cause)));
     };
     (async () => {
       try {
         while (await readable._waitForRead()) {
-          const item = await iterator.next();
           if (readable.destroyed) break;
+          const item = await iterator.next();
           if (item.done) {
             complete = true;
-            readable.push(null);
+            if (!readable.destroyed) readable.push(null);
             break;
           }
+          // Even after cancellation, observe an already admitted value. A
+          // late rejection must not escape after close or be left unhandled.
           const chunk = await item.value;
           if (readable.destroyed) break;
           readable.push(chunk);
         }
       } catch (err) {
-        if (!readable.destroyed) readable.destroy(__streamToError(err));
+        sourceFailure = sourceFailure || __streamToError(err);
+        if (!readable.destroyed) readable.destroy(sourceFailure);
       } finally {
-        closeIterator();
+        // Producers can also end the stream explicitly. Route that unfinished
+        // iterator through the same cleanup owner instead of dropping it.
+        if (!complete && !readable.destroyed) readable.destroy();
+        finishReading();
       }
     })();
     return readable;
@@ -32930,10 +32955,11 @@ mod tests {
         ),
         // Sized reads preserve frame boundaries and demand across adapters;
         // iterators retain terminal-error ownership through asynchronous cleanup.
+        // Iterable adapters also own pending next/value and return cleanup.
         (
             "node:stream",
-            56_470,
-            "f33b66dd2648cae742f4d04ad0a481e03d67431d0c221c797d85e0d11bf79ac0",
+            57_901,
+            "52a80ed36a67974d7b69efeedd64f0a67fb58202964309e6e25d6ae49f1f5927",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -47807,6 +47833,276 @@ globalThis.__spawn_abort_result = result;
                 "duplexClosed",
             ] {
                 assert_eq!(result[name], json!(true), "{name}: {result}");
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_readable_from_owns_iterator_return_and_destroy_hooks() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.fromIteratorOwnership = { done: false };
+                    (async () => {
+                        const { Readable } = await import('node:stream');
+                        const settle = async () => {
+                            for (let index = 0; index < 64; index++) await Promise.resolve();
+                        };
+                        const observe = promise => promise.then(
+                            () => ({ ok: true }), error => ({ error: error.message }));
+                        const cases = [];
+                        for (const mode of ['ok', 'return-error', 'hook-error']) {
+                            let release;
+                            const gate = new Promise(resolve => { release = resolve; });
+                            let returned = 0;
+                            let released = false;
+                            async function* values() {
+                                try { yield 'first'; yield 'unconsumed'; }
+                                finally {
+                                    returned++;
+                                    await gate;
+                                    released = true;
+                                    if (mode === 'return-error') throw new Error('iterator release failed');
+                                }
+                            }
+                            let hooks = 0;
+                            let hookError;
+                            let finishHook;
+                            let closes = 0;
+                            const errors = [];
+                            const source = Readable.from(values(), {
+                                destroy(error, callback) {
+                                    hooks++;
+                                    hookError = error ? error.message : null;
+                                    finishHook = () => callback(mode === 'ok' ? null : new Error('destroy hook failed'));
+                                },
+                            });
+                            source.on('error', error => errors.push(error.message));
+                            source.on('close', () => closes++);
+                            const iterator = source[Symbol.asyncIterator]();
+                            const first = (await iterator.next()).value;
+                            let settled = false;
+                            const work = observe(iterator.return()).then(result => {
+                                settled = true;
+                                return result;
+                            });
+                            const repeated = observe(iterator.return());
+                            source.destroy();
+                            await settle();
+                            const before = { returned, released, hooks, closed: source.closed, settled };
+                            release();
+                            await settle();
+                            const beforeHook = { returned, released, hooks, closed: source.closed, settled, hookError };
+                            finishHook();
+                            const outcome = await work;
+                            cases.push({ mode, first, before, beforeHook, outcome, repeated: await repeated,
+                                returned, hooks, closes, closed: source.closed, errors });
+                        }
+
+                        const eof = [];
+                        for (const autoDestroy of [true, false]) {
+                            let calls = 0;
+                            let returns = 0;
+                            let hooks = 0;
+                            const source = Readable.from({
+                                [Symbol.iterator]() { return this; },
+                                next() { return calls++ < 2 ? { value: calls, done: false } : { done: true }; },
+                                return() { returns++; return { done: true }; },
+                            }, { autoDestroy, destroy(error, callback) { hooks++; callback(error); } });
+                            const values = [];
+                            for await (const value of source) values.push(value);
+                            const beforeDestroy = { values, returns, hooks, closed: source.closed };
+                            source.destroy();
+                            await settle();
+                            eof.push({ autoDestroy, beforeDestroy, returns, hooks, closed: source.closed });
+                        }
+
+                        let idleReads = 0;
+                        let idleReturns = 0;
+                        const idleErrors = [];
+                        const idle = Readable.from({
+                            [Symbol.iterator]() { return this; },
+                            next() { idleReads++; return { done: true }; },
+                            return() { idleReturns++; throw new Error('idle release failed'); },
+                        });
+                        idle.on('error', error => idleErrors.push(error.message));
+                        idle.destroy();
+                        idle.destroy();
+                        await settle();
+                        globalThis.fromIteratorOwnership = { done: true, cases, eof,
+                            idle: { reads: idleReads, returns: idleReturns, errors: idleErrors, closed: idle.closed } };
+                    })().catch(error => { globalThis.fromIteratorOwnership.error = String(error); });
+                    ",
+                )
+                .await
+                .expect("evaluate iterable cleanup ownership");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fromIteratorOwnership").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            for (index, error) in [
+                None,
+                Some("iterator release failed"),
+                Some("destroy hook failed"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let entry = &result["cases"][index];
+                assert_eq!(entry["first"], json!("first"));
+                assert_eq!(
+                    entry["before"],
+                    json!({"returned":1,"released":false,"hooks":0,"closed":false,"settled":false})
+                );
+                let hook_error = (index == 1).then_some("iterator release failed");
+                assert_eq!(
+                    entry["beforeHook"],
+                    json!({"returned":1,"released":true,"hooks":1,"closed":false,"settled":false,
+                        "hookError":hook_error})
+                );
+                let expected = error.map_or_else(
+                    || json!({"ok":true}),
+                    |message| json!({"error":message}),
+                );
+                assert_eq!(entry["outcome"], expected, "{result}");
+                assert_eq!(entry["repeated"], expected);
+                assert_eq!(entry["errors"], json!(error.into_iter().collect::<Vec<_>>()));
+                for name in ["returned", "hooks", "closes"] {
+                    assert_eq!(entry[name], json!(1), "{name}: {result}");
+                }
+                assert_eq!(entry["closed"], json!(true));
+            }
+            for (index, auto_destroy) in [true, false].into_iter().enumerate() {
+                let entry = &result["eof"][index];
+                assert_eq!(
+                    entry["beforeDestroy"],
+                    json!({"values":[1,2],"returns":0,"hooks":u8::from(auto_destroy),"closed":auto_destroy})
+                );
+                assert_eq!(entry["returns"], json!(0));
+                assert_eq!(entry["hooks"], json!(1));
+                assert_eq!(entry["closed"], json!(true));
+            }
+            assert_eq!(
+                result["idle"],
+                json!({"reads":0,"returns":1,"errors":["idle release failed"],"closed":true})
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_readable_from_cancellation_owns_pending_next_and_values() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.fromPendingOwnership = { done: false };
+                    (async () => {
+                        const { Readable } = await import('node:stream');
+                        const settle = async () => {
+                            for (let index = 0; index < 64; index++) await Promise.resolve();
+                        };
+                        const deferred = () => {
+                            let resolve, reject;
+                            const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+                            return { promise, resolve, reject };
+                        };
+                        const cases = [];
+                        for (const mode of ['ok', 'next-error', 'value-error', 'return-error', 'return-value-error', 'original-error']) {
+                            const next = deferred();
+                            const value = deferred();
+                            const returned = deferred();
+                            const returnValue = deferred();
+                            let reads = 0;
+                            let returns = 0;
+                            let hooks = 0;
+                            let hookError;
+                            let closes = 0;
+                            let ends = 0;
+                            const delivered = [];
+                            const errors = [];
+                            const source = Readable.from({
+                                [Symbol.asyncIterator]() { return this; },
+                                next() { reads++; return next.promise; },
+                                return() { returns++; return returned.promise; },
+                            }, { destroy(error, callback) {
+                                hooks++; hookError = error ? error.message : null; callback(error);
+                            } });
+                            source.on('data', chunk => delivered.push(chunk));
+                            source.on('error', error => errors.push(error.message));
+                            source.on('end', () => ends++);
+                            const closed = new Promise(resolve => source.on('close', () => { closes++; resolve(); }));
+                            await settle();
+                            source.destroy(mode === 'original-error' ? new Error('original failure') : undefined);
+                            source.destroy();
+                            await settle();
+                            const pending = { reads, returns, hooks, closed: source.closed };
+                            if (mode === 'next-error') next.reject(new Error('next failed'));
+                            else next.resolve({ done: false, value: value.promise });
+                            await settle();
+                            const afterNext = !source.closed && hooks === 0;
+                            if (mode === 'return-error' || mode === 'original-error') returned.reject(new Error('return failed'));
+                            else returned.resolve({ done: true, value: returnValue.promise });
+                            await settle();
+                            const afterReturn = !source.closed && hooks === 0;
+                            if (mode === 'value-error' || mode === 'original-error') value.reject(new Error('value failed'));
+                            else value.resolve('must not be delivered');
+                            await settle();
+                            const waitingForReturnValue = !source.closed && hooks === 0;
+                            if (mode === 'return-value-error') returnValue.reject(new Error('return value failed'));
+                            else returnValue.resolve();
+                            await closed;
+                            source.destroy();
+                            cases.push({ mode, pending, afterNext, afterReturn, waitingForReturnValue,
+                                reads, returns, hooks, hookError, closes, ends, delivered, errors,
+                                closed: source.closed });
+                        }
+                        globalThis.fromPendingOwnership = { done: true, cases };
+                    })().catch(error => { globalThis.fromPendingOwnership.error = String(error); });
+                    ",
+                )
+                .await
+                .expect("evaluate pending iterable cancellation ownership");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fromPendingOwnership").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            for (index, error) in [
+                None,
+                Some("next failed"),
+                Some("value failed"),
+                Some("return failed"),
+                Some("return value failed"),
+                Some("original failure"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let entry = &result["cases"][index];
+                assert_eq!(
+                    entry["pending"],
+                    json!({"reads":1,"returns":1,"hooks":0,"closed":false}),
+                    "{result}"
+                );
+                assert_eq!(entry["afterNext"], json!(true));
+                assert_eq!(entry["afterReturn"], json!(true));
+                assert_eq!(entry["waitingForReturnValue"], json!(!matches!(index, 3 | 5)));
+                assert_eq!(entry["hookError"], json!(error));
+                assert_eq!(entry["errors"], json!(error.into_iter().collect::<Vec<_>>()));
+                assert_eq!(entry["delivered"], json!([]));
+                assert_eq!(entry["ends"], json!(0));
+                assert_eq!(entry["closed"], json!(true));
+                for name in ["reads", "returns", "hooks", "closes"] {
+                    assert_eq!(entry[name], json!(1), "{name}: {result}");
+                }
             }
         });
     }
