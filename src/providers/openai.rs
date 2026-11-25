@@ -6332,26 +6332,47 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("fixture connection");
             socket
-                .set_read_timeout(Some(Duration::from_secs(30)))
+                .set_read_timeout(Some(Duration::from_millis(250)))
                 .expect("fixture read timeout");
             socket
                 .set_write_timeout(Some(Duration::from_secs(30)))
                 .expect("fixture write timeout");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let mut request = Vec::new();
             let mut buffer = [0_u8; 4096];
             loop {
-                let count = socket.read(&mut buffer).expect("fixture request");
-                assert!(count > 0, "client closed before the request completed");
-                request.extend_from_slice(&buffer[..count]);
-                if let Some(boundary) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                    let headers = parse_headers(&String::from_utf8_lossy(&request[..boundary]));
-                    let length = headers
-                        .get("content-length")
-                        .and_then(|length| length.parse::<usize>().ok())
-                        .unwrap_or(0);
-                    if request.len() >= boundary + 4 + length {
-                        break;
+                match socket.read(&mut buffer) {
+                    Ok(0) => panic!("client closed before the request completed"),
+                    Ok(count) => {
+                        request.extend_from_slice(&buffer[..count]);
+                        if let Some(boundary) =
+                            request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            let headers =
+                                parse_headers(&String::from_utf8_lossy(&request[..boundary]));
+                            let length = headers
+                                .get("content-length")
+                                .and_then(|length| length.parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if request.len() >= boundary + 4 + length {
+                                break;
+                            }
+                        }
                     }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for completion request"
+                        );
+                    }
+                    Err(err) => panic!("fixture request read failed: {err}"),
                 }
             }
             let response = format!(
