@@ -677,7 +677,6 @@ where
 
             match state.event_source.next().await {
                 Some(Ok(msg)) => {
-                    state.transient_error_count = 0;
                     if msg.data == "[DONE]" {
                         // Completion metadata can precede trailing item events
                         // and usage. Finalize only at the wire boundary.
@@ -697,27 +696,10 @@ where
                     }
                 }
                 Some(Err(error)) => {
-                    // Preserve the bounded retry policy for transient wire errors.
-                    const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                    if error.kind() == std::io::ErrorKind::WriteZero
-                        || error.kind() == std::io::ErrorKind::WouldBlock
-                        || error.kind() == std::io::ErrorKind::TimedOut
-                    {
-                        state.transient_error_count += 1;
-                        if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
-                            tracing::warn!(
-                                kind = ?error.kind(),
-                                count = state.transient_error_count,
-                                "Transient error in SSE stream, continuing"
-                            );
-                            continue;
-                        }
-                        tracing::warn!(
-                            kind = ?error.kind(),
-                            "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                             consecutive attempts, treating as fatal"
-                        );
-                    }
+                    // Both transports are terminal on a source error. Retrying
+                    // this read would mistake their next EOF for a clean end
+                    // and authorize buffered tools after response.completed.
+                    // Preserve the typed failure for whole-request retry.
                     return Some((Err(Error::sse(&error)), None));
                 }
                 None => {
@@ -805,6 +787,19 @@ impl<S> NdjsonStream<S> {
             ..SseEvent::default()
         }
     }
+
+    fn finish_with_error(
+        &mut self,
+        error: std::io::Error,
+    ) -> Poll<Option<std::io::Result<SseEvent>>> {
+        // A partial line cannot be completed by bytes after a failed read.
+        // Match SseStream: deliver the error once, discard undecoded input,
+        // and never poll this transport again.
+        self.finished = true;
+        self.buffer = Vec::new();
+        self.buffer_offset = 0;
+        Poll::Ready(Some(Err(error)))
+    }
 }
 
 impl<S> Stream for NdjsonStream<S>
@@ -835,15 +830,12 @@ where
                 match event {
                     Ok(Some(event)) => return Poll::Ready(Some(Ok(event))),
                     Ok(None) => continue,
-                    Err(error) => {
-                        self.finished = true;
-                        return Poll::Ready(Some(Err(error)));
-                    }
+                    Err(error) => return self.finish_with_error(error),
                 }
             }
             if unread.len() > self.max_event_bytes {
-                self.finished = true;
-                return Poll::Ready(Some(Err(self.event_too_large_error())));
+                let error = self.event_too_large_error();
+                return self.finish_with_error(error);
             }
             if chunks == MAX_NDJSON_CHUNKS_PER_POLL {
                 cx.waker().wake_by_ref();
@@ -862,13 +854,13 @@ where
                     chunks += 1;
                     self.buffer.extend_from_slice(&chunk);
                 }
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
+                Poll::Ready(Some(Err(error))) => return self.finish_with_error(error),
                 Poll::Ready(None) => {
                     self.finished = true;
                     let line = std::mem::take(&mut self.buffer);
                     match self.parse_line(&line) {
                         Ok(event) => return Poll::Ready(event.map(Ok)),
-                        Err(error) => return Poll::Ready(Some(Err(error))),
+                        Err(error) => return self.finish_with_error(error),
                     }
                 }
                 Poll::Pending => return Poll::Pending,
@@ -1129,8 +1121,6 @@ where
     orphan_tool_call_arguments: HashMap<String, String>,
     tool_identities: ToolIdentities,
     terminal_outcome: Option<ResponseOutcome>,
-    /// Consecutive WriteZero errors seen without a successful event in between.
-    transient_error_count: usize,
     /// Shared by wire reads and queued event delivery across next() calls.
     ready_work_since_yield: usize,
     /// Billing must reach the session account when it arrives, even while
@@ -1166,7 +1156,6 @@ where
             orphan_tool_call_arguments: HashMap::new(),
             tool_identities: ToolIdentities::default(),
             terminal_outcome: None,
-            transient_error_count: 0,
             ready_work_since_yield: 0,
             usage_observer: None,
         }
@@ -8524,40 +8513,127 @@ mod tests {
         }
 
         #[test]
-        fn ndjson_transient_errors_remain_bounded_and_reset_after_a_valid_frame() {
+        fn transport_errors_withhold_tools_even_after_completion_metadata() {
+            for mode in MODES {
+                for kind in [
+                    std::io::ErrorKind::WriteZero,
+                    std::io::ErrorKind::WouldBlock,
+                    std::io::ErrorKind::TimedOut,
+                    std::io::ErrorKind::ConnectionReset,
+                ] {
+                    for (completed, trailing) in [(false, true), (true, false), (true, true)] {
+                        let mut prefix = vec![text_delta("partial"), tool_done("{}")];
+                        if completed {
+                            prefix.push(completion(7, 3));
+                        }
+                        let mut chunks = vec![
+                            Ok(mode.events(&prefix)),
+                            Err(std::io::Error::new(kind, "response read failed")),
+                        ];
+                        if trailing {
+                            let mut suffix = mode.events(&[completion(99, 99)]);
+                            suffix.extend(mode.frame("[DONE]"));
+                            chunks.push(Ok(suffix));
+                        }
+                        let (mut output, observation) = observed_stream(mode, chunks, Tail::Eof);
+                        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                        runtime.block_on(async {
+                            let mut saw_partial = false;
+                            let mut saw_tool_preview = false;
+                            for _ in 0..16 {
+                                match output.next().await.expect("transport error missing") {
+                                    Ok(StreamEvent::TextDelta { delta, .. }) => {
+                                        saw_partial |= delta == "partial";
+                                    }
+                                    Ok(StreamEvent::ToolCallStart { id, .. }) => {
+                                        assert_eq!(id, "call_1");
+                                        saw_tool_preview = true;
+                                    }
+                                    Ok(StreamEvent::Start { partial }) => {
+                                        mode.assert_identity(&partial);
+                                    }
+                                    Ok(
+                                        StreamEvent::TextStart { .. }
+                                        | StreamEvent::ToolCallDelta { .. },
+                                    ) => {}
+                                    Ok(event) => panic!(
+                                        "{mode:?}/{kind:?}/{completed}/{trailing}: failed response authorized {event:?}"
+                                    ),
+                                    Err(error) => {
+                                        assert!(saw_partial && saw_tool_preview);
+                                        assert!(
+                                            error
+                                                .to_string()
+                                                .contains("SSE error: response read failed"),
+                                            "original transport failure was lost: {error}"
+                                        );
+                                        if kind == std::io::ErrorKind::TimedOut {
+                                            assert!(
+                                                error
+                                                    .to_string()
+                                                    .contains("transient connection drop")
+                                            );
+                                        }
+                                        assert_eq!(observation.polls.load(Ordering::SeqCst), 2);
+                                        assert_retired(&mut output, &observation);
+                                        return;
+                                    }
+                                }
+                            }
+                            panic!("transport failure did not retire the response");
+                        });
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn ndjson_read_error_discards_partial_frame_and_never_polls_the_source_again() {
             let mode = Mode {
                 ndjson: true,
-                codex: true,
+                codex: false,
             };
-            for recover in [false, true] {
-                let mut chunks: Vec<_> = (0..5)
-                    .map(|_| Err(std::io::Error::from(std::io::ErrorKind::TimedOut)))
-                    .collect();
-                if recover {
-                    chunks.push(Ok(mode.events(&[completion(7, 3)])));
-                    chunks.extend(
-                        (0..5).map(|_| Err(std::io::Error::from(std::io::ErrorKind::TimedOut))),
-                    );
-                    chunks.push(Ok(mode.frame("[DONE]")));
-                } else {
-                    chunks.push(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
-                    chunks.push(Ok(mode.events(&[tool_done("{}"), completion(99, 99)])));
-                }
-                let (mut output, observation) = observed_stream(mode, chunks, Tail::Pending);
+            for kind in [
+                std::io::ErrorKind::WriteZero,
+                std::io::ErrorKind::WouldBlock,
+                std::io::ErrorKind::TimedOut,
+                std::io::ErrorKind::ConnectionReset,
+            ] {
+                let observation = Arc::new(SourceObservation::default());
+                let first = text_delta("before failure").to_string();
+                let tool = mode.frame(&tool_done(r#"{"text":"must not execute"}"#).to_string());
+                let split = tool.len() / 2;
+                let mut prefix = mode.frame(&first);
+                prefix.extend_from_slice(&tool[..split]);
+                let mut suffix = tool[split..].to_vec();
+                suffix.extend(mode.events(&[completion(99, 99)]));
+                let source = ObservedSource {
+                    chunks: vec![
+                        Ok(prefix),
+                        Err(std::io::Error::new(kind, "partial frame interrupted")),
+                        Ok(suffix),
+                    ]
+                    .into(),
+                    tail: Tail::Eof,
+                    observation: Arc::clone(&observation),
+                };
+                let mut parser = NdjsonStream::new(source);
                 let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
                 runtime.block_on(async {
-                    if recover {
-                        let events = terminal_events(&mut output).await;
-                        let Some(StreamEvent::Done { message, .. }) = events.last() else {
-                            panic!("valid frame did not reset transient allowance");
-                        };
-                        assert_eq!((message.usage.input, message.usage.output), (7, 3));
-                    } else {
-                        assert!(output.next().await.expect("fatal sixth error").is_err());
-                        assert_eq!(observation.polls.load(Ordering::SeqCst), 6);
+                    let event = parser.next().await.unwrap().expect("complete prefix");
+                    assert_eq!(event.data, first);
+                    let error = parser.next().await.unwrap().expect_err("failed read");
+                    assert_eq!(error.kind(), kind);
+                    assert_eq!(error.to_string(), "partial frame interrupted");
+                    assert!(parser.buffer.is_empty(), "partial tool frame was retained");
+                    assert_eq!(parser.buffer_offset, 0);
+                    for _ in 0..3 {
+                        assert!(matches!(parser.next().now_or_never(), Some(None)));
                     }
-                    assert_retired(&mut output, &observation);
+                    assert_eq!(observation.polls.load(Ordering::SeqCst), 2);
                 });
+                drop(parser);
+                assert!(observation.dropped.load(Ordering::SeqCst));
             }
         }
 
