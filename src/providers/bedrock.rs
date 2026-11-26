@@ -1684,7 +1684,9 @@ mod tests {
         spawn_bedrock_raw_json_server(
             responses
                 .into_iter()
-                .map(|response| serde_json::to_string(&response).expect("serialize Bedrock response"))
+                .map(|response| {
+                    serde_json::to_string(&response).expect("serialize Bedrock response")
+                })
                 .collect(),
         )
     }

@@ -1601,7 +1601,8 @@ mod tests {
         }
 
         // Repeated names in distinct objects are unambiguous and remain valid.
-        let input = r#"{"left":{"path":"a"},"right":{"path":"b"},"steps":[{"path":"c"},{"path":"d"}]}"#;
+        let input =
+            r#"{"left":{"path":"a"},"right":{"path":"b"},"steps":[{"path":"c"},{"path":"d"}]}"#;
         let result = collect(vec![
             start(),
             tool_start(0, "call-a", "read"),
@@ -1617,7 +1618,10 @@ mod tests {
         let ContentBlock::ToolCall(call) = &message.content[0] else {
             panic!("expected preserved tool call");
         };
-        assert_eq!(call.arguments, serde_json::from_str::<Value>(input).unwrap());
+        assert_eq!(
+            call.arguments,
+            serde_json::from_str::<Value>(input).unwrap()
+        );
     }
 
     #[test]
