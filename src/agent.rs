@@ -8850,12 +8850,25 @@ struct AgentSessionHostActions {
 struct ExtensionAiCompletionHostState {
     provider: Arc<dyn Provider>,
     stream_options: StreamOptions,
-    models: Vec<Value>,
+    /// Lazily materialized `pi_ai_model_registry_values` view of
+    /// `compaction_models.registry` (or an explicit test-injected override).
+    /// Leaving this `None` until `list_ai_models` is actually invoked avoids
+    /// allocating thousands of `serde_json::Value` maps on every startup.
+    models: Option<Vec<Value>>,
     compaction_models: ExtensionCompactionModelState,
     compaction_privacy: Arc<StdMutex<compaction::CompactionPrivacy>>,
 }
 
 impl ExtensionAiCompletionHostState {
+    fn resolved_models(&mut self) -> &[Value] {
+        if self.models.is_none()
+            && let Some(registry) = self.compaction_models.registry.as_deref()
+        {
+            self.models = Some(pi_ai_model_registry_values(registry));
+        }
+        self.models.as_deref().unwrap_or(&[])
+    }
+
     fn refresh_provider_catalog(&mut self) -> Result<()> {
         let Some(manager) = self.compaction_models.provider_manager.upgrade() else {
             return Ok(());
@@ -8886,7 +8899,7 @@ impl ExtensionAiCompletionHostState {
         self.compaction_models.registry = Some(Arc::new(registry));
         self.compaction_models.provider_revision = Some(catalog.revision);
         self.compaction_models.js_provider_ids = catalog.stream_provider_ids;
-        self.models = models.clone();
+        self.models = None;
         manager.set_extension_models(models);
         Ok(())
     }
@@ -9536,7 +9549,8 @@ impl ExtensionHostActions for AgentSessionHostActions {
             Error::extension("extension completion host state mutex poisoned".to_string())
         })?;
         state.refresh_provider_catalog()?;
-        if state.models.is_empty()
+        let is_empty = state.resolved_models().is_empty();
+        if is_empty
             && !state.compaction_models.active_extension_model
             && state
                 .compaction_models
@@ -9553,7 +9567,7 @@ impl ExtensionHostActions for AgentSessionHostActions {
                 "provider": state.provider.name(),
             }]));
         }
-        Ok(Value::Array(state.models.clone()))
+        Ok(Value::Array(state.resolved_models().to_vec()))
     }
 
     async fn compact_session(
@@ -13672,7 +13686,7 @@ mod extensions_integration_tests {
                 ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
                     provider: Arc::new(NoopProvider),
                     stream_options: StreamOptions::default(),
-                    models: Vec::new(),
+                    models: None,
                     compaction_models: ExtensionCompactionModelState::default(),
                     compaction_privacy: Arc::new(StdMutex::new(
                         compaction::CompactionPrivacy::default(),
@@ -13742,7 +13756,7 @@ mod extensions_integration_tests {
                 ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
                     provider: Arc::new(NoopProvider),
                     stream_options: StreamOptions::default(),
-                    models: Vec::new(),
+                    models: None,
                     compaction_models: ExtensionCompactionModelState::default(),
                     compaction_privacy: Arc::new(StdMutex::new(
                         compaction::CompactionPrivacy::default(),
@@ -13940,11 +13954,11 @@ mod extensions_integration_tests {
                 ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
                     provider,
                     stream_options: StreamOptions::default(),
-                    models: vec![json!({
+                    models: Some(vec![json!({
                         "id": "capture-model",
                         "provider": "capturing-provider",
                         "api": "test-api",
-                    })],
+                    })]),
                     compaction_models: ExtensionCompactionModelState::default(),
                     compaction_privacy: Arc::new(StdMutex::new(
                         compaction::CompactionPrivacy::default(),
@@ -14039,7 +14053,7 @@ mod extensions_integration_tests {
             ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
                 provider,
                 stream_options: options,
-                models: Vec::new(),
+                models: None,
                 compaction_models: models,
                 compaction_privacy: Arc::new(StdMutex::new(
                     compaction::CompactionPrivacy::default(),
@@ -14311,7 +14325,7 @@ mod extensions_integration_tests {
                         thinking_level: Some(crate::model::ThinkingLevel::High),
                         ..StreamOptions::default()
                     },
-                    models: Vec::new(),
+                    models: None,
                     compaction_models: ExtensionCompactionModelState::default(),
                     compaction_privacy: Arc::new(StdMutex::new(
                         compaction::CompactionPrivacy::default(),
@@ -15258,6 +15272,90 @@ mod extensions_integration_tests {
         assert_eq!(session.agent.provider().name(), "capturing-provider");
     }
 
+    #[test]
+    fn set_model_registry_materializes_extension_ai_models_lazily() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let provider = Arc::new(PiAiCaptureProvider { calls });
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let first_registry =
+                ModelRegistry::from_entries_for_tests(vec![compaction_override_entry(
+                    "lazy-prov",
+                    "first-model",
+                    true,
+                )]);
+            session.set_model_registry(first_registry);
+            {
+                let state = session.extension_ai_completion.lock().unwrap();
+                assert!(
+                    state.models.is_none(),
+                    "set_model_registry must not eagerly serialize extension JSON values"
+                );
+            }
+
+            let actions = AgentSessionHostActions {
+                session: Arc::clone(&session.session),
+                injected: Arc::new(StdMutex::new(ExtensionInjectedQueue::default())),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                is_turn_active: Arc::new(AtomicBool::new(false)),
+                pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
+                ai_completion: Arc::clone(&session.extension_ai_completion),
+                provider_admission: ProviderAdmissionGate::default(),
+                session_action_admission: SessionActionAdmissionGate::default(),
+            };
+            let listed = actions.list_ai_models().await.expect("list_ai_models");
+            let listed_arr = listed.as_array().expect("models array");
+            assert_eq!(listed_arr.len(), 1);
+            assert_eq!(listed_arr[0]["id"], json!("first-model"));
+            assert!(
+                session
+                    .extension_ai_completion
+                    .lock()
+                    .unwrap()
+                    .models
+                    .is_some(),
+                "list_ai_models should cache materialized JSON values after first access"
+            );
+
+            // Replacing the registry invalidates the cached JSON view without eager rebuild.
+            let second_registry =
+                ModelRegistry::from_entries_for_tests(vec![compaction_override_entry(
+                    "lazy-prov",
+                    "second-model",
+                    true,
+                )]);
+            session.set_model_registry(second_registry);
+            assert!(
+                session
+                    .extension_ai_completion
+                    .lock()
+                    .unwrap()
+                    .models
+                    .is_none(),
+                "replacing model registry must invalidate cached JSON values lazily"
+            );
+            let updated = actions
+                .list_ai_models()
+                .await
+                .expect("list_ai_models updated");
+            let updated_arr = updated.as_array().expect("updated models array");
+            assert_eq!(updated_arr.len(), 1);
+            assert_eq!(updated_arr[0]["id"], json!("second-model"));
+        });
+    }
+
     struct NativePrivacyCapture {
         requests: Arc<StdMutex<Vec<Value>>>,
         response: Arc<StdMutex<Value>>,
@@ -15736,7 +15834,7 @@ mod extensions_integration_tests {
                 ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
                     provider,
                     stream_options: StreamOptions::default(),
-                    models: Vec::new(),
+                    models: None,
                     compaction_models: ExtensionCompactionModelState::default(),
                     compaction_privacy: Arc::new(StdMutex::new(
                         compaction::CompactionPrivacy::default(),
@@ -15884,7 +15982,7 @@ mod extensions_integration_tests {
         Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
             provider: Arc::new(NoopProvider),
             stream_options: StreamOptions::default(),
-            models: Vec::new(),
+            models: None,
             compaction_models: ExtensionCompactionModelState::default(),
             compaction_privacy: Arc::new(StdMutex::new(compaction::CompactionPrivacy::default())),
         }))
@@ -22060,7 +22158,7 @@ impl AgentSession {
         let extension_ai_completion = Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
             provider: agent.provider(),
             stream_options: agent.stream_options().clone(),
-            models: Vec::new(),
+            models: None,
             compaction_models: ExtensionCompactionModelState::default(),
             compaction_privacy: Arc::clone(&agent.compaction_privacy_state),
         }));
@@ -22208,7 +22306,6 @@ impl AgentSession {
             || self.agent.tool_call_dialect(),
             ModelEntry::tool_call_dialect,
         ));
-        self.set_extension_ai_models(pi_ai_model_registry_values(&registry));
         // Keep the extension ctx catalog in sync when the registry is
         // replaced after extension boot (e.g. after merging extension
         // providers in main). No-op before boot; boot seeds it (gh #167).
@@ -22221,6 +22318,7 @@ impl AgentSession {
             registry.extension_manages_model(provider.name(), provider.model_id());
         self.model_registry = Some(Arc::new(registry));
         if let Ok(mut state) = self.extension_ai_completion.lock() {
+            state.models = None;
             state.compaction_models.registry = self.model_registry.clone();
             state.compaction_models.provider_revision = None;
             state.compaction_models.active_extension_model |= extension_model;
@@ -22446,11 +22544,7 @@ impl AgentSession {
         }
         state.provider = provider;
         state.stream_options = self.agent.stream_options().clone();
-        state.models = self
-            .model_registry
-            .as_deref()
-            .map(pi_ai_model_registry_values)
-            .unwrap_or_default();
+        state.models = None;
         state.compaction_models.registry = self.model_registry.clone();
         // Bind a candidate to its own manager before any factory hostcall.
         // Disable uses no manager, so retained retired handles cannot refresh it.
@@ -22592,16 +22686,6 @@ impl AgentSession {
         models
             .recovery_cli_api_key
             .clone_from(&self.recovery_cli_api_key);
-    }
-
-    fn set_extension_ai_models(&self, models: Vec<Value>) {
-        let Ok(mut state) = self.extension_ai_completion.lock() else {
-            tracing::error!(
-                "extension completion host state mutex poisoned; keeping stale model catalog"
-            );
-            return;
-        };
-        state.models = models;
     }
 
     pub fn set_semantic_context_bundle(
@@ -22849,7 +22933,7 @@ impl AgentSession {
             registry = Some(Arc::clone(live_registry));
             if admit {
                 let models = pi_ai_model_registry_values(live_registry);
-                state.models = models.clone();
+                state.models = None;
                 region.manager().set_extension_models(models);
             }
         }
@@ -26611,7 +26695,7 @@ impl AgentSession {
         let mut hook_registry = self.model_registry.as_deref().cloned().unwrap_or_default();
         hook_registry.merge_extension_registry(&catalog.bindings, catalog.entries)?;
         let hook_models = pi_ai_model_registry_values(&hook_registry);
-        manager.set_extension_models(hook_models.clone());
+        manager.set_extension_models(hook_models);
         {
             let mut state = candidate_ai_completion
                 .lock()
@@ -26620,7 +26704,7 @@ impl AgentSession {
             state.compaction_models.provider_manager = manager.handle();
             state.compaction_models.provider_revision = Some(catalog.revision);
             state.compaction_models.js_provider_ids = catalog.stream_provider_ids;
-            state.models = hook_models;
+            state.models = None;
         }
 
         // Fire the `startup` lifecycle hook once extensions are loaded.

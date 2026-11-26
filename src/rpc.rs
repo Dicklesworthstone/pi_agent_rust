@@ -3709,21 +3709,30 @@ async fn run_with_input(
     let mut service_registry = RpcServiceRegistryGuard(Some(session.agent.service_owner("")));
     // The available list can omit unready declared providers. Retain the full
     // catalog and admit option-only entries without replacing registry routes.
-    let mut model_registry = session.model_registry().cloned();
-    if model_registry.is_none()
-        && let Some(region) = &session.extensions
-    {
-        // A host without a registry may supply its initial extension rows in
-        // options. Mark those rows as extension-owned before admitting the
-        // remaining host-only entries, so an unload can still retire them.
-        let registry = model_registry.get_or_insert_with(crate::models::ModelRegistry::default);
-        if let Some(catalog) = region.manager().extension_provider_catalog(None)? {
-            registry.merge_extension_registry(&catalog.bindings, catalog.entries)?;
+    // Skip cloning and re-installing the registry when every option entry is
+    // already present (the common CLI startup path).
+    let needs_extension_bootstrap =
+        session.model_registry().is_none() && session.extensions.is_some();
+    let needs_available_merge = session
+        .model_registry()
+        .is_some_and(|registry| registry.has_missing_entries(&options.available_models));
+    if needs_extension_bootstrap || needs_available_merge {
+        let mut model_registry = session.model_registry().cloned();
+        if model_registry.is_none()
+            && let Some(region) = &session.extensions
+        {
+            // A host without a registry may supply its initial extension rows in
+            // options. Mark those rows as extension-owned before admitting the
+            // remaining host-only entries, so an unload can still retire them.
+            let registry = model_registry.get_or_insert_with(crate::models::ModelRegistry::default);
+            if let Some(catalog) = region.manager().extension_provider_catalog(None)? {
+                registry.merge_extension_registry(&catalog.bindings, catalog.entries)?;
+            }
         }
-    }
-    if let Some(mut registry) = model_registry {
-        registry.merge_missing_entries(options.available_models.clone());
-        session.set_model_registry(registry);
+        if let Some(mut registry) = model_registry {
+            registry.merge_missing_entries(options.available_models.clone());
+            session.set_model_registry(registry);
+        }
     }
     // Refresh extension registrations without acquiring the outer session lock
     // held by a streaming turn. Unchanged generations reuse their catalog Arc.

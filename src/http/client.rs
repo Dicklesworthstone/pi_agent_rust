@@ -236,20 +236,19 @@ pub(crate) trait HttpTransport: std::fmt::Debug + Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    tls: std::result::Result<TlsConnector, String>,
     user_agent: String,
     vcr: Option<VcrRecorder>,
     transport: Option<Arc<dyn HttpTransport>>,
 }
 
-/// Process-global cache of the built TLS connector.
+/// Process-global cache of the built TLS connector, initialized lazily on the
+/// first HTTPS connection.
 ///
-/// Building the connector pulls in the root trust store, which is the single
-/// most expensive part of constructing a [`Client`]. `Client::new()` is called
-/// from many hot paths (every provider constructor, the version check, etc.),
-/// so without caching each call rebuilt the trust store from scratch. We now
-/// build the connector once per process and clone it (`TlsConnector` is cheap
-/// to clone) on every subsequent call. See pi_agent_rust#101.
+/// Building the connector pulls in the root trust store (~2+ MiB heap and
+/// startup CPU), which was previously paid eagerly inside every [`Client::new`]
+/// even for idle RPC/TUI startups, plain HTTP endpoints, and VCR/mock runs.
+/// Caching it behind `OnceLock` and deferring construction until `connect_tls`
+/// avoids both repeated rebuilds (pi_agent_rust#101) and idle-startup cost.
 ///
 /// The `Err` variant carries the build error as a `String` so a transient or
 /// configuration failure is still observed identically on every call.
@@ -332,15 +331,12 @@ fn shared_tls_connector() -> std::result::Result<TlsConnector, String> {
 impl Client {
     #[must_use]
     pub fn new() -> Self {
-        let tls = shared_tls_connector();
-
         let user_agent = std::env::var(ANTIGRAVITY_VERSION_ENV).map_or_else(
             |_| DEFAULT_USER_AGENT.to_string(),
             |v| format!("{DEFAULT_USER_AGENT} Antigravity/{v}"),
         );
 
         Self {
-            tls,
             user_agent,
             vcr: None,
             transport: None,
@@ -719,7 +715,7 @@ async fn send_parts_with_proxy(
     Vec<(String, String)>,
     BoxStream<'static, std::io::Result<Vec<u8>>>,
 )> {
-    let mut transport = connect_transport(parsed, client, proxy).await?;
+    let mut transport = connect_transport(parsed, proxy).await?;
 
     let request_bytes =
         build_request_bytes(method, parsed, &client.user_agent, headers, body, proxy);
@@ -1023,7 +1019,6 @@ struct ConnectAttemptError {
 /// closes the socket.
 async fn connect_transport_once(
     parsed: &ParsedUrl,
-    client: &Client,
     proxy: Option<&ProxyEndpoint>,
 ) -> std::result::Result<Transport, ConnectAttemptError> {
     // With a proxy the TCP hop terminates at the proxy; destination DNS and
@@ -1054,7 +1049,7 @@ async fn connect_transport_once(
         if proxy.uses_tls() {
             // Authenticate the proxy before transmitting any credentials or
             // origin metadata. A failed first hop never retries in plaintext.
-            transport = connect_tls(client, &proxy.host, transport, "proxy").await?;
+            transport = connect_tls(&proxy.host, transport, "proxy").await?;
         }
         if matches!(parsed.scheme, Scheme::Https) {
             transport = proxy_connect_tunnel(transport, parsed, proxy)
@@ -1069,22 +1064,20 @@ async fn connect_transport_once(
         Scheme::Http => Ok(transport),
         // This handshake authenticates the origin independently, even when
         // the CONNECT tunnel already rides inside a proxy TLS connection.
-        Scheme::Https => connect_tls(client, &parsed.host, transport, "origin").await,
+        Scheme::Https => connect_tls(&parsed.host, transport, "origin").await,
     }
 }
 
 async fn connect_tls(
-    client: &Client,
     host: &str,
     transport: Transport,
     peer: &str,
 ) -> std::result::Result<Transport, ConnectAttemptError> {
-    let tls = client.tls.as_ref().map_err(|error| ConnectAttemptError {
+    let tls = shared_tls_connector().map_err(|error| ConnectAttemptError {
         error: Error::api(format!("TLS configuration error: {error}")),
         retryable_not_connected: false,
     })?;
     let stream = tls
-        .clone()
         .connect(host, transport)
         .await
         .map_err(|error| ConnectAttemptError {
@@ -1094,16 +1087,12 @@ async fn connect_tls(
     Ok(Transport::Tls(Box::new(stream)))
 }
 
-async fn connect_transport(
-    parsed: &ParsedUrl,
-    client: &Client,
-    proxy: Option<&ProxyEndpoint>,
-) -> Result<Transport> {
+async fn connect_transport(parsed: &ParsedUrl, proxy: Option<&ProxyEndpoint>) -> Result<Transport> {
     use asupersync::time::{sleep, wall_now};
 
     let mut backoffs = NOT_CONNECTED_RETRY_BACKOFFS.iter();
     loop {
-        let failure = match connect_transport_once(parsed, client, proxy).await {
+        let failure = match connect_transport_once(parsed, proxy).await {
             Ok(transport) => return Ok(transport),
             Err(failure) => failure,
         };

@@ -2340,6 +2340,38 @@ impl ModelRegistry {
 
     /// Admit a supplied catalog without replacing existing routes or metadata.
     /// Declared provider IDs stay distinct even when they are built-in aliases.
+    pub(crate) fn has_missing_entries(&self, entries: &[ModelEntry]) -> bool {
+        if entries.is_empty() {
+            return false;
+        }
+        let key = |entry: &ModelEntry| {
+            (
+                entry.model.provider.trim().to_ascii_lowercase(),
+                entry.model.id.trim().to_ascii_lowercase(),
+            )
+        };
+        let present: HashSet<_> = self.models.iter().map(key).collect();
+        let live_providers: Option<HashSet<_>> =
+            (!self.extension_provider_names.is_empty()).then(|| {
+                self.models
+                    .iter()
+                    .map(|entry| extension_provider_key(&entry.model.provider))
+                    .collect()
+            });
+        entries.iter().any(|entry| {
+            if let Some(live_providers) = &live_providers {
+                let provider = extension_provider_key(&entry.model.provider);
+                if self.extension_provider_names.contains(&provider)
+                    && !self.active_extension_provider_names.contains(&provider)
+                    && !live_providers.contains(&provider)
+                {
+                    return false;
+                }
+            }
+            !present.contains(&key(entry))
+        })
+    }
+
     pub(crate) fn merge_missing_entries(&mut self, entries: Vec<ModelEntry>) {
         let key = |entry: &ModelEntry| {
             (
@@ -8186,6 +8218,10 @@ mod tests {
                 .resolve("openai", "unlisted-native-model")
                 .is_some()
         );
+        assert!(
+            !registry.has_missing_entries(&[extension.clone()]),
+            "retired extension namespace must not be flagged as missing"
+        );
         registry.merge_missing_entries(vec![extension.clone()]);
         assert!(registry.find("open-router", "shared").is_none());
 
@@ -8200,8 +8236,16 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        registry.merge_missing_entries(vec![extension]);
+        assert!(
+            registry.has_missing_entries(&[extension.clone()]),
+            "missing entry under an active extension provider must be flagged"
+        );
+        registry.merge_missing_entries(vec![extension.clone()]);
         assert!(registry.find("open-router", "shared").is_some());
+        assert!(
+            !registry.has_missing_entries(&[extension]),
+            "already-present entry must not be flagged as missing"
+        );
     }
 
     #[test]
@@ -12009,6 +12053,58 @@ mod tests {
         fs::write(&path, r#"{"anthropic":["b"]}"#).expect("write v2");
         let fp_v2 = user_model_overrides_fingerprint_at(&path);
         assert_ne!(fp_v1, fp_v2, "fingerprint must change when content changes");
+    }
+
+    #[test]
+    fn has_missing_entries_matches_merge_missing_entries_contract() {
+        let mk_entry = |provider: &str, id: &str| ModelEntry {
+            model: Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: "openai-completions".to_string(),
+                provider: provider.to_string(),
+                base_url: "https://example.invalid/v1".to_string(),
+                reasoning: false,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    audio: None,
+                },
+                context_window: 128_000,
+                max_tokens: 4096,
+                headers: HashMap::new(),
+            },
+            api_key: None,
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        };
+
+        let existing = mk_entry("openai", "gpt-4o");
+        let case_alias = mk_entry(" OpenAI ", " GPT-4O ");
+        let fresh = mk_entry("openai", "gpt-5-new");
+        let retired = mk_entry("ext-retired", "ghost-model");
+
+        let mut registry = ModelRegistry::from_entries_for_tests(vec![existing.clone()]);
+        assert!(!registry.has_missing_entries(&[]));
+        assert!(!registry.has_missing_entries(&[existing.clone(), case_alias]));
+        assert!(registry.has_missing_entries(&[existing, fresh.clone()]));
+
+        registry.merge_missing_entries(vec![fresh.clone()]);
+        assert!(!registry.has_missing_entries(&[fresh]));
+
+        // Retired extension provider namespaces are ignored by both methods.
+        registry
+            .extension_provider_names
+            .insert(extension_provider_key("ext-retired"));
+        assert!(!registry.has_missing_entries(std::slice::from_ref(&retired)));
+        let before = registry.models().len();
+        registry.merge_missing_entries(vec![retired]);
+        assert_eq!(registry.models().len(), before);
     }
 
     mod max_thinking_level {

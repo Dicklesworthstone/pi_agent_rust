@@ -3230,39 +3230,6 @@ async fn run(
             )));
     }
 
-    // The /btw side-question client (bd-cv653.3.16): bound to the smol
-    // role when it resolves AND credentials exist; interactive-only.
-    let btw_client =
-        pi::app::resolve_role_model(pi::models::ModelRole::Smol, &cli, &config, &model_registry)
-            .and_then(|resolution| {
-                pi::btw::BtwClient::for_model_entry(
-                    &resolution.model_entry,
-                    &selection.model_entry,
-                    cli.api_key.as_deref(),
-                    &auth,
-                    config.secrets.as_ref(),
-                )
-            });
-    // Rebinding factory (bd-9jgrt): lets `/model smol <spec>` rebuild the
-    // /btw client mid-session against fresh on-disk credentials.
-    let btw_api_key = cli.api_key.clone();
-    let btw_primary_entry = selection.model_entry.clone();
-    let btw_secrets_settings = config.secrets.clone();
-    let btw_cwd = cwd.clone();
-    let btw_factory: pi::btw::BtwClientFactory = std::sync::Arc::new(move |entry| {
-        let Ok(mut auth) = pi::auth::AuthStorage::load(pi::config::Config::auth_path()) else {
-            return None;
-        };
-        auth.set_command_working_directory(&btw_cwd).ok()?;
-        pi::btw::BtwClient::for_model_entry(
-            entry,
-            &btw_primary_entry,
-            btw_api_key.as_deref(),
-            &auth,
-            btw_secrets_settings.as_ref(),
-        )
-    });
-
     // MCP client (bd-cv653.6.1): discover server configs (CLI > .pi >
     // .agents > global > foreign), eagerly connect already-acknowledged
     // servers under a bounded global budget, and mount their tools as
@@ -3644,6 +3611,42 @@ async fn run(
             auth.clone(),
             cli.api_key.clone(),
         );
+        // The /btw side-question client (bd-cv653.3.16): bound to the smol
+        // role when it resolves AND credentials exist; interactive-only.
+        let btw_client = pi::app::resolve_role_model(
+            pi::models::ModelRole::Smol,
+            &cli,
+            &config,
+            &model_registry,
+        )
+        .and_then(|resolution| {
+            pi::btw::BtwClient::for_model_entry(
+                &resolution.model_entry,
+                &selection.model_entry,
+                cli.api_key.as_deref(),
+                &auth,
+                config.secrets.as_ref(),
+            )
+        });
+        // Rebinding factory (bd-9jgrt): lets `/model smol <spec>` rebuild the
+        // /btw client mid-session against fresh on-disk credentials.
+        let btw_api_key = cli.api_key.clone();
+        let btw_primary_entry = selection.model_entry.clone();
+        let btw_secrets_settings = config.secrets.clone();
+        let btw_cwd = cwd.clone();
+        let btw_factory: pi::btw::BtwClientFactory = std::sync::Arc::new(move |entry| {
+            let Ok(mut auth) = pi::auth::AuthStorage::load(pi::config::Config::auth_path()) else {
+                return None;
+            };
+            auth.set_command_working_directory(&btw_cwd).ok()?;
+            pi::btw::BtwClient::for_model_entry(
+                entry,
+                &btw_primary_entry,
+                btw_api_key.as_deref(),
+                &auth,
+                btw_secrets_settings.as_ref(),
+            )
+        });
 
         // Preserve launch role assignments in the classic command surface.
         // This is an in-memory view; command overrides never rewrite settings.
