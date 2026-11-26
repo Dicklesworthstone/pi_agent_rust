@@ -2826,6 +2826,22 @@ fn rpc_error_from_response(response: &Value, command: &str) -> Error {
         .get("error")
         .and_then(Value::as_str)
         .unwrap_or("RPC command failed");
+    // The server sends the displayed Session error, including this stable
+    // marker. Match it only at the start so provider text quoting a previous
+    // failure cannot change the classification of the current request.
+    let message = error.strip_prefix("Session error: ").unwrap_or(error);
+    if let Some(detail) = message.strip_prefix(Error::SESSION_PERSISTENCE_PREFIX) {
+        return Error::session_persistence(format!("RPC {command} failed: {detail}"));
+    }
+    if response.get("errorCode").and_then(Value::as_str) == Some("cost_cap")
+        && let Some(cap) = response.get("costCap")
+        && let Some(spent) = cap.get("spent").and_then(Value::as_f64)
+        && let Some(limit) = cap.get("cap").and_then(Value::as_f64)
+        && spent >= 0.0
+        && limit >= 0.0
+    {
+        return Error::CostCap { spent, cap: limit };
+    }
     Error::api(format!("RPC {command} failed: {error}"))
 }
 

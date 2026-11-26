@@ -440,7 +440,7 @@ printf '{"type":"response","id":"rpc-2","command":"get_state","success":true,"da
 IFS= read -r -t 10 request || exit 1
 printf '{"type":"agent_start","sessionId":"not-admitted"}\n'
 printf '{"type":"agent_end","messages":[]}\n'
-printf '{"type":"response","id":"rpc-1","command":"prompt","success":false,"error":"fixture refusal"}\n'
+printf '{"type":"response","id":"rpc-1","command":"prompt","success":false,"error":"Session error: [SESSION_PERSISTENCE_FAILED] save failed"}\n'
 IFS= read -r -t 10 probe || exit 1
 printf '{"type":"response","id":"rpc-2","command":"get_state","success":true,"data":{"alive":true}}\n'
 "#,
@@ -452,11 +452,36 @@ printf '{"type":"response","id":"rpc-2","command":"get_state","success":true,"da
             |_| panic!("a failed acknowledgement must not expose speculative events"),
         ))
         .expect_err("server refusal");
-        assert!(error.to_string().contains("fixture refusal"));
+        assert!(error.is_session_persistence());
+        assert!(error.to_string().contains("save failed"));
         let state =
             futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
                 .expect("acknowledged refusal preserves the connection");
         assert_eq!(state, json!({"alive":true}));
+        client.shutdown().expect("shutdown refusal fixture");
+    }
+
+    #[test]
+    fn request_preserves_cost_cap_and_leaves_unrelated_refusals_generic() {
+        let mut client = client(
+            r#"
+IFS= read -r -t 10 request || exit 1
+printf '%s\n' '{"type":"response","id":"rpc-1","command":"compact","success":false,"errorCode":"cost_cap","costCap":{"spent":5.5,"cap":5.0},"error":"budget exhausted"}'
+IFS= read -r -t 10 request || exit 1
+printf '%s\n' '{"type":"response","id":"rpc-2","command":"compact","success":false,"error":"Provider error: upstream quoted [SESSION_PERSISTENCE_FAILED] in output"}'
+IFS= read -r -t 10 request || exit 1
+printf '%s\n' '{"type":"response","id":"rpc-3","command":"compact","success":false,"errorCode":"cost_cap","costCap":{"cap":5.0},"error":"malformed refusal"}'
+"#,
+        );
+        let cap = futures::executor::block_on(client.compact()).expect_err("cost cap");
+        let sdk::Error::CostCap { spent, cap } = cap else {
+            panic!("expected a typed cost refusal");
+        };
+        assert_eq!((spent, cap), (5.5, 5.0));
+        for diagnostic in ["upstream quoted", "malformed refusal"] {
+            let error = futures::executor::block_on(client.compact()).expect_err("API refusal");
+            assert!(matches!(error, sdk::Error::Api(message) if message.contains(diagnostic)));
+        }
         client.shutdown().expect("shutdown refusal fixture");
     }
 

@@ -923,7 +923,10 @@ truncated frames, or transport failure. Reconnect before making another request;
 an interrupted exchange cannot safely donate its delayed response or terminal
 events to the next operation. The SDK does not replay interrupted operations,
 whose tool effects may already have happened. A well-formed server refusal
-completes that request and leaves the connection usable.
+completes that request and leaves the connection usable. For a rejected command
+or prompt acknowledgement, `Error::is_session_persistence()` identifies an
+indeterminate save. Reconcile the session before starting another turn.
+A structured budget refusal returns `Error::CostCap { spent, cap }`.
 
 To abort a turn while keeping its session and connection, keep polling the prompt
 future and send `RpcControlHandle::abort()` instead. Continue consuming through
