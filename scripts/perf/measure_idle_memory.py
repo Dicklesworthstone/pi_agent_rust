@@ -106,7 +106,10 @@ def rss_linux(pid: int) -> int | None:
         if line.startswith("VmRSS:"):
             parts = line.split()
             if len(parts) >= 2:
-                return int(parts[1]) * 1024
+                try:
+                    return int(parts[1]) * 1024
+                except ValueError:
+                    return None
     return None
 
 
@@ -116,7 +119,7 @@ def rss_macos(pid: int) -> int | None:
             ["ps", "-o", "rss=", "-p", str(pid)], text=True, timeout=2.0
         ).strip()
         return int(out) * 1024
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
         return None
 
 
@@ -185,7 +188,12 @@ def collect_bench_env(source_commit: str) -> tuple[dict[str, Any], str]:
     if meminfo:
         for line in meminfo.splitlines():
             if line.startswith("MemTotal:"):
-                mem_total_mb = int(line.split()[1]) // 1024
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        mem_total_mb = int(parts[1]) // 1024
+                    except ValueError:
+                        mem_total_mb = 0
                 break
     if mem_total_mb == 0:
         try:
@@ -358,6 +366,7 @@ def run_self_test() -> int:
             assert run_cli(["--binary", str(fake_pi), "--samples", "4", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
             assert run_cli(["--binary", str(fake_pi), "--settle-ms", "50", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
             assert run_cli(["--binary", str(fake_pi), "--run-id", "a", "--correlation-id", "b", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
+            assert run_cli(["--binary", str(fake_pi), "--run-id", "   ", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
             assert run_cli(["--binary", str(fake_pi), "--out", str(neg_out), "--source-commit", "0" * 40]) == 1
             assert run_cli(["--binary", str(fake_pi), "--idle-state", "   ", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
             early_exit = root / "target/release/early_pi"
@@ -396,9 +405,17 @@ def run_cli(argv: list[str] | None = None) -> int:
     if args.self_test:
         return run_self_test()
 
-    if args.run_id and args.correlation_id and args.run_id != args.correlation_id:
+    if args.run_id is not None and not args.run_id.strip():
+        print("FAIL: --run-id must be non-empty when specified", file=sys.stderr)
+        return 1
+    if args.correlation_id is not None and not args.correlation_id.strip():
+        print("FAIL: --correlation-id must be non-empty when specified", file=sys.stderr)
+        return 1
+    explicit_run_id = args.run_id.strip() if args.run_id is not None else None
+    explicit_corr_id = args.correlation_id.strip() if args.correlation_id is not None else None
+    if explicit_run_id and explicit_corr_id and explicit_run_id != explicit_corr_id:
         print(
-            f"FAIL: --run-id ({args.run_id!r}) and --correlation-id ({args.correlation_id!r}) must match",
+            f"FAIL: --run-id ({explicit_run_id!r}) and --correlation-id ({explicit_corr_id!r}) must match",
             file=sys.stderr,
         )
         return 1
@@ -452,8 +469,8 @@ def run_cli(argv: list[str] | None = None) -> int:
         )
 
     default_id = f"idle-rss-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-    run_id = args.run_id or args.correlation_id or default_id
-    correlation_id = args.correlation_id or run_id
+    run_id = explicit_run_id or explicit_corr_id or default_id
+    correlation_id = explicit_corr_id or run_id
 
     samples: list[dict[str, Any]] = []
     seen_pids: set[int] = set()

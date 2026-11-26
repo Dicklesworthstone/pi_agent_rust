@@ -664,17 +664,41 @@ fi
 
 if [[ "$RUN_RUST" -eq 1 ]]; then
     echo "[tool-concurrency-soak] Phase 2: Parameterized Rust concurrency soak (soak_sustained_tool_concurrency_extended)"
-    declare -a RUNNER=(cargo)
+    USE_RCH=0
     if [[ "$CARGO_RUNNER" == "rch" ]] || { [[ "$CARGO_RUNNER" == "auto" ]] && command -v rch >/dev/null 2>&1 && rch check --quiet >/dev/null 2>&1; }; then
-        RUNNER=(rch exec -- cargo)
+        USE_RCH=1
     fi
-    if ! PI_CONCURRENCY_WAVES="$WAVES" \
-         PI_CONCURRENCY_PARALLEL_READS="$PARALLEL_READS" \
-         PI_CONCURRENCY_HOSTCALL_BURST="$HOSTCALL_BURST" \
-         PI_SOAK_MAX_SECS="$MAX_SECS" \
-         PI_SOAK_ARTIFACT_DIR="$ARTIFACT_DIR" \
-         "${RUNNER[@]}" test --locked --test e2e_soak_stability soak_sustained_tool_concurrency_extended -- --ignored --nocapture; then
-        OVERALL_RC=1
+    if [[ "$USE_RCH" -eq 1 ]]; then
+        JOBS="${CARGO_BUILD_JOBS:-2}"
+        if ! RCH_BUILD_TIMEOUT_SEC="${RCH_BUILD_TIMEOUT_SEC:-3600}" \
+             RCH_TEST_TIMEOUT_SEC="${RCH_TEST_TIMEOUT_SEC:-3600}" \
+             CARGO_BUILD_JOBS="$JOBS" \
+             rch exec --base HEAD --clean-overlay --no-overlay -- \
+             env \
+             TMPDIR=/tmp \
+             CARGO_INCREMENTAL=0 \
+             CARGO_PROFILE_DEV_DEBUG=0 \
+             CARGO_PROFILE_DEV_STRIP=symbols \
+             CARGO_PROFILE_TEST_DEBUG=0 \
+             CARGO_PROFILE_TEST_STRIP=symbols \
+             PI_CONCURRENCY_WAVES="$WAVES" \
+             PI_CONCURRENCY_PARALLEL_READS="$PARALLEL_READS" \
+             PI_CONCURRENCY_HOSTCALL_BURST="$HOSTCALL_BURST" \
+             PI_SOAK_MAX_SECS="$MAX_SECS" \
+             cargo test -j "$JOBS" --locked --test e2e_soak_stability soak_sustained_tool_concurrency_extended -- --ignored --nocapture \
+             2>&1 | tee "$ARTIFACT_DIR/rust_soak.log"; then
+            OVERALL_RC=1
+        fi
+    else
+        if ! PI_CONCURRENCY_WAVES="$WAVES" \
+             PI_CONCURRENCY_PARALLEL_READS="$PARALLEL_READS" \
+             PI_CONCURRENCY_HOSTCALL_BURST="$HOSTCALL_BURST" \
+             PI_SOAK_MAX_SECS="$MAX_SECS" \
+             PI_SOAK_ARTIFACT_DIR="$ARTIFACT_DIR" \
+             cargo test --locked --test e2e_soak_stability soak_sustained_tool_concurrency_extended -- --ignored --nocapture \
+             2>&1 | tee "$ARTIFACT_DIR/rust_soak.log"; then
+            OVERALL_RC=1
+        fi
     fi
 fi
 

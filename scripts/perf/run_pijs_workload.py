@@ -62,13 +62,16 @@ REQUIRED_RECORD_FIELDS = (
     "calls_per_sec",
     "build_profile",
     "build_profile_verified",
+    "build_fingerprint_contract",
     "build_fingerprint_verified",
+    "executable_build_profile",
     "executable_profile_verified",
     "compiled_profile_family",
     "compiled_opt_level",
     "compiled_debug",
     "compiled_features",
     "debug_assertions",
+    "config_hash",
     "allocator_requested",
     "allocator_request_source",
     "allocator_effective",
@@ -253,6 +256,24 @@ def validate_lane_record(
             errors.append(
                 f"build_profile must equal 'perf' for regression-gate eligibility, got {record['build_profile']!r}"
             )
+        if record["build_fingerprint_contract"] != "cargo_build_fingerprint.v1":
+            errors.append(
+                "build_fingerprint_contract must equal 'cargo_build_fingerprint.v1', "
+                f"got {record['build_fingerprint_contract']!r}"
+            )
+        if record["executable_build_profile"] != "perf":
+            errors.append(
+                f"executable_build_profile must equal 'perf', got {record['executable_build_profile']!r}"
+            )
+        config_hash = str(record["config_hash"]).strip()
+        if (
+            len(config_hash) != 64
+            or any(ch not in "0123456789abcdef" for ch in config_hash)
+            or all(ch == "0" for ch in config_hash)
+        ):
+            errors.append(
+                f"config_hash must be a 64-char lowercase non-zero hex SHA-256, got {config_hash!r}"
+            )
         if record["confidence"] != "high":
             errors.append(
                 f"confidence must equal 'high' for regression-gate evidence, got {record['confidence']!r}"
@@ -436,13 +457,16 @@ def run_self_test() -> int:
                 "  'calls_per_sec': (total * 1_000_000) // elapsed_us,\n"
                 "  'build_profile': 'perf',\n"
                 "  'build_profile_verified': True,\n"
+                "  'build_fingerprint_contract': 'cargo_build_fingerprint.v1',\n"
                 "  'build_fingerprint_verified': True,\n"
+                "  'executable_build_profile': 'perf',\n"
                 "  'executable_profile_verified': True,\n"
                 "  'compiled_profile_family': 'release',\n"
                 "  'compiled_opt_level': '3',\n"
                 "  'compiled_debug': 'true',\n"
                 "  'compiled_features': ['clipboard', 'image', 'image-resize', 'sqlite-sessions', 'wasm-host'],\n"
                 "  'debug_assertions': False,\n"
+                "  'config_hash': '0' * 64 if os.environ.get('BAD_CONFIG_HASH', '0') == '1' else 'b' * 64,\n"
                 "  'allocator_requested': os.environ['PI_BENCH_ALLOCATOR'],\n"
                 "  'allocator_request_source': 'env',\n"
                 "  'allocator_effective': os.environ['PI_BENCH_ALLOCATOR'],\n"
@@ -524,10 +548,32 @@ def run_self_test() -> int:
                 else:
                     os.environ["TAMPER_SHA"] = old_tamper
             assert rc == 1, f"expected rc=1 for tampered binary_sha256, got {rc}"
+            old_cfg_hash = os.environ.get("BAD_CONFIG_HASH")
+            os.environ["BAD_CONFIG_HASH"] = "1"
+            try:
+                rc = run_cli(
+                    [
+                        "--workdir",
+                        str(root),
+                        "--binary",
+                        str(fake_bin),
+                        "--out",
+                        str(bad_out),
+                        "--run-id",
+                        "selftest-run-4",
+                    ]
+                )
+            finally:
+                if old_cfg_hash is None:
+                    os.environ.pop("BAD_CONFIG_HASH", None)
+                else:
+                    os.environ["BAD_CONFIG_HASH"] = old_cfg_hash
+            assert rc == 1, f"expected rc=1 for zeroed config_hash, got {rc}"
             assert run_cli(["--binary", str(fake_bin), "--iterations", "0", "--out", str(bad_out)]) == 1
             assert run_cli(["--binary", str(fake_bin), "--iterations", "10", "--out", str(bad_out)]) == 1
             assert run_cli(["--binary", str(fake_bin), "--allocator", "jemalloc", "--out", str(bad_out)]) == 1
             assert run_cli(["--binary", str(fake_bin), "--run-id", "a", "--correlation-id", "b", "--out", str(bad_out)]) == 1
+            assert run_cli(["--binary", str(fake_bin), "--run-id", "   ", "--out", str(bad_out)]) == 1
             assert not bad_out.exists()
     finally:
         if old_target is not None:
@@ -587,9 +633,17 @@ def run_cli(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    if args.run_id and args.correlation_id and args.run_id != args.correlation_id:
+    if args.run_id is not None and not args.run_id.strip():
+        print("FAIL: --run-id must be non-empty when specified", file=sys.stderr)
+        return 1
+    if args.correlation_id is not None and not args.correlation_id.strip():
+        print("FAIL: --correlation-id must be non-empty when specified", file=sys.stderr)
+        return 1
+    explicit_run_id = args.run_id.strip() if args.run_id is not None else None
+    explicit_corr_id = args.correlation_id.strip() if args.correlation_id is not None else None
+    if explicit_run_id and explicit_corr_id and explicit_run_id != explicit_corr_id:
         print(
-            f"FAIL: --run-id ({args.run_id!r}) and --correlation-id ({args.correlation_id!r}) must match",
+            f"FAIL: --run-id ({explicit_run_id!r}) and --correlation-id ({explicit_corr_id!r}) must match",
             file=sys.stderr,
         )
         return 1
@@ -607,8 +661,8 @@ def run_cli(argv: list[str] | None = None) -> int:
         return 2
 
     default_id = f"pijs-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-    run_id = args.run_id or args.correlation_id or default_id
-    correlation_id = args.correlation_id or run_id
+    run_id = explicit_run_id or explicit_corr_id or default_id
+    correlation_id = explicit_corr_id or run_id
     expected_binary_sha256 = sha256_file(binary)
 
     records: list[dict[str, Any]] = []

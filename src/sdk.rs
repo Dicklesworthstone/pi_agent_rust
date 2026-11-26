@@ -2684,9 +2684,9 @@ impl RpcTransportClient {
                 .try_send(RpcWriteRequest { encoded, completed })
                 .map_err(|_| Error::api("RPC subprocess writer is unavailable"))?;
         }
-        completion
-            .await
-            .map_err(|_| Error::api("RPC subprocess writer stopped before completing the frame"))??;
+        completion.await.map_err(|_| {
+            Error::api("RPC subprocess writer stopped before completing the frame")
+        })??;
         Ok(operation)
     }
 

@@ -4,10 +4,11 @@
 Canonical release binary-size measurement control
 (`src/perf_build.rs::BinarySizeMeasurementControl`, `#[serde(deny_unknown_fields)]`).
 
-Inspects an existing release `pi` binary (or builds with `--build` when
-explicitly requested), verifies that the binary is stripped, and atomically
-writes the exact 15-field `pi.perf.binary_size_measurement.v1` control artifact
-consumed by `src/perf_build.rs::verify_binary_size_measurement_control`.
+Inspects an existing release `pi` binary (passing `--no-build`), or builds
+`cargo build --locked --bin pi --release` by default, verifies that the binary
+is stripped, and atomically writes the exact 15-field
+`pi.perf.binary_size_measurement.v1` control artifact consumed by
+`src/perf_build.rs::verify_binary_size_measurement_control`.
 
 Exit 0 = artifact written, schema valid, binary stripped and within budget.
 Exit 1 = binary missing, unstripped, build failed, or over budget.
@@ -186,6 +187,7 @@ def run_self_test() -> int:
                 assert run_cli(["--binary", str(copied), "--no-build", "--threshold-mb", "0", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
                 assert run_cli(["--binary", str(copied), "--no-build", "--threshold-mb", "nan", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
                 assert run_cli(["--binary", str(copied), "--no-build", "--run-id", "a", "--correlation-id", "b", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
+                assert run_cli(["--binary", str(copied), "--no-build", "--run-id", "   ", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
                 assert run_cli(["--binary", str(copied), "--no-build", "--out", str(neg_out), "--source-commit", "0" * 40]) == 1
                 assert not neg_out.exists()
     finally:
@@ -224,9 +226,17 @@ def run_cli(argv: list[str] | None = None) -> int:
     if not math.isfinite(args.threshold_mb) or args.threshold_mb <= 0.0:
         print(f"FAIL: --threshold-mb must be finite and > 0, got {args.threshold_mb}", file=sys.stderr)
         return 1
-    if args.run_id and args.correlation_id and args.run_id != args.correlation_id:
+    if args.run_id is not None and not args.run_id.strip():
+        print("FAIL: --run-id must be non-empty when specified", file=sys.stderr)
+        return 1
+    if args.correlation_id is not None and not args.correlation_id.strip():
+        print("FAIL: --correlation-id must be non-empty when specified", file=sys.stderr)
+        return 1
+    explicit_run_id = args.run_id.strip() if args.run_id is not None else None
+    explicit_corr_id = args.correlation_id.strip() if args.correlation_id is not None else None
+    if explicit_run_id and explicit_corr_id and explicit_run_id != explicit_corr_id:
         print(
-            f"FAIL: --run-id ({args.run_id!r}) and --correlation-id ({args.correlation_id!r}) must match",
+            f"FAIL: --run-id ({explicit_run_id!r}) and --correlation-id ({explicit_corr_id!r}) must match",
             file=sys.stderr,
         )
         return 1
@@ -284,8 +294,8 @@ def run_cli(argv: list[str] | None = None) -> int:
         )
 
     default_id = f"binary-size-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-    run_id = args.run_id or args.correlation_id or default_id
-    correlation_id = args.correlation_id or run_id
+    run_id = explicit_run_id or explicit_corr_id or default_id
+    correlation_id = explicit_corr_id or run_id
 
     size_bytes = binary.stat().st_size
     size_mb = size_bytes / (1024.0 * 1024.0)
