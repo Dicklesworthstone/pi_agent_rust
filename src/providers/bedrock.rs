@@ -821,12 +821,36 @@ impl Provider for BedrockProvider {
         // as a caller dropping the returned stream before its first poll.
         // Keep typed decoding: a Value round-trip would silently discard
         // duplicate billing fields before the response could reject them.
-        if let Some(observer) = &options.usage_observer {
-            let envelope: BedrockUsageEnvelope =
-                serde_json::from_str(&response_text).map_err(parse_error)?;
-            if let Some(usage) = &envelope.usage {
-                observer.observe(&convert_usage(usage))?;
-            }
+        let envelope: BedrockUsageEnvelope =
+            serde_json::from_str(&response_text).map_err(parse_error)?;
+        if let Some(observer) = &options.usage_observer
+            && let Some(usage) = &envelope.usage
+        {
+            observer.observe(&convert_usage(usage))?;
+        }
+        // Tool input and untagged content contain Value fields, whose ordinary
+        // decoding erases duplicate keys. Reject ambiguity in the raw reply
+        // before any content can become local execution authority. The typed
+        // envelope above has already retained any trustworthy billing, while
+        // duplicate billing fields fail before an observer sees them.
+        if serde_json::from_str::<super::openai::UniqueToolArgumentKeys>(&response_text).is_err() {
+            let message = AssistantMessage {
+                api: "bedrock-converse-stream".to_string(),
+                provider: self.provider_name.clone(),
+                model: self.model.clone(),
+                usage: envelope
+                    .usage
+                    .as_ref()
+                    .map_or_else(Usage::default, convert_usage),
+                stop_reason: StopReason::Error,
+                error_message: Some(
+                    "Bedrock JSON response contains invalid or ambiguous JSON fields; local tool calls withheld"
+                        .to_string(),
+                ),
+                timestamp: Utc::now().timestamp_millis(),
+                ..AssistantMessage::default()
+            };
+            return Ok(Box::pin(stream::iter(Self::message_events(&message))));
         }
         let parsed: BedrockConverseResponse =
             serde_json::from_str(&response_text).map_err(parse_error)?;
@@ -1657,6 +1681,17 @@ mod tests {
     fn spawn_bedrock_json_server(
         responses: Vec<Value>,
     ) -> (String, mpsc::Receiver<CapturedBedrockRequest>) {
+        spawn_bedrock_raw_json_server(
+            responses
+                .into_iter()
+                .map(|response| serde_json::to_string(&response).expect("serialize Bedrock response"))
+                .collect(),
+        )
+    }
+
+    fn spawn_bedrock_raw_json_server(
+        responses: Vec<String>,
+    ) -> (String, mpsc::Receiver<CapturedBedrockRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind Bedrock test server");
         let address = listener.local_addr().expect("Bedrock test server address");
         let (sender, receiver) = mpsc::channel();
@@ -1674,7 +1709,7 @@ mod tests {
     fn serve_bedrock_json_reply(
         mut socket: TcpStream,
         sender: &mpsc::Sender<CapturedBedrockRequest>,
-        response_body: &Value,
+        response_body: &str,
     ) {
         socket
             .set_read_timeout(Some(FIXTURE_POLL))
@@ -1725,8 +1760,6 @@ mod tests {
             })
             .expect("capture Bedrock request");
 
-        let response_body =
-            serde_json::to_string(response_body).expect("serialize Bedrock response");
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
             response_body.len()
@@ -2446,6 +2479,53 @@ mod tests {
     }
 
     #[test]
+    fn json_duplicate_input_keys_withhold_calls_and_preserve_trustworthy_usage() {
+        for input in [
+            r#"{"path":"first","path":"secret-canary"}"#,
+            r#"{"path":"first","\u0070ath":"secret-canary"}"#,
+            r#"{"options":{"path":"first","path":"secret-canary"}}"#,
+            r#"{"steps":[{"path":"first","path":"secret-canary"}]}"#,
+        ] {
+            let response = [
+                r#"{"output":{"message":{"role":"assistant","content":[{"toolUse":{"toolUseId":"call-a","name":"write","input":"#,
+                input,
+                r#"}}]}},"stopReason":"tool_use","usage":{"inputTokens":7,"outputTokens":3,"cacheReadInputTokens":20,"cacheWriteInputTokens":5,"totalTokens":35}}"#,
+            ]
+            .concat();
+            let (base_url, requests) = spawn_bedrock_raw_json_server(vec![response]);
+            let (provider, budget) = guarded_json_provider(&base_url);
+            let options = StreamOptions {
+                api_key: Some("fixture-bearer-token".to_string()),
+                ..StreamOptions::default()
+            };
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime build");
+            runtime.block_on(async {
+                let events = provider
+                    .stream(&Context::default(), &options)
+                    .await
+                    .expect("ambiguous output retains a trustworthy billing envelope")
+                    .collect::<Vec<_>>()
+                    .await;
+                let error = assert_json_failure(&events);
+                let diagnostic = error.error_message.as_deref().unwrap();
+                assert!(diagnostic.contains("ambiguous JSON fields"));
+                assert!(!diagnostic.contains("secret-canary"));
+                assert_eq!(budget.spent(), 35.0);
+                assert_eq!(budget.snapshot().pending, 0.0);
+                assert!(matches!(
+                    provider.stream(&Context::default(), &options).await,
+                    Err(Error::CostCap { .. })
+                ));
+            });
+            requests
+                .recv_timeout(FIXTURE_BUDGET)
+                .expect("real HTTP request");
+        }
+    }
+
+    #[test]
     fn json_setup_usage_and_public_events_settle_one_bill() {
         let response = json_reply(vec![json!({"text": "answer"})], "end_turn");
         let (base_url, requests) = spawn_bedrock_json_server(vec![response]);
@@ -2730,6 +2810,7 @@ mod tests {
             "truncated",
             "server",
             "invalid-batch",
+            "duplicate-input",
         ] {
             let directory = tempfile::tempdir().expect("isolated write target");
             let marker = directory.path().join("marker.txt");
@@ -2755,7 +2836,22 @@ mod tests {
             if authorized {
                 replies.push(json_reply(vec![json!({"text": "Finished."})], "end_turn"));
             }
-            let (url, requests) = spawn_bedrock_json_server(replies);
+            let mut replies = replies
+                .into_iter()
+                .map(|reply| serde_json::to_string(&reply).unwrap())
+                .collect::<Vec<_>>();
+            if case == "duplicate-input" {
+                // Inject a duplicate into the raw wire bytes. Building this
+                // with json! or Value would erase the very defect under test.
+                let field = "\"content\":\"authorized write\"";
+                assert_eq!(replies[0].matches(field).count(), 1);
+                replies[0] = replies[0].replacen(
+                    field,
+                    "\"content\":\"first\",\"content\":\"authorized write\"",
+                    1,
+                );
+            }
+            let (url, requests) = spawn_bedrock_raw_json_server(replies);
             let provider = BedrockProvider::new("m").with_base_url(format!("{url}/converse"));
             let config = AgentConfig {
                 max_tool_iterations: 1,

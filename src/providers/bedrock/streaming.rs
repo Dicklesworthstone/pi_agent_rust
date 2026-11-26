@@ -380,7 +380,8 @@ impl MessageState {
             }
             let usage = value
                 .get("usage")
-                .ok_or_else(|| invalid("metadata has no usage"))?;
+                .filter(|usage| usage.is_object())
+                .ok_or_else(|| invalid("metadata has missing or invalid usage"))?;
             let input = token_count(usage, "inputTokens")?;
             let output = token_count(usage, "outputTokens")?;
             let cache_read = token_count(usage, "cacheReadInputTokens")?;
@@ -578,14 +579,17 @@ impl MessageState {
             }
             ContentBlock::ToolCall(tool) => {
                 let arguments = if block.tool_input_seen {
-                    serde_json::from_str::<Value>(&block.tool_input)
-                        .map_err(|_| invalid("malformed tool input JSON"))?
+                    // The shared parser permits omitted empty arguments. A
+                    // supplied empty fragment is different: it never formed
+                    // the complete input required to authorize this call.
+                    if block.tool_input.trim().is_empty() {
+                        return Err(invalid("malformed tool input JSON"));
+                    }
+                    super::super::openai::parse_final_tool_arguments(&block.tool_input)
+                        .map_err(|_| invalid("malformed or ambiguous tool input JSON"))?
                 } else {
                     serde_json::json!({})
                 };
-                if !arguments.is_object() {
-                    return Err(invalid("tool input must be a complete JSON object"));
-                }
                 tool.arguments = arguments;
                 self.pending.push_back(StreamEvent::ToolCallEnd {
                     content_index,
@@ -689,6 +693,11 @@ fn dispatch(frame: &Frame, state: &mut MessageState, secrets: &[String]) -> Resu
         }
     }
     let kind = frame.header(":event-type")?;
+    // Validate the original bytes: Value keeps only the last occurrence of a
+    // key, including escaped-equivalent names. Otherwise an ambiguous frame
+    // can replace a tool identity, terminal authorization, or billing counter.
+    serde_json::from_slice::<super::super::openai::UniqueToolArgumentKeys>(&frame.payload)
+        .map_err(|_| invalid("invalid or ambiguous event JSON"))?;
     let value =
         serde_json::from_slice(&frame.payload).map_err(|_| invalid("invalid event JSON"))?;
     state.event(kind, &value)
@@ -807,11 +816,15 @@ mod tests {
     }
 
     fn event(kind: &str, payload: &Value) -> Vec<u8> {
+        raw_event(kind, &serde_json::to_vec(payload).unwrap())
+    }
+
+    fn raw_event(kind: &str, payload: &[u8]) -> Vec<u8> {
         let mut headers = Vec::new();
         header(":message-type", "event", &mut headers);
         header(":event-type", kind, &mut headers);
         header(":content-type", "application/json", &mut headers);
-        raw_frame(&headers, &serde_json::to_vec(&payload).unwrap())
+        raw_frame(&headers, payload)
     }
 
     fn start() -> Vec<u8> {
@@ -1557,6 +1570,101 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_tool_input_keys_are_rejected_across_fragments() {
+        for input in [
+            r#"{"path":"first","path":"secret-canary"}"#,
+            r#"{"path":"first","\u0070ath":"secret-canary"}"#,
+            r#"{"options":{"path":"first","path":"secret-canary"}}"#,
+            r#"{"steps":[{"path":"first","path":"secret-canary"}]}"#,
+        ] {
+            let split = input.len() / 2;
+            let bytes = [
+                start(),
+                tool_start(0, "call-a", "write"),
+                tool_input(0, &input[..split]),
+                tool_input(0, &input[split..]),
+                block_stop(0),
+                tool_stop(),
+            ]
+            .concat();
+            let result = collect(bytes.chunks(3).map(<[u8]>::to_vec).collect());
+            assert_one_terminal_error(&result);
+            assert!(
+                !result
+                    .iter()
+                    .any(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. }))),
+                "ambiguous input must not become an executable call: {result:?}"
+            );
+            let diagnostic = result.last().unwrap().as_ref().unwrap_err().to_string();
+            assert!(diagnostic.contains("ambiguous tool input JSON"));
+            assert!(!diagnostic.contains("secret-canary"));
+        }
+
+        // Repeated names in distinct objects are unambiguous and remain valid.
+        let input = r#"{"left":{"path":"a"},"right":{"path":"b"},"steps":[{"path":"c"},{"path":"d"}]}"#;
+        let result = collect(vec![
+            start(),
+            tool_start(0, "call-a", "read"),
+            tool_input(0, input),
+            block_stop(0),
+            tool_stop(),
+        ]);
+        assert!(result.iter().all(Result::is_ok), "{result:?}");
+        let Some(Ok(StreamEvent::Done { reason, message })) = result.last() else {
+            panic!("expected completed unambiguous tool call: {result:?}");
+        };
+        assert_eq!(*reason, StopReason::ToolUse);
+        let ContentBlock::ToolCall(call) = &message.content[0] else {
+            panic!("expected preserved tool call");
+        };
+        assert_eq!(call.arguments, serde_json::from_str::<Value>(input).unwrap());
+    }
+
+    #[test]
+    fn duplicate_event_fields_cannot_replace_tool_identity_or_terminal_authority() {
+        for payload in [
+            r#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"call-a","name":"read","name":"write"}}}"#,
+            r#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"call-a","toolUseId":"call-b","name":"write"}}}"#,
+            r#"{"contentBlockIndex":7,"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"call-a","name":"write"}}}"#,
+            r#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"call-a","name":"read","\u006eame":"write"}}}"#,
+        ] {
+            let result = collect(vec![
+                start(),
+                raw_event("contentBlockStart", payload.as_bytes()),
+                block_stop(0),
+                tool_stop(),
+            ]);
+            assert_one_terminal_error(&result);
+            assert!(!result.iter().any(|item| matches!(
+                item,
+                Ok(StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. })
+            )));
+        }
+
+        for payload in [
+            r#"{"stopReason":"max_tokens","stopReason":"tool_use"}"#,
+            r#"{"stopReason":"content_filtered","\u0073topReason":"tool_use"}"#,
+        ] {
+            let result = collect(vec![
+                start(),
+                tool_start(0, "call-a", "read"),
+                block_stop(0),
+                raw_event("messageStop", payload.as_bytes()),
+                usage_metadata(),
+            ]);
+            assert_one_terminal_error(&result);
+            // A completed content preview is not terminal execution authority.
+            assert_eq!(
+                result
+                    .iter()
+                    .filter(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. })))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn absent_arguments_and_explicit_empty_objects_are_valid_zero_argument_calls() {
         for fragments in [vec![], vec!["{}"], vec!["", "{", "}"]] {
             let mut frames = vec![start(), tool_start(0, "call-a", "read")];
@@ -1888,6 +1996,30 @@ mod tests {
                     start(),
                     stop(),
                     event("metadata", &json!({"usage": {"inputTokens": -1}})),
+                ],
+                vec![start(), stop(), event("metadata", &json!({"usage": null}))],
+                vec![start(), stop(), event("metadata", &json!({"usage": []}))],
+                vec![start(), stop(), event("metadata", &json!({"usage": 0}))],
+                vec![
+                    start(),
+                    stop(),
+                    raw_event(
+                        "metadata",
+                        br#"{"usage":{"inputTokens":35,"inputTokens":0}}"#,
+                    ),
+                ],
+                vec![
+                    start(),
+                    stop(),
+                    raw_event(
+                        "metadata",
+                        br#"{"usage":{"inputTokens":35,"\u0069nputTokens":0}}"#,
+                    ),
+                ],
+                vec![
+                    start(),
+                    stop(),
+                    raw_event("metadata", br#"{"usage":{"inputTokens":35},"usage":{}}"#),
                 ],
             ] {
                 let (provider, budget, dropped) =
