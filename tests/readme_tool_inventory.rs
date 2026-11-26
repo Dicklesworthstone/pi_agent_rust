@@ -467,4 +467,67 @@ fn docs_and_changelog_parity_checks_pass_and_reject_planted_drift() {
 
     let truncated_cl = "## [Unreleased]\n\n### Added\n- Only one item.\n\n## [v0.8.0]\n";
     assert!(verify_changelog_unreleased_completeness(truncated_cl).is_err());
+
+    // Truthfulness guards from the 2026-11-25 reality check:
+    assert!(
+        !readme_text.contains(r#"{ "apiKey": "sk-ant-..." }"#),
+        "README troubleshooting must not recommend a nonexistent settings.json `apiKey` field"
+    );
+    assert!(
+        !readme_text
+            .contains("DSR provisions the coverage toolchain and records summary, LCOV, and HTML"),
+        "README Coverage section must not claim DSR runs LCOV/HTML coverage until registered in .dsr/repos.yaml"
+    );
+    assert!(
+        !readme_text.contains("not part of the code quality recipe"),
+        "README must reflect that check_readme_evidence_freshness.py is Check 10 in .dsr/repos.yaml"
+    );
+    assert!(
+        !cargo_toml.contains("22 MiB"),
+        "Cargo.toml must not retain retired 22 MiB release size-budget comments"
+    );
+}
+
+fn subcommands_section(readme_text: &str) -> &str {
+    let start = readme_text
+        .find("### Subcommands\n")
+        .expect("README has a `### Subcommands` section"); // ubs:ignore test assertion
+    let rest = &readme_text[start..];
+    let end = rest[1..]
+        .find("\n## ")
+        .map_or(rest.len(), |offset| offset + 1);
+    &rest[..end]
+}
+
+#[test]
+fn readme_subcommands_cover_all_visible_cli_commands() {
+    use clap::CommandFactory;
+
+    let readme_text = readme();
+    let section = subcommands_section(&readme_text);
+    let cli_cmd = pi::cli::Cli::command();
+
+    let mut missing = Vec::new();
+    for sub in cli_cmd.get_subcommands() {
+        if sub.is_hide_set() || sub.get_name() == "help" {
+            continue;
+        }
+        let name = sub.get_name();
+        let mentioned =
+            section.contains(&format!("pi {name}")) || section.contains(&format!("`{name}`"));
+        if !mentioned {
+            missing.push(name.to_string());
+        }
+        if name == "usage" {
+            let about = sub.get_about().map(ToString::to_string).unwrap_or_default();
+            assert!(
+                !about.to_ascii_lowercase().contains("migrate"),
+                "`pi usage` help text must not carry a misplaced Migrate doc comment: {about:?}"
+            );
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "visible CLI subcommands omitted from README `### Subcommands`: {missing:?}"
+    );
 }

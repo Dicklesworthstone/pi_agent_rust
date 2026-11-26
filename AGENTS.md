@@ -112,6 +112,10 @@ lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
 strip = true        # Remove debug symbols
+
+[profile.dist]
+inherits = "release"
+opt-level = 3       # Shipping binaries built by DSR (no arbitrary size ceiling)
 ```
 
 jemalloc is opt-in via `--features jemalloc` for allocation-heavy benchmark variants.
@@ -287,6 +291,11 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 | `src/providers/gemini.rs` | Gemini API implementation |
 | `src/providers/cohere.rs` | Cohere API implementation |
 | `src/providers/azure.rs` | Azure OpenAI API implementation |
+| `src/providers/bedrock.rs` | Amazon Bedrock Converse API implementation |
+| `src/providers/vertex.rs` | Google Vertex AI implementation |
+| `src/providers/copilot.rs` | GitHub Copilot backend implementation |
+| `src/providers/gitlab.rs` | GitLab Duo backend implementation |
+| `src/providers/cursor.rs` | Cursor backend implementation |
 | `src/providers/mod.rs` | Provider factory and extension stream-simple bridge |
 | `src/tools.rs` | Tool trait, registry, and the core file/shell/search tools; other built-ins live in their own modules (36 total, tiered in `src/xdev.rs`; `subagent` is opt-in) |
 | `src/interactive_ftui.rs` | Default FrankenTUI interactive stack (feature `ftui`, on by default) |
@@ -334,15 +343,15 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 
 ### Migration Strategy
 
-This port uses two key libraries from sibling projects:
+This port uses two key sibling-ecosystem crates (pinned from crates.io in `Cargo.toml`, with optional local sibling-path overrides commented in `[patch.crates-io]`):
 
-1. **asupersync** (`../asupersync`) - Structured concurrency runtime
+1. **asupersync** (`crates.io` / optional `../asupersync`) - Structured concurrency runtime
    - Async runtime (structured concurrency)
    - Provides HTTP client, TLS, SQLite
    - Enables deterministic testing with LabRuntime
    - Explicit capability context (Cx)
 
-2. **rich_rust** (`../rich_rust`) - Terminal UI library
+2. **rich_rust** (`crates.io` / optional `../rich_rust`) - Terminal UI library
    - Console with markup syntax `[bold red]text[/]`
    - Tables, Panels, Progress bars
    - Markdown rendering
@@ -577,7 +586,7 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 
 ## bv — Graph-Aware Triage Engine
 
-bv is a graph-aware triage engine for Beads projects (`.beads/beads.jsonl`). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
+bv is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl`). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
 
 **Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use MCP Agent Mail.
 
@@ -645,7 +654,7 @@ bv --robot-recipes                           # Discover installed recipe names
 ### Understanding Robot Output
 
 **All robot JSON includes:**
-- `data_hash` — Fingerprint of source beads.jsonl
+- `data_hash` — Fingerprint of source `issues.jsonl`
 - `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
 - `as_of` / `as_of_commit` — Present when using `--as-of`
 

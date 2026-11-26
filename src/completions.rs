@@ -27,7 +27,12 @@ pub fn print_script(shell: &str, out: &mut dyn std::io::Write) -> Result<()> {
         }
     };
     let mut cmd = crate::cli::Cli::command();
-    clap_complete::aot::generate(generator, &mut cmd, "pi", &mut std::io::stdout().lock());
+    // Generate into an in-memory buffer first: `clap_complete::aot::generate`
+    // panics internally on any `io::Error` (including `BrokenPipe` when piped
+    // to `head`/`less`), and previously bypassed `out` by locking `stdout`
+    // directly.
+    let mut script = Vec::new();
+    clap_complete::aot::generate(generator, &mut cmd, "pi", &mut script);
     // Dynamic wrapper: --model/--session consult `pi __complete` so values
     // come from the live registry/session index (never drift).
     let wrapper = match shell {
@@ -36,8 +41,20 @@ pub fn print_script(shell: &str, out: &mut dyn std::io::Write) -> Result<()> {
         "fish" => FISH_DYNAMIC_WRAPPER,
         _ => unreachable!(),
     };
-    let _ = std::io::Write::write_fmt(out, format_args!("{wrapper}\n"));
+    if write_ignoring_broken_pipe(out, &script)?
+        && write_ignoring_broken_pipe(out, wrapper.as_bytes())?
+    {
+        let _ = write_ignoring_broken_pipe(out, b"\n")?;
+    }
     Ok(())
+}
+
+fn write_ignoring_broken_pipe(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<bool> {
+    match out.write_all(bytes) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
 #[allow(clippy::needless_raw_string_hashes)]
@@ -162,13 +179,42 @@ mod tests {
 
     #[test]
     fn script_generation_covers_all_shells() {
-        for shell in ["bash", "zsh", "fish"] {
+        for (shell, expected_clap_marker) in [
+            ("bash", "_pi()"),
+            ("zsh", "#compdef pi"),
+            ("fish", "complete -c pi"),
+        ] {
             let mut out = Vec::new();
             print_script(shell, &mut out).expect("script");
             let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                // ubs:ignore test assertion
+                text.contains(expected_clap_marker),
+                "{shell} clap_complete output missing from writer ({expected_clap_marker})"
+            );
             assert!(text.contains("__complete"), "{shell} wrapper missing");
         }
         assert!(print_script("powershell", &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn print_script_ignores_broken_pipe_without_panicking() -> Result<()> {
+        struct BrokenPipeWriter;
+        impl std::io::Write for BrokenPipeWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "broken pipe",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for shell in ["bash", "zsh", "fish"] {
+            print_script(shell, &mut BrokenPipeWriter)?;
+        }
+        Ok(())
     }
 
     #[test]

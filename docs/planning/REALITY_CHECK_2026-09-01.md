@@ -1,6 +1,6 @@
-# Reality Check — pi_agent_rust — Historical Baseline (2026-09-01), Nov-12 Refresh, & Current Refresh (2026-11-19)
+# Reality Check — pi_agent_rust — Historical Baseline (2026-09-01), Nov-12, Nov-19, & Current Refresh (2026-11-25)
 
-> **Current Canonical Refresh (`2026-11-19`, `HEAD = c8ac9b8c810dc3e0a3694b6f6a4f514d8a8e7fd1`):** Jump to **[§12. End-to-End Reality Check & Bridge Plan — 2026-11-19 (Post-11/11 DSR Gate)](#12-end-to-end-reality-check--bridge-plan--2026-11-19-post-1111-dsr-gate)** below. Sections 1–10 (`2026-09-01..03`, `v0.4.0` era) and Section 11 (`2026-11-12`, pre-gate wave) are preserved intact as historical records; this file is revised in place per `AGENTS.md` (no file proliferation).
+> **Current Canonical Refresh (`2026-11-25`, `v0.9.0` shipped + `130+` commits ahead at `a005deca3` / `origin/main = 92f8f936e`):** Jump to **[§13. End-to-End Reality Check & Bridge Plan — 2026-11-25 (Post-`v0.9.0`, 208/208 Conformance)](#13-end-to-end-reality-check--bridge-plan--2026-11-25-post-v090-208208-conformance)** below. Sections 1–12 are preserved intact as historical records; this file is revised in place per `AGENTS.md` (no file proliferation).
 
 # Reality Check — pi_agent_rust — 2026-09-01
 
@@ -1428,4 +1428,44 @@ Existing Critical-Path Unblocks:
   .5 -> bd-dsr-authority-dist-size-budget-dk9av, bd-o6hte
   .10 -> bd-v090-docs-changelog-dsr-release-cut-1cs36
 ```
+
+---
+
+## 13. End-to-End Reality Check & Bridge Plan — 2026-11-25 (Post-`v0.9.0`, 208/208 Conformance)
+
+Audited on `2026-11-25` against **100%** of `AGENTS.md` (1,012 lines), `README.md` (3,849 lines), `CHANGELOG.md`, `Cargo.toml`, `.dsr/repos.yaml`, `docs/README.md`, `docs/releasing.md`, `.beads/issues.jsonl` (`3,250` visible beads: `3,191` closed [98.2%], `31` open, `23` in_progress, `1` blocked, `4` deferred; `0` dep cycles), all `6` open GitHub issues (`#182, #250, #252, #257, #258, #271`), the live `v0.9.0` GitHub Release (`2026-11-21T18:00:20Z`, `32` signed DSR assets), live execution of `/home/ubuntu/.local/bin/pi` (`0.9.0 (1a7d2d2bd ...)`), and the source tree (`HEAD = a005deca3`, `origin/main = 92f8f936e`).
+
+### 13.1 Executive Verdict
+
+**Real product capability is materially ahead of `2026-11-19`:**
+- **`v0.9.0` shipped via DSR** (`32` assets with `.sha256` + `.minisig`, real git SHA `1a7d2d2bd` in `pi --version`).
+- **Live coding works cleanly on Linux:** `pi -p --no-session --no-tools "Reply with exactly OK"` returns `OK` (`exit=0`) via auto-selected `openai-codex/gpt-5.6-sol` (`1.05M` ctx), RPC `get_state` exits `0`, `--mode json` exit codes (`2`, `4`) match docs, clean-env `pi doctor --format json` passes (`9 pass, 6 info, 2 warn, 0 fail`).
+- **Extension must-pass conformance reached `208/208` (`100.0%`, `0` failures)** at `a005deca3` with `225/226` (`99.6%`, `0` regressions) health delta; `extension` and `dropin` categories in `scripts/report_swarm_claim_readiness.py` are now **`ready` (`0` blockers)**, cutting total blockers from `24` to `14`.
+- **Zero stubs, zero `unsafe`:** All `32` top-level CLI subcommands (`src/main.rs:3944-4208`) and `36` built-in tools (`src/xdev.rs:145`) are wired to real implementations (`150/153` reachable modules, `3` allowlisted).
+
+**Five structural gaps still separate the repo from full vision delivery:**
+1. **Authoritative DSR proof dark for `185+` commits (`6` days):** Last bound green receipt (`20261119T013916-HzcdJjUq`, `11/11`) sits at `d15f16f3d`; all `12` subsequent runs failed/interrupted (disk/RCH/restart/now-fixed regressions), paralyzing `~25+` already-landed beads open/`in_progress` (including `bd-v090-docs-changelog-dsr-release-cut-1cs36`, `bd-reality-check-2026-11-19-bridge-yxf43.*`, `bd-oxu87`, `bd-mg6s5`, `bd-y84fr`, and the extension stream/ACP/drop-fence/soak wave).
+2. **Performance claims remain `100%` unmeasured (`0/19` budgets, `19/19 NO_DATA`, `14/14` CI `NO_DATA`, `4` data-contract failures):** `budget_summary.json` is `claim_readiness.status = "blocked"`; `stress_triage.json` (`199.6d`) and `swarm_activity_digest.json` (`200.1d`) are stale; `full_suite_verdict.json` (`19/20 PASS, 13/14 blocking PASS`) fails solely on `bd-3ar8v.2.8` (`91d` stale). Worse, live audit of `scripts/perf/` revealed `5` broken/RH-2-synthetic scripts (`run_event_dispatch_scenario.py` fabricating `random.seed(42)` PASS data, `run_ext_cold_load_complex.py` falling back to `random.seed(42)`, `run_pijs_workload.py` using `--release` and an invented schema incompatible with `examples/pijs_workload.rs` + `tests/perf_budgets.rs`, `measure_binary_size.py` and `measure_idle_memory.py` violating `src/perf_build.rs` `#[serde(deny_unknown_fields)]` schemas and spawning `pi --print ping`, and `preflight_dsr_recipe.sh` hardcoding macOS `/Users/jemanuel/.../dsr`). Live probe of shipped `v0.9.0` via fixed `measure_idle_memory.py` measured **`56.02 MiB` max idle RSS** (`58,736,640` bytes across `5` unique idle `pi --mode rpc --no-session` PIDs, spread `733 KB`) and **`87.82 MiB` stripped binary size**.
+3. **Windows ships publicly (`pi-windows-amd64`) with `0` runtime test runs:** `wsurf` is disabled; DSR Check 12 (`x86_64-pc-windows-gnu`) compiles `--lib --bins` only; GH `#182`, `#257`, `#271` remain open (`bd-kgkrq` is fixed in `src/tools.rs:2850-2899` but unverified on Windows).
+4. **Live `NO_BEAD` defects & doc falsehoods (`NB-1`..`NB-10`):**
+   - `NB-1`: `pi completions bash | head -n 5` panicked on `BrokenPipe` (`src/completions.rs:30` ignored `out`, locked `stdout` directly, and left crash bundles).
+   - `NB-2`: `README.md:3636-3646` falsely claimed `dsr quality` provisions coverage & emits LCOV/HTML artifacts.
+   - `NB-3`: `README.md:3279-3280` recommended nonexistent `{ "apiKey": "..." }` in `settings.json`.
+   - `NB-4`: `src/cli.rs:3503` attached `Migrate`'s doc comment to `Commands::Usage`.
+   - `NB-5`: `19` real wired CLI subcommands were omitted from `README.md` `### Subcommands`.
+   - `NB-6`: `6` verified `README.md` / `AGENTS.md` / `Cargo.toml` contradictions (Check 10 freshness wording, retired `22 MiB` release profile comments, May vs Nov `From:` dates, omitted `cursor.rs` & provider support modules, `AGENTS.md` 6/11 providers / sibling paths / `.beads/beads.jsonl` / missing `[profile.dist]`).
+   - `NB-7`: `scripts/report_swarm_claim_readiness.py` emits `2` false `docs` blockers looking for deleted `v0.2.0` headings (`'### Latest run snapshot'` and `'Latest certification/evidence refresh'`).
+   - `NB-8`: `2` unowned release-governance HOLDs (`crates.io` fail-closed DSR publisher; live DSR check of GitHub `refs/tags/v*` immutable ruleset `20418963`).
+   - `NB-9`: Post-`v0.9.0` (`133+` commits) `v0.9.1` DSR release cut (GH `#250` and `#258` remain intentionally open pending maintainer WAL signoff and locked fuzz corpus/replay acceptance).
+   - `NB-10`: `9` pre-existing gitignored files under `src/` (`src/eval/__pycache__/`, `src/*.orig`, `*.root_full_recovery`, `*.empty_recovery`, `*.rej`) fail local `ci_full_suite_gate`/`ci_evidence_bundle` (awaiting Rule 1 written deletion approval).
+5. **Owner decisions & tech debt:** `bd-tools-known-names-missing-seven-mbo3g`, `bd-sdk-image-retry-durable-save-fence-5a2b1`, `bd-dxz76` (`NEEDS JE`), plus `bd-jdf1u` (~30 crate-wide Clippy allows + `dead_code`), `bd-rquickjs-014-safe-typedarray-qvkcd`, `bd-charmed-bubbletea-024-wrapped-tail-drtao`, `bd-lib-suite-wall-clock-assertions-jll3n`.
+
+### 13.2 Bridge Actions Taken in This Wave (`2026-11-25`)
+- **Perf script integrity & wiring (`scripts/perf/*.py` + `scripts/perf/preflight_dsr_recipe.sh`):**
+  - Rewired `scripts/perf/run_pijs_workload.py` to real `--profile perf` `examples/pijs_workload`, both canonical `2000x1` & `2000x10` lanes, `PI_BENCH_*` env propagation, and strict `pi.perf.workload.v1` contract validation matching `tests/perf_budgets.rs:3752-3977` (`bd-tool-call-throughput-canonical-o3ubk`).
+  - Removed 100% of `random.seed(42)` synthetic data fabrication (RH-2) from `scripts/perf/run_event_dispatch_scenario.py` and `scripts/perf/run_ext_cold_load_complex.py`; both now fail closed (`exit 2`, write nothing) when real artifacts are missing and compute real metrics/percentiles from `scenario_runner.jsonl` and Criterion `sample.json`/`estimates.json`.
+  - Aligned `scripts/perf/measure_binary_size.py` (exact `15`-field `pi.perf.binary_size_measurement.v1`) and `scripts/perf/measure_idle_memory.py` (exact `22`-field `pi.perf.idle_rss_measurement.v1` + `11`-field `BenchEnvMeasurementControl` + `5` unique idle `pi --mode rpc --no-session` PIDs + MAX/spread aggregation) with `src/perf_build.rs`'s `#[serde(deny_unknown_fields)]` validators.
+  - Added hermetic `--self-test` suites to all `5` Python scripts (all `5/5` passing) and fixed hardcoded macOS `dsr` path + `EXPECTED_CHECKS=12` floor in `scripts/perf/preflight_dsr_recipe.sh`.
+- **Sibling pane (`pts/1`, same conversation) concurrently fixed `NB-1`..`NB-6`** (`src/completions.rs`, `src/cli.rs`, `README.md`, `AGENTS.md`, `Cargo.toml`, `tests/readme_tool_inventory.rs`) while `origin/main` landed `92f8f936e` (`bd-branch-plan-authority-zgxkl` classic TUI lifecycle).
+- **Remaining critical path:** Bank `12/12` DSR quality receipt on clean merged `HEAD` -> batch-close `~25+` already-landed beads -> execute strict DSR perf refresh (`bd-3ar8v.2.8` + `bd-tool-call-throughput-canonical-o3ubk` + `bd-ri-phase1-full-refresh-rndeg` + `bd-sog97.*`) -> restore `wsurf` Windows runtime lane (`bd-m7im4`) & `11`-provider live validation (`bd-provider-live-validation-11-xme9d`) -> cut `v0.9.1` via DSR.
 

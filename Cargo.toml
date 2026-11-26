@@ -223,8 +223,8 @@ futures = "0.3"
 async-trait = "0.1"
 
 # URL reads (bd-cv653.2.2): HTML reader-mode conversion + PDF text extraction
-# htmd is lean and always on; pdf-extract adds ~6 MiB so it is opt-in
-# (release binary size budget, 22 MiB). `full` includes it.
+# htmd is lean and always on; pdf-extract adds heavyweight PDF parsing deps so
+# it stays opt-in (`full` includes it).
 htmd = "0.6.0"
 pdf-extract = { version = "0.12", optional = true }
 # Native archive/document reads. Reuse the existing flate2 backend without
@@ -527,8 +527,7 @@ full = [
 # BPE token counting (bd-cv653.7.2.1): real O200k/Cl100k tables replace the
 # chars/4 heuristic; default-on, disable for size-critical minimal builds.
 bpe-tokens = ["dep:tiktoken-rs"]
-# PDF extraction for URL reads (bd-cv653.2.2) — opt-in to keep the default
-# release binary inside the 22 MiB size budget.
+# PDF extraction for URL reads (bd-cv653.2.2) — opt-in heavyweight parser.
 url-pdf = ["dep:pdf-extract"]
 # Sampling profiler (bd-cv653.7.12.1) — opt-in; adds pprof + inferno deps.
 profiler = ["dep:pprof"]

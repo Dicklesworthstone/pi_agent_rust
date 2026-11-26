@@ -162,9 +162,9 @@ Two additional machine-recognized citation forms exist:
   existence and validity are still checked, but staleness is not enforced
   because such claims never satisfy current release-facing requirements.
 
-`scripts/check_readme_evidence_freshness.py` (a pre-release check listed in
-[docs/releasing.md](docs/releasing.md), not part of the code quality recipe)
-checks file freshness and artifact content so stale, no-data, or
+`scripts/check_readme_evidence_freshness.py` (Check 10 in the registered DSR
+quality recipe [`.dsr/repos.yaml`](.dsr/repos.yaml) and listed in
+[docs/releasing.md](docs/releasing.md)) checks file freshness and artifact content so stale, no-data, or
 correlation-mismatched evidence cannot back user-facing performance claims;
 for release-facing citations of `budget_summary.json` it validates the full
 `pi.perf.budget_summary.v2` contract, including that the header counts equal
@@ -1183,18 +1183,18 @@ The current extension must-pass corpus is the exact set selected by
 coverage of that authoritative list.
 
 From:
-- `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json` (generated `2026-05-15T17:03:02.000Z`, run `local-20260515T170218075Z`)
-- `tests/ext_conformance/reports/health_delta/health_delta_report.json` (generated `2026-05-13T03:37:59.568Z`)
-- `tests/ext_conformance/reports/journeys/journey_report.json` (generated `2026-05-13T02:59:58.302Z`)
-- `tests/evidence_bundle/index.json` (generated `2026-05-12T19:26:21.441Z`, run `local-20260512T192621Z`)
-- `tests/full_suite_gate/certification_verdict.json` (generated `2026-05-14T19:59:37.227Z`)
+- `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json` (generated `2026-11-25T09:25:51.681Z`, run `local-20261125T092551681Z`)
+- `tests/ext_conformance/reports/health_delta/health_delta_report.json` (generated `2026-11-25T07:27:38.391Z`)
+- `tests/ext_conformance/reports/journeys/journey_report.json` (generated `2026-09-23T03:58:34.679Z`)
+- `tests/evidence_bundle/index.json` (generated `2026-11-21T05:50:57.069503Z`, run `local-bundle-fix-20261121T055057Z`)
+- `tests/full_suite_gate/certification_verdict.json` (generated `2026-11-25T07:24:53.579Z`)
 - Historical verdict blob at `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91:docs/evidence/dropin-certification-verdict.json` (generated `2026-05-18T19:37:26Z` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8`; the live file may contain a later verdict)
 
 - Historical strict drop-in result: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the Git-pinned historical verdict blob above; it neither describes the live verdict file nor certifies `v0.3.0`)*
 - Unified evidence bundle, as regenerated `2026-11-21`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
 - Extension must-pass gate, as regenerated `2026-11-25`: `208/208` must-pass extensions passed (`0` failures); informational stretch set `17/19` passed — the May 2026 `123/123` snapshot predates the expanded corpus *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
 - Extension health delta, as regenerated `2026-11-25`: `226` extensions tested at `99.6%` pass rate (`225/226`) with `0` regressions vs the 2026-02-07 baseline *(from tests/ext_conformance/reports/health_delta/health_delta_report.json; historical snapshot)*
-- Extension journey coverage, as regenerated `2026-08-17`: `125/125` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json; historical snapshot)*
+- Extension journey coverage, as regenerated `2026-09-23`: `125/125` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json; historical snapshot)*
 - Historical stress-triage evidence is retained under `tests/perf/reports/`; it is not current enough to support a release-facing performance claim.
 
 ---
@@ -1449,20 +1449,43 @@ pi doctor --only sessions --format json
 pi doctor --only swarm --format json
 pi doctor ./path/to/extension --policy safe --fix
 
-# Read-only swarm progress SLO evaluation from normalized evidence
-pi swarm-progress --input progress-slo-input.json --format json
-pi swarm-progress --input progress-slo-input.json --since HEAD~1 --out-json progress-slo.json
-
-# Session storage migration (JSONL -> v2 sidecar store)
+# Session recovery, import, handoff, garbage collection, and migration
+pi import --from-claude ~/.claude/projects/...
+pi recover <session-or-crash-bundle>
+pi handoff --to "next agent" --print
+pi gc --older-than 30d --dry-run
 pi migrate ~/.pi/agent/sessions --dry-run
 pi migrate ~/.pi/agent/sessions
+
+# Git workflow, code review, worktrees, and policy rules
+pi review staged --offline
+pi commit --dry-run
+pi worktree list
+pi rules list
+pi grievances list
+
+# Usage, spend stats, profiling, token counting, UI gallery, and self-update
+pi stats --format json
+pi usage --format json
+pi token ./src/main.rs
+pi profile --top 20
+pi gallery --format text
+pi completions bash
+pi self-update --check
+
+# Read-only swarm, context-pack, replay, and validation-broker inspection
+pi context-preview --format json
+pi swarm-progress --input progress-slo-input.json --format json
+pi swarm-replay-preview --trace trace.jsonl --format json
+pi validation-broker status --store slots.jsonl --format json
 ```
 
-- `update-index` refreshes extension index metadata used by `search` and `info`.
-- `search` and `info` let you discover and inspect extension metadata without leaving the CLI.
+- `update-index`, `search`, and `info` refresh and query extension catalog metadata without leaving the CLI.
 - `pi doctor` checks ordinary installation health: config, directories, auth, shell setup, and sessions. Swarm coordination diagnostics are opt-in with `--only swarm` (or a comma-separated selection including `swarm`); they require development infrastructure such as Beads, Agent Mail, RCH, and build scratch space. `pi doctor --only swarm --format json` reports cgroup CPU quota, cpuset size, NUMA topology, cgroup memory limits, target/tmp headroom, and recommended concurrency budgets before large multi-agent runs. These explicit checks remain strict and fail closed on operational hazards. Text, JSON, and markdown reports use the same selected findings and exit with status 1 when any selected check fails; warnings and informational findings exit 0. Supplying an extension path checks extension compatibility by default.
-- `swarm-progress` evaluates a normalized progress SLO snapshot and emits advisory JSON/text only; it does not mutate Beads, git, Agent Mail, RCH, validation broker slots, runpacks, or source files. Operator workflow, privacy boundaries, degraded Agent Mail/RCH interpretation, stale-Beads handling, and no-open-work convergence guidance lives in [docs/swarm-operations-runbook.md#progress-slo-operator-workflow](docs/swarm-operations-runbook.md#progress-slo-operator-workflow).
-- `migrate` validates or creates the v2 session sidecar format for faster resume on larger histories.
+- `import`, `recover`, `handoff`, `gc`, and `migrate` manage session lifecycle: importing Claude/Codex transcripts, recovering crashed or corrupted sessions, generating structured session handoffs, pruning old sessions/caches, and migrating JSONL sessions to the v2 segment sidecar format.
+- `review`, `commit`, `worktree`, `rules`, and `grievances` support repository review, commit staging, isolated git worktrees, project stream-abort rules, and logged agent grievances.
+- `stats`, `usage`, `token`, `profile`, `gallery`, `completions`, and `self-update` provide local cost/token analytics, provider quota checks, BPE token counting, turn/tool profiling, UI component previews, shell completion scripts (backed by the hidden `__complete` helper), and verified release updates.
+- `context-preview`, `swarm-progress`, `swarm-replay-preview`, and `validation-broker` provide read-only swarm/context diagnostics and SLO evaluation without mutating Beads, git, Agent Mail, RCH, or source files. Operator workflow, privacy boundaries, degraded Agent Mail/RCH interpretation, stale-Beads handling, and no-open-work convergence guidance lives in [docs/swarm-operations-runbook.md#progress-slo-operator-workflow](docs/swarm-operations-runbook.md#progress-slo-operator-workflow).
 
 ---
 
@@ -1686,7 +1709,7 @@ Project context files are a separate switch. By default pi appends `AGENTS.md` /
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Provider-count rule: Pi has 11 native provider implementation modules. Those modules are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, `gitlab`, and `cursor`. User-visible provider IDs, aliases, OpenAI-compatible presets, and extension-provided `streamSimple` providers are counted separately because several native modules expose multiple routes. The factory module `mod.rs` and shared live-catalog helper `model_fetch.rs` are support modules, not provider implementations, and are excluded.
+Provider-count rule: Pi has 11 native provider implementation modules. Those modules are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, `gitlab`, and `cursor`. User-visible provider IDs, aliases, OpenAI-compatible presets, and extension-provided `streamSimple` providers are counted separately because several native modules expose multiple routes. Shared support modules under `src/providers/` (`mod.rs`, `model_fetch.rs`, `extension_stream.rs`, `openai_completion.rs`, `openai_deepseek.rs`, `openai_openrouter.rs`, `openai_responses_complete.rs`, and `tool_schema.rs`) are excluded.
 
 ### Key Design Decisions
 
@@ -2747,7 +2770,7 @@ Concrete engineering work in this codebase includes:
 | Provider/message memory path | Zero-copy request context migration (`Cow`), `Arc`-based message/result sharing, clone elimination in stream end paths | Removes hot-path cloning and allocation churn in core agent/provider loops |
 | TUI rendering path | Message render cache, conversation-prefix cache, reusable render buffers, viewport/render-path refactors, Criterion perf gates | Reduces redraw cost and jitter while streaming long outputs |
 | Startup/resource loading | Parallelized skill/prompt/theme loading plus precomputed tool definitions/command names | Moves heavy initialization off the critical path to improve time-to-interaction |
-| Allocator/build profile | Size-budgeted default release profile, opt-in jemalloc benchmark variants, strict artifact validation for perf claims | Keeps shipping artifacts within budget and prevents benchmark/reporting drift |
+| Allocator/build profile | Speed-optimized `release` and `dist` profiles (`opt-level = 3`, fat LTO, strip), opt-in jemalloc benchmark variants, strict artifact validation for perf claims | Maximizes runtime speed for shipped binaries while keeping benchmark provenance and reporting drift-free |
 | Perf governance | Scenario matrix, claim-integrity gates, strict no-data fail behavior, variance/confidence artifacts, reproducible orchestration bundles | Makes performance claims auditable and regression detection automatic |
 | Hostcall marshalling planner | `HostcallRewriteEngine` uses a small cost model to pick fast opcode fusion only when it is clearly cheaper and unambiguous; otherwise it stays on the canonical path and records fallback reason | Gains speed on hot marshalling shapes without risking silent semantic drift from ambiguous rewrites |
 | Tool text-processing hot path | `truncate_head`/`truncate_tail` use lazy line traversal and `memchr` line counting; normalization switched to a single-pass transform instead of chained string rewrites | Large file/tool outputs avoid unnecessary intermediate allocations and stay responsive |
@@ -3185,8 +3208,7 @@ If the evidence set is incomplete or contradictory, the claim-integrity gate sta
 
 ### Allocator Strategy for Benchmarks
 
-Default release builds use the platform allocator to stay inside the shipping
-binary-size budget. FreeBSD and MSVC builds also always use the platform
+Default release builds use the platform allocator to avoid cross-allocator heap/thread issues across native dependencies and keep heavyweight extras opt-in. FreeBSD and MSVC builds also always use the platform
 allocator; FreeBSD libc already uses jemalloc internally, and mixing allocator
 domains across libc/pthread and C dependencies can turn heap corruption into
 thread-spawn crashes. For allocator experiments, Pi supports explicit `system`
@@ -3276,10 +3298,11 @@ ln -s $(which fdfind) ~/.local/bin/fd
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 
-# Or in settings.json
-{ "apiKey": "sk-ant-..." }
+# Or store credentials in ~/.pi/agent/auth.json via interactive login
+pi
+# then run /login anthropic
 
-# Or per-command
+# Or pass a key for a single invocation
 pi --api-key "sk-ant-..." "Hello"
 ```
 
@@ -3635,15 +3658,12 @@ and published exclusively through Doodlestein Self-Releaser (DSR).
 
 ### Coverage
 
-Coverage is a component of the registered DSR quality recipe:
-
-```bash
-dsr quality --tool pi_agent_rust
-```
-
-DSR provisions the coverage toolchain and records summary, LCOV, and HTML
-artifacts with source provenance; direct coverage-tool invocations are not an
-accepted project gate.
+Code coverage is **not** currently one of the 12 checks in the registered DSR
+quality recipe ([`.dsr/repos.yaml`](.dsr/repos.yaml)), and `dsr quality --tool pi_agent_rust`
+does not currently emit LCOV or HTML coverage artifacts. When coverage gating is
+enabled, it will be added to the DSR quality recipe with source provenance rather
+than run via ad hoc local coverage invocations or disabled GitHub Actions
+workflows.
 
 ### Project Structure
 
@@ -3674,6 +3694,7 @@ src/
 │   ├── vertex.rs           # Google Vertex AI
 │   ├── copilot.rs          # GitHub Copilot backend
 │   ├── gitlab.rs           # GitLab Duo backend
+│   ├── cursor.rs           # Cursor backend
 │   └── mod.rs              # Provider factory + extension bridge
 ├── tools.rs                # Built-in tool implementations
 ├── sse.rs                  # Streaming SSE parser

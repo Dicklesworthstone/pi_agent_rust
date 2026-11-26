@@ -3500,7 +3500,6 @@ pub enum Commands {
         only: Option<String>,
     },
 
-    /// Migrate session files from JSONL v1 to v2 segment format
     /// Show provider usage/quota state (bd-cv653.7.4)
     Usage {
         /// Output format: text (default) or json
