@@ -26,7 +26,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-DSR="${PREFILLIGHT_DSR_DEFAULT:-/Users/jemanuel/projects/doodlestein_self_releaser/dsr}"
+DSR="${PREFILLIGHT_DSR_DEFAULT:-$(command -v dsr 2>/dev/null || echo /Users/jemanuel/projects/doodlestein_self_releaser/dsr)}"
 WORKDIR="${PREFILLIGHT_WORKDIR_DEFAULT:-$PROJECT_ROOT}"
 OUT=""
 
@@ -123,13 +123,12 @@ if [[ -x "$DSR" ]]; then
   DSR_DRY_RC=$?
   set -e
   PLANNED_LINES=$(echo "$DSR_DRY" | grep -c "Planned, NOT executed" || true)
-  # The recipe grew a seventh check (check_fixture_read_patience.py) and then
-  # an eighth on 2026-09-22 (check_readme_evidence_freshness.py
-  # --structural-only); at a floor of 6 this contract would have stayed green
-  # while one was removed. The finding id keeps its original spelling on
+  # The recipe grew from 6 checks to 12 checks (including check_fixture_read_patience.py,
+  # check_readme_evidence_freshness.py, check_dsr_contract_sync.py, and the Linux-hosted
+  # x86_64-pc-windows-gnu cross-check). Keep the finding id's original spelling on
   # purpose: tests/dsr_recipe_preflight_test.rs greps for it verbatim.
-  EXPECTED_CHECKS=8
-  if [[ "${PLANNED_LINES:-0}" -ge "$EXPECTED_CHECKS" ]]; then
+  EXPECTED_CHECKS=12
+  if [[ "$DSR_DRY_RC" -eq 0 ]] && [[ "${PLANNED_LINES:-0}" -ge "$EXPECTED_CHECKS" ]]; then
     record pass "DSR_DRY_RUN_PLANS_6_CHECKS" \
       "dsr plans $PLANNED_LINES checks (expected >=$EXPECTED_CHECKS)"
   else
