@@ -4962,12 +4962,17 @@ impl Agent {
                     // through the normal aborted-turn lifecycle before a time
                     // cap, prewalk handoff, or follow-up can report success.
                     // Input fetched by the executor remains available to resume.
+                    // When the assistant already finished without tool calls,
+                    // preserve its completed Stop response while skipping
+                    // follow-ups, recovery nudges, and optional advisor review.
                     self.message_queue.restore_steering_front_lossless(
                         steering_after_tools.take().unwrap_or_default(),
                     );
                     self.take_prewalk_evidence();
-                    has_more_tool_calls = true;
-                    continue;
+                    if has_more_tool_calls {
+                        continue;
+                    }
+                    break 'agent;
                 }
                 let prewalk_evidence = self.take_prewalk_evidence();
                 let handoff = if self.run_budget.is_some()

@@ -7788,12 +7788,25 @@ fn certification_signal_does_not_turn_partial_no_data_into_pass() {
 #[test]
 fn full_suite_gate_reads_current_total_gates_field() {
     let gate: V = serde_json::from_str(include_str!("full_suite_gate/full_suite_verdict.json"))
-        .expect("parse checked-in full-suite verdict");
+        .expect("parse checked-in full-suite verdict"); // ubs:ignore[rust.panic.expect] -- Fixture must parse.
+    let passed = gate["summary"]["passed"]
+        .as_u64()
+        .expect("summary.passed count"); // ubs:ignore[rust.panic.expect] -- Checked-in verdict schema.
+    let total_gates = gate["summary"]["total_gates"]
+        .as_u64()
+        .expect("summary.total_gates count"); // ubs:ignore[rust.panic.expect] -- Checked-in verdict schema.
+    assert!(
+        total_gates > 0,
+        "checked-in full-suite verdict must list gates"
+    ); // ubs:ignore[rust.panic.assert-macros] -- Non-vacuous gate total guard.
 
     let (signal, detail) = validate_full_suite_gate(&gate);
     assert_eq!(signal, Signal::Fail, "{detail}");
-    assert!(detail.contains("17/20 gates pass"), "{detail}");
-    assert!(!detail.contains("17/0"), "{detail}");
+    assert!(
+        detail.contains(&format!("{passed}/{total_gates} gates pass")),
+        "{detail}"
+    ); // ubs:ignore[rust.panic.assert-macros] -- Verifies total_gates parsing.
+    assert!(!detail.contains(&format!("{passed}/0")), "{detail}"); // ubs:ignore[rust.panic.assert-macros] -- Regresses missing total_gates bug.
 }
 
 #[test]

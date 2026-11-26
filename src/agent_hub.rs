@@ -483,10 +483,9 @@ impl AgentHubRegistry {
         if pid == 0 || !self.can_start_schema_correction(id) {
             return false;
         }
-        let Some(entry) = self.entries.get_mut(id) else {
-            return false;
-        };
-        entry.pid = Some(pid);
+        // Keep `entry.pid` bound to the original attempt (matching
+        // `SubagentResult::pid`), while routing live process control (kill/reap)
+        // to the active correction child through `live_processes`.
         self.live_processes.insert(id.to_string(), pid);
         true
     }

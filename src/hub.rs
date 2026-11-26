@@ -553,6 +553,12 @@ struct Ring {
     cap: usize,
     ready_log: Option<regex::Regex>,
     ready_log_passed: bool,
+    /// Bytes and lines appended since the last readiness scan. Scanning before
+    /// half the ring can evict guarantees every match up to `RING_BYTE_CAP / 2`
+    /// is observed in amortized O(N) time instead of rescanning the full 1 MiB
+    /// ring on every 8 KiB chunk.
+    ready_unscanned_bytes: usize,
+    ready_unscanned_lines: usize,
     capture: LogCapture,
 }
 
@@ -568,31 +574,49 @@ impl Ring {
             cap,
             ready_log: None,
             ready_log_passed: true,
+            ready_unscanned_bytes: 0,
+            ready_unscanned_lines: 0,
             capture: LogCapture::default(),
         }
     }
 
+    fn scan_readiness(&mut self) -> bool {
+        if !self.ready_log_passed {
+            self.ready_log_passed = self
+                .ready_log
+                .as_ref()
+                .is_none_or(|re| re.is_match(&self.text()));
+        }
+        self.ready_unscanned_bytes = 0;
+        self.ready_unscanned_lines = 0;
+        self.ready_log_passed
+    }
+
     fn watch_readiness(&mut self, pattern: Option<regex::Regex>) {
-        self.ready_log_passed = pattern.as_ref().is_none_or(|re| re.is_match(&self.text()));
         self.ready_log = pattern;
+        self.ready_log_passed = false;
+        self.scan_readiness();
     }
 
     fn push_chunk(&mut self, chunk: &str) {
+        let mut partial_added = 0usize;
         for fragment in chunk.split_inclusive('\n') {
             if let Some(text) = fragment.strip_suffix('\n') {
                 self.push_partial(text);
                 self.finish_line();
             } else {
                 self.push_partial(fragment);
+                partial_added = partial_added.saturating_add(fragment.len());
             }
         }
-        // Observe at the stream seam, before a later burst can evict the
-        // readiness marker. Once observed, the log gate remains satisfied.
-        if !self.ready_log_passed {
-            self.ready_log_passed = self
-                .ready_log
-                .as_ref()
-                .is_some_and(|re| re.is_match(&self.text()));
+        self.ready_unscanned_bytes = self.ready_unscanned_bytes.saturating_add(partial_added);
+        // Observe small streams immediately and noisy bursts at half-ring
+        // intervals before eviction can discard the readiness marker.
+        if !self.ready_log_passed
+            && self.ready_log.is_some()
+            && (self.bytes < 64 * 1024 || self.ready_unscanned_bytes >= RING_BYTE_CAP / 2)
+        {
+            self.scan_readiness();
         }
     }
 
@@ -632,6 +656,15 @@ impl Ring {
         if self.cap == 0 {
             return;
         }
+        let will_evict = self.lines.len() >= self.cap || self.bytes + line.len() > RING_BYTE_CAP;
+        if will_evict
+            && !self.ready_log_passed
+            && self.ready_log.is_some()
+            && (self.ready_unscanned_bytes >= RING_BYTE_CAP / 2
+                || self.ready_unscanned_lines >= (self.cap / 2).max(1))
+        {
+            self.scan_readiness();
+        }
         while self.lines.len() >= self.cap || self.bytes + line.len() > RING_BYTE_CAP {
             let Some(evicted) = self.lines.pop_front() else {
                 break;
@@ -639,7 +672,10 @@ impl Ring {
             self.truncated_lines.pop_front();
             self.bytes -= evicted.len();
         }
-        self.bytes += line.len();
+        let line_len = line.len();
+        self.bytes += line_len;
+        self.ready_unscanned_bytes = self.ready_unscanned_bytes.saturating_add(line_len);
+        self.ready_unscanned_lines = self.ready_unscanned_lines.saturating_add(1);
         self.lines.push_back(line);
         self.truncated_lines.push_back(truncated);
     }
@@ -649,6 +685,7 @@ impl Ring {
         if !self.partial.is_empty() || self.partial_truncated {
             self.finish_line();
         }
+        self.scan_readiness();
     }
 
     /// Readiness sees only service text, never our truncation annotations.
@@ -1611,7 +1648,7 @@ fn start_inner(spec: &LaunchSpec, request: &ServiceRequest) -> Result<ServiceSna
                 ),
             ));
         }
-        let log_passed = ring.lock().map_err(|_| registry_err())?.ready_log_passed;
+        let log_passed = ring.lock().map_err(|_| registry_err())?.scan_readiness();
         let remaining = deadline.saturating_duration_since(Instant::now());
         let port_passed = ready.port.is_none_or(|port| {
             if remaining.is_zero() {

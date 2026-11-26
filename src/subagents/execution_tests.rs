@@ -772,12 +772,16 @@ fi
         serde_json::from_str(correction.strip_prefix("Task: ").unwrap()).unwrap();
     assert_eq!(correction["previousOutput"], invalid);
     let errors = correction["validationErrors"].as_array().unwrap();
-    assert_eq!(errors.len(), 1);
+    assert_eq!(errors.len(), 2);
     let diagnostic = errors[0].as_str().unwrap();
     assert!(diagnostic.len() <= MAX_OUTPUT_VALIDATION_BYTES);
     assert!(diagnostic.contains("PI_SUBAGENT_SCHEMA_OUTPUT"));
-    assert!(diagnostic.contains(OUTPUT_VALIDATION_TRUNCATED));
-    assert!(!diagnostic.contains("rejected-value-"));
+    assert_eq!(errors[1].as_str().unwrap(), OUTPUT_VALIDATION_TRUNCATED);
+    assert!(
+        errors
+            .iter()
+            .all(|entry| !entry.as_str().unwrap().contains("rejected-value-"))
+    );
     assert!(!correction.to_string().contains(assignment));
 }
 
@@ -2800,10 +2804,11 @@ fn source_entry(output: &ToolOutput) -> crate::agent_hub::ChildEntry {
         .expect("fixture child must have launched"); // ubs:ignore: required real-process fixture observation
     let task = value["task"].as_str().expect("fixture assignment"); // ubs:ignore: required tool-result shape
     let preview = task.chars().take(500).collect::<String>();
-    crate::agent_hub::registry()
+    let roster = crate::agent_hub::registry()
         .lock()
         .expect("hub registry") // ubs:ignore: test requires an intact registry
-        .roster()
+        .roster();
+    roster
         .into_iter()
         .find(|entry| entry.pid.map(u64::from) == Some(pid) && entry.task == preview)
         .expect("the actual process must have a registered owner") // ubs:ignore: ownership regression oracle

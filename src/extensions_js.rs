@@ -15835,12 +15835,15 @@ export function createWriteStream(path, opts) {
 // VFS work crosses admission in the calling extension's scope. Only callback
 // delivery is deferred; user callback exceptions must never become a second
 // filesystem completion. Capture the narrow scheduler before guest mutation.
-const enqueueFileCallback = globalThis.__pi_fs_watch_runtime.enqueue;
+const enqueueFileCallback = globalThis.__pi_fs_watch_runtime?.enqueue;
 function fileCallback(callback, operation, failedResult = () => []) {
   if (typeof callback !== "function") {
     const error = new TypeError("node:fs callback must be a function");
     error.code = "ERR_INVALID_ARG_TYPE";
     throw error;
+  }
+  if (typeof enqueueFileCallback !== "function") {
+    throw new Error("node:fs callback scheduler unavailable");
   }
   let args;
   try { args = [null, ...operation()]; }

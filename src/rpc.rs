@@ -29172,12 +29172,18 @@ export default function init(pi) {
                     None,
                 );
                 // Exercise the real queue-delivery boundary without admitting a
-                // provider. Build the closed tool suffix that terminal recovery
-                // may inherit when an outer task is dropped before its save.
+                // provider. Abort right after the queued message is delivered
+                // (before provider dispatch) so pre-boundary cancellation still
+                // preserves unconsumed steering while this fixture tests the
+                // delivered transcript provenance inherited by terminal recovery.
                 let (handle, signal) = crate::agent::AbortHandle::new();
-                handle.abort();
+                let abort_after_delivery = handle.clone();
                 let aborted = agent
-                    .run_continue_with_abort(Some(signal), |_| {})
+                    .run_continue_with_abort(Some(signal), move |event| {
+                        if matches!(event, AgentEvent::MessageEnd { .. }) {
+                            abort_after_delivery.abort();
+                        }
+                    })
                     .await
                     .expect("aborted queue delivery");
                 assert_eq!(aborted.stop_reason, StopReason::Aborted);
