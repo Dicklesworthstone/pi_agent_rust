@@ -17,7 +17,7 @@ const BASH_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// Resolve model-role and terminal selectors through one identity parser.
 /// Exact catalog identities win before interpreting a named thinking suffix;
 /// provider-qualified unknown models remain available for runtime validation.
-pub(crate) fn resolve_model_selector(
+pub fn resolve_model_selector(
     available: &[String],
     selector: &str,
 ) -> Result<(String, String, Option<ThinkingLevel>), String> {
@@ -3816,12 +3816,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.status_message = Some("Agent busy; try again".to_string());
             return None;
         };
-        let owner_session_id = match self.session.try_lock() {
-            Ok(session) => session.header.id.clone(),
-            Err(_) => {
-                self.status_message = Some("Session busy; try again".to_string());
-                return None;
-            }
+        let owner_session_id = if let Ok(session) = self.session.try_lock() {
+            session.header.id.clone()
+        } else {
+            self.status_message = Some("Session busy; try again".to_string());
+            return None;
         };
         if self.displayed_session_id.as_deref() != Some(owner_session_id.as_str()) {
             self.status_message = Some("Session display is catching up; try again".to_string());

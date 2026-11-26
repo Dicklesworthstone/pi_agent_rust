@@ -519,7 +519,9 @@ fn readme_subcommands_cover_all_visible_cli_commands() {
             missing.push(name.to_string());
         }
         if name == "usage" {
-            let about = sub.get_about().map(ToString::to_string).unwrap_or_default();
+            let about = sub
+                .get_about()
+                .map_or_else(String::new, ToString::to_string);
             assert!(
                 !about.to_ascii_lowercase().contains("migrate"),
                 "`pi usage` help text must not carry a misplaced Migrate doc comment: {about:?}"

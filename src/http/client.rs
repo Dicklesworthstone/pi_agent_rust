@@ -239,6 +239,8 @@ pub struct Client {
     user_agent: String,
     vcr: Option<VcrRecorder>,
     transport: Option<Arc<dyn HttpTransport>>,
+    #[cfg(test)]
+    tls_override: Option<std::result::Result<TlsConnector, String>>,
 }
 
 /// Process-global cache of the built TLS connector, initialized lazily on the
@@ -340,6 +342,8 @@ impl Client {
             user_agent,
             vcr: None,
             transport: None,
+            #[cfg(test)]
+            tls_override: None,
         }
     }
 
@@ -715,7 +719,7 @@ async fn send_parts_with_proxy(
     Vec<(String, String)>,
     BoxStream<'static, std::io::Result<Vec<u8>>>,
 )> {
-    let mut transport = connect_transport(parsed, proxy).await?;
+    let mut transport = connect_transport(client, parsed, proxy).await?;
 
     let request_bytes =
         build_request_bytes(method, parsed, &client.user_agent, headers, body, proxy);
@@ -1018,6 +1022,7 @@ struct ConnectAttemptError {
 /// TLS handshake. On failure the partially-connected stream is dropped, which
 /// closes the socket.
 async fn connect_transport_once(
+    client: &Client,
     parsed: &ParsedUrl,
     proxy: Option<&ProxyEndpoint>,
 ) -> std::result::Result<Transport, ConnectAttemptError> {
@@ -1049,7 +1054,7 @@ async fn connect_transport_once(
         if proxy.uses_tls() {
             // Authenticate the proxy before transmitting any credentials or
             // origin metadata. A failed first hop never retries in plaintext.
-            transport = connect_tls(&proxy.host, transport, "proxy").await?;
+            transport = connect_tls(client, &proxy.host, transport, "proxy").await?;
         }
         if matches!(parsed.scheme, Scheme::Https) {
             transport = proxy_connect_tunnel(transport, parsed, proxy)
@@ -1064,16 +1069,30 @@ async fn connect_transport_once(
         Scheme::Http => Ok(transport),
         // This handshake authenticates the origin independently, even when
         // the CONNECT tunnel already rides inside a proxy TLS connection.
-        Scheme::Https => connect_tls(&parsed.host, transport, "origin").await,
+        Scheme::Https => connect_tls(client, &parsed.host, transport, "origin").await,
     }
 }
 
+#[cfg(test)]
+fn resolve_tls_connector(client: &Client) -> std::result::Result<TlsConnector, String> {
+    client
+        .tls_override
+        .as_ref()
+        .map_or_else(shared_tls_connector, Clone::clone)
+}
+
+#[cfg(not(test))]
+fn resolve_tls_connector(_client: &Client) -> std::result::Result<TlsConnector, String> {
+    shared_tls_connector()
+}
+
 async fn connect_tls(
+    client: &Client,
     host: &str,
     transport: Transport,
     peer: &str,
 ) -> std::result::Result<Transport, ConnectAttemptError> {
-    let tls = shared_tls_connector().map_err(|error| ConnectAttemptError {
+    let tls = resolve_tls_connector(client).map_err(|error| ConnectAttemptError {
         error: Error::api(format!("TLS configuration error: {error}")),
         retryable_not_connected: false,
     })?;
@@ -1087,12 +1106,16 @@ async fn connect_tls(
     Ok(Transport::Tls(Box::new(stream)))
 }
 
-async fn connect_transport(parsed: &ParsedUrl, proxy: Option<&ProxyEndpoint>) -> Result<Transport> {
+async fn connect_transport(
+    client: &Client,
+    parsed: &ParsedUrl,
+    proxy: Option<&ProxyEndpoint>,
+) -> Result<Transport> {
     use asupersync::time::{sleep, wall_now};
 
     let mut backoffs = NOT_CONNECTED_RETRY_BACKOFFS.iter();
     loop {
-        let failure = match connect_transport_once(parsed, proxy).await {
+        let failure = match connect_transport_once(client, parsed, proxy).await {
             Ok(transport) => return Ok(transport),
             Err(failure) => failure,
         };
@@ -4127,10 +4150,10 @@ uMpFxVamNIo=
             builder.with_webpki_roots()
         };
         Client {
-            tls: Ok(builder
+            tls_override: Some(Ok(builder
                 .alpn_protocols(vec![b"http/1.1".to_vec()])
                 .build()
-                .unwrap()),
+                .unwrap())),
             ..Client::new()
         }
     }

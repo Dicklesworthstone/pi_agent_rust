@@ -126,14 +126,14 @@ fn install_memory_tree_navigation(
     } else {
         candidate.reset_leaf();
     }
-    let prompt = if candidate.leaf_id() != live.leaf_id() {
+    let prompt = if candidate.leaf_id() == live.leaf_id() {
+        None
+    } else {
         Some(crate::plan::replacement_system_prompt(
             agent,
             &agent.handle.session_store(),
             live,
         )?)
-    } else {
-        None
     };
     let (messages_for_ui, usage) = conversation_from_session(&candidate);
     let agent_messages = candidate.to_messages_for_current_path();
