@@ -535,7 +535,10 @@ unlocked logs, only as many as needed, and always keeps active logs and at
 least eight recent ones. Set `PI_JOBS_ARTIFACT_RETENTION=preserve` to keep
 every log instead; Pi then refuses new background jobs once the budget is
 full. Job snapshots report the applied policy, removed-file count, and
-reclaimed bytes in `artifactCleanup`.
+reclaimed bytes in `artifactCleanup`. A cancelled shell job reports `status: "killed"`.
+Its `exitCode` contains the shell's numeric exit code when the operating system
+provides one, including an exit code returned by a signal handler. A Unix
+shell terminated directly by a signal has a null `exitCode`.
 
 Print mode can keep working after a background job finishes. Add `--wait-async`
 or set `"async": {"printWake": true}` to wait for the current session's jobs,

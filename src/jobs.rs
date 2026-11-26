@@ -846,6 +846,15 @@ fn ensure_process_accepting_jobs(reg: &JobRegistry) -> Result<()> {
     Ok(())
 }
 
+/// Check admission while holding the registry lock shared with shutdown.
+fn ensure_background_publication(reg: &JobRegistry, owner_session_id: &str) -> Result<()> {
+    ensure_process_accepting_jobs(reg)?;
+    if reg.closing_owners.contains_key(owner_session_id) {
+        return Err(session_closing_error(owner_session_id));
+    }
+    Ok(())
+}
+
 fn remove_quiescent_owner_generation(reg: &mut JobRegistry, owner_session_id: &str) {
     if !reg.closing_owners.contains_key(owner_session_id)
         && reg
@@ -953,10 +962,7 @@ fn capture_session_spawn_generation(owner_session_id: &str) -> Result<SessionSpa
     let mut reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
-    ensure_process_accepting_jobs(&reg)?;
-    if reg.closing_owners.contains_key(owner_session_id) {
-        return Err(session_closing_error(owner_session_id));
-    }
+    ensure_background_publication(&reg, owner_session_id)?;
     let generation = reg
         .owner_shutdown_generations
         .get(owner_session_id)
@@ -1787,6 +1793,9 @@ impl ForegroundJob {
         let mut reg = registry()
             .lock()
             .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
+        // A completed command can still be delivered inline during shutdown.
+        // Only the transition to a new background owner requires admission.
+        let publication = ensure_background_publication(&reg, &self.handle.owner_session_id);
         let job = reg
             .jobs
             .get_mut(&self.handle.id)
@@ -1802,6 +1811,7 @@ impl ForegroundJob {
             self.armed = false;
             return Ok(ForegroundPromotion::Completed(snapshot));
         }
+        publication?;
         job.delivery = JobDelivery::Background;
         // Tail mutation is memory-only. The pumps release artifact I/O
         // before acquiring this mutex and never acquire the registry with
@@ -1832,16 +1842,13 @@ impl ForegroundJob {
         let mut reg = registry()
             .lock()
             .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
-        ensure_process_accepting_jobs(&reg)?;
+        ensure_background_publication(&reg, &self.handle.owner_session_id)?;
         if reg
-            .closing_owners
-            .contains_key(&self.handle.owner_session_id)
-            || reg
-                .owner_shutdown_generations
-                .get(&self.handle.owner_session_id)
-                .copied()
-                .unwrap_or_default()
-                != generation
+            .owner_shutdown_generations
+            .get(&self.handle.owner_session_id)
+            .copied()
+            .unwrap_or_default()
+            != generation
         {
             return Err(session_closing_error(&self.handle.owner_session_id));
         }
@@ -3301,22 +3308,15 @@ fn monitor_job(
     // Settle only after reap and bounded pipe drain. Classify by the action
     // that actually initiated termination, not by a cancellation request that
     // may have arrived after the OS process exited but before reap observation.
-    let (status, code) = match termination_status {
-        Some(JobStatus::Killed) => (JobStatus::Killed, None),
-        Some(JobStatus::TimedOut) => (JobStatus::TimedOut, exit_code),
-        _ => (
-            if exit_code == Some(0) {
-                JobStatus::Exited
-            } else {
-                JobStatus::Failed
-            },
-            exit_code,
-        ),
-    };
+    let status = termination_status.unwrap_or(if exit_code == Some(0) {
+        JobStatus::Exited
+    } else {
+        JobStatus::Failed
+    });
     if let Some(shell_state) = &resources.shell_state {
         shell_state.finish(termination_status.is_none() && exit_code.is_some_and(|code| code >= 0));
     }
-    settle_job_and_enqueue_notice(id, status, code, output_complete);
+    settle_job_and_enqueue_notice(id, status, exit_code, output_complete);
     resources.settlement_published = true;
 }
 
@@ -8543,6 +8543,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancellation_preserves_the_exit_code_from_a_term_handler() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            "trap 'exit 42' TERM; echo handler-ready; while :; do sleep 1; done",
+            Some(30),
+            Some(&root),
+        )
+        .expect("spawn shell with a TERM handler");
+        wait_for_output(&snapshot.id, "handler-ready", Duration::from_secs(5));
+        let cancelled = cancel(TEST_SESSION_ID, &snapshot.id).expect("cancel");
+        assert_eq!(cancelled.status, "killed");
+        assert_eq!(cancelled.exit_code, Some(42));
+        let _ = take_completion_notices(TEST_SESSION_ID);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cancel_kills_running_job() {
         let _guard = process_test_guard();
         let root = temp_root();
@@ -9059,6 +9081,37 @@ mod tests {
     }
 
     #[test]
+    fn owner_shutdown_prevents_foreground_promotion_and_its_completion_notice() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("closing-foreground-{}", uuid::Uuid::new_v4().simple());
+        let id = format!("job-{}", uuid::Uuid::new_v4().simple());
+        let mut entry = synthetic_entry(&id, root.join("closing.log"), 0, true);
+        entry.owner_session_id.clone_from(&owner);
+        entry.delivery = JobDelivery::Foreground;
+        registry()
+            .lock()
+            .expect("registry")
+            .jobs
+            .insert(id.clone(), entry);
+        let foreground = ForegroundJob {
+            handle: wait_handle(&owner, &id).expect("foreground handle"),
+            armed: true,
+        };
+
+        let closing = SessionShutdownAttempt::begin(&owner).expect("fence the owner");
+        let Err(error) = foreground.promote() else {
+            panic!("closing owner transferred a foreground job to background delivery");
+        };
+        assert!(error.to_string().contains("PI_JOBS_SESSION_CLOSING"));
+        settle_job_and_enqueue_notice(&id, JobStatus::Killed, None, true);
+        assert!(list(&owner).expect("session jobs").is_empty());
+        assert!(take_completion_notices(&owner).is_empty());
+        assert!(!registry().lock().expect("registry").jobs.contains_key(&id));
+        closing.finish_success().expect("release owner fence");
+    }
+
+    #[test]
     fn completed_foreground_command_wins_promotion_without_a_notice() {
         let _guard = process_test_guard();
         let root = temp_root();
@@ -9084,6 +9137,7 @@ mod tests {
         assert!(!settled.tail_truncated);
         assert!(list(&owner).expect("hidden foreground list").is_empty());
         assert!(take_completion_notices(&owner).is_empty());
+        let closing = SessionShutdownAttempt::begin(&owner).expect("fence after completion");
         match foreground.promote().expect("resolve completion race") {
             ForegroundPromotion::Completed(snapshot) => {
                 assert_eq!(snapshot.id, id);
@@ -9098,6 +9152,7 @@ mod tests {
             "consuming inline completion releases its registry metadata"
         );
         assert!(take_completion_notices(&owner).is_empty());
+        closing.finish_success().expect("release owner fence");
     }
 
     #[test]
