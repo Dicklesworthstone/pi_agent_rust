@@ -37,9 +37,9 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dsr)       DSR="$2"; shift 2 ;;
-    --work-dir)  WORKDIR="$2"; shift 2 ;;
-    --out)       OUT="$2"; shift 2 ;;
+    --dsr)       [[ $# -ge 2 ]] || usage; DSR="$2"; shift 2 ;;
+    --work-dir)  [[ $# -ge 2 ]] || usage; WORKDIR="$2"; shift 2 ;;
+    --out)       [[ $# -ge 2 ]] || usage; OUT="$2"; shift 2 ;;
     -h|--help)   usage ;;
     *)           echo "unknown arg: $1" >&2; usage ;;
   esac
@@ -107,7 +107,7 @@ else
 fi
 
 # ─── 5. DSR repos.yaml has a pi_agent_rust entry with checks ──────
-REPOS_YAML="${HOME}/.config/dsr/repos.yaml"
+REPOS_YAML="${DSR_REPOS_FILE:-${HOME}/.config/dsr/repos.yaml}"
 if [[ -f "$REPOS_YAML" ]] && \
    grep -q "pi_agent_rust" "$REPOS_YAML"; then
   record pass "DSR_REPOS_YAML_HAS_PI_AGENT_RUST" "$REPOS_YAML"
@@ -147,6 +147,7 @@ if grep -q "/tmp/pi-agent-rust-dsr" "$REPOS_YAML" 2>/dev/null; then
 fi
 
 # ─── 8. rch is on PATH and healthy ────────────────────────────────
+RCH_DIAG=""
 if command -v rch >/dev/null 2>&1; then
   record pass "RCH_ON_PATH" "$(command -v rch)"
   if RCH_DIAG=$(rch diagnose 2>&1); then
@@ -157,6 +158,7 @@ if command -v rch >/dev/null 2>&1; then
         "rch diagnose did not return a clear healthy signal; DSR may fall back to local cargo which produces invalid evidence"
     fi
   else
+    RCH_DIAG="rch diagnose failed"
     record warn "RCH_DIAGNOSE_FAILED" \
       "rch diagnose failed; DSR may fall back to local cargo"
   fi
@@ -194,7 +196,7 @@ if [[ -f "$CMR" ]]; then
   record pass "CHECK_MODULE_REACHABILITY_PRESENT" "$CMR"
 else
   record fail "CHECK_MODULE_REACHABILITY_PRESENT" \
-    "$CMR missing; the DSR recipe's check #6 will fail"
+    "$CMR missing; the DSR recipe's check #8 will fail"
 fi
 
 # ─── 12. tests/installer_regression.sh exists ────────────────────
@@ -203,7 +205,7 @@ if [[ -f "$TIR" ]]; then
   record pass "INSTALLER_REGRESSION_PRESENT" "$TIR"
 else
   record fail "INSTALLER_REGRESSION_PRESENT" \
-    "$TIR missing; DSR check #5 will fail"
+    "$TIR missing; DSR check #7 will fail"
 fi
 
 # ─── 13. evidence-contract-schema.json has the perf schemas ─────
@@ -275,20 +277,22 @@ for i in "${!findings[@]}"; do
 done
 findings_json+="]"
 
-# Run diagnose if available for richer provenance
+# Reuse captured rch diagnose output without SIGPIPE under pipefail
 RCH_DIAGNOSE_OUT="null"
-if command -v rch >/dev/null 2>&1; then
-  RCH_DIAGNOSE_OUT=$(rch diagnose 2>&1 | head -50 || echo "rch diagnose failed")
-  RCH_DIAGNOSE_OUT=$(jq -nc --arg s "$RCH_DIAGNOSE_OUT" '$s')
+if [[ -n "$RCH_DIAG" ]]; then
+  RCH_DIAG_HEAD=$(printf '%s\n' "$RCH_DIAG" | sed -n '1,50p')
+  RCH_DIAGNOSE_OUT=$(jq -nc --arg s "$RCH_DIAG_HEAD" '$s')
 fi
 
 GIT_COMMIT=$(cd "$WORKDIR" && git rev-parse HEAD 2>/dev/null || echo "unknown")
 GIT_DIRTY=$(cd "$WORKDIR" && git status --porcelain 2>/dev/null \
-              | head -1 || echo "")
+              | sed -n '1p' || echo "")
 if [[ -n "$GIT_DIRTY" ]]; then GIT_DIRTY=true; else GIT_DIRTY=false; fi
 
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+TIMESTAMP=$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))' 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
 
+TMP_OUT="$(dirname "$OUT")/.$(basename "$OUT").tmp.$$"
+trap 'rm -f "$TMP_OUT"' EXIT
 jq -n \
   --arg schema "pi.evidence.ri_phase1_recipe_audit_runpack.v1" \
   --arg generated_at "$TIMESTAMP" \
@@ -315,7 +319,9 @@ jq -n \
     verdict: $verdict,
     findings: $findings,
     rch_diagnose_head: $rch_diagnose
-  }' > "$OUT"
+  }' > "$TMP_OUT"
+mv -f "$TMP_OUT" "$OUT"
+trap - EXIT
 
 # ─── Summary ──────────────────────────────────────────────────────
 echo "preflight verdict: $VERDICT"

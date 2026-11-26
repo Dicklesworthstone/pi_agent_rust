@@ -338,22 +338,25 @@ def invoke_lane(
     env["PI_BENCH_RUN_ID"] = run_id
     env["PI_BENCH_CORRELATION_ID"] = correlation_id
     env["PI_BENCH_ALLOCATOR"] = allocator
-    proc = subprocess.run(
-        [
-            str(binary),
-            "--iterations",
-            str(iterations),
-            "--tool-calls",
-            str(tool_calls),
-            "--runtime-engine",
-            "quickjs",
-        ],
-        cwd=workdir,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=600.0,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                str(binary),
+                "--iterations",
+                str(iterations),
+                "--tool-calls",
+                str(tool_calls),
+                "--runtime-engine",
+                "quickjs",
+            ],
+            cwd=workdir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"pijs_workload (--tool-calls {tool_calls}) failed to run: {exc}"
     if proc.returncode != 0:
         return (
             None,
@@ -376,11 +379,15 @@ def invoke_lane(
 
 def write_jsonl_atomic(out_path: Path, records: list[dict[str, Any]]) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-    tmp_path.replace(out_path)
+    tmp_path = out_path.with_name(f".{out_path.name}.tmp.{os.getpid()}")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        tmp_path.replace(out_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def run_self_test() -> int:

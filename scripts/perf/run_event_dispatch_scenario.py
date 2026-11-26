@@ -89,7 +89,11 @@ def percentile(sorted_values: list[float], p: float) -> float:
 def load_real_event_dispatch_samples(path: Path) -> tuple[list[float], dict[str, int], str | None]:
     per_call_values: list[float] = []
     extension_counts: dict[str, int] = {}
-    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [], {}, f"cannot read {path}: {exc}"
+    for line_no, raw_line in enumerate(raw_text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
             continue
@@ -183,6 +187,9 @@ def run_self_test() -> int:
             assert run_cli(["--input", str(bool_in), "--out", str(neg_out)]) == 1
             assert run_cli(["--input", str(real_in), "--out", str(neg_out), "--budget-p99-us", "0"]) == 1
             assert run_cli(["--input", str(real_in), "--out", str(neg_out), "--budget-p99-us", "nan"]) == 1
+            bad_utf8 = root / "bad_utf8.jsonl"
+            bad_utf8.write_bytes(b"\xff\xfe\x00\x01")
+            assert run_cli(["--input", str(bad_utf8), "--out", str(neg_out)]) == 1
             assert not neg_out.exists()
     finally:
         if old_target is not None:
@@ -268,9 +275,13 @@ def run_cli(argv: list[str] | None = None) -> int:
     }
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = args.out.with_suffix(args.out.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp_path.replace(args.out)
+    tmp_path = args.out.with_name(f".{args.out.name}.tmp.{os.getpid()}")
+    try:
+        tmp_path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_path.replace(args.out)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     print(
         f"wrote {args.out}: samples={len(ordered)} max={max_us:.3f}us p99={p99:.3f}us "

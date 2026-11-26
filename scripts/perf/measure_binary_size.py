@@ -76,28 +76,33 @@ def is_stripped(path: Path) -> bool:
         return False
     nm = shutil.which("nm")
     if nm is not None:
-        proc = subprocess.run(
-            [nm, "--no-sort-by-size", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-        )
-        combined = f"{proc.stdout}\n{proc.stderr}".lower()
-        if "no symbols" in combined:
-            return True
-        if proc.returncode == 0:
-            return not any(line.strip() for line in proc.stdout.splitlines())
-        return False
+        try:
+            proc = subprocess.run(
+                [nm, "-p", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+            combined = f"{proc.stdout}\n{proc.stderr}".lower()
+            if "no symbols" in combined:
+                return True
+            if proc.returncode == 0:
+                return not any(line.strip() for line in proc.stdout.splitlines())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     file_bin = shutil.which("file")
     if file_bin is not None:
-        proc = subprocess.run(
-            [file_bin, str(path)],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-        )
-        out = proc.stdout.lower()
-        return proc.returncode == 0 and "stripped" in out and "not stripped" not in out
+        try:
+            proc = subprocess.run(
+                [file_bin, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+            out = proc.stdout.lower()
+            return proc.returncode == 0 and "stripped" in out and "not stripped" not in out
+        except (OSError, subprocess.TimeoutExpired):
+            return False
     return False
 
 
@@ -228,13 +233,17 @@ def run_cli(argv: list[str] | None = None) -> int:
 
     binary = (args.binary or default_release_binary(args.workdir, no_build=args.no_build)).resolve()
     if not args.no_build:
-        print(f"building {binary} with cargo build --bin pi --release...", file=sys.stderr)
-        proc = subprocess.run(
-            ["cargo", "build", "--bin", "pi", "--release"],
-            cwd=args.workdir,
-            capture_output=True,
-            text=True,
-        )
+        print(f"building {binary} with cargo build --locked --bin pi --release...", file=sys.stderr)
+        try:
+            proc = subprocess.run(
+                ["cargo", "build", "--locked", "--bin", "pi", "--release"],
+                cwd=args.workdir,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            print(f"FAIL: could not invoke cargo: {exc} (no artifact written)", file=sys.stderr)
+            return 1
         if proc.returncode != 0:
             print(
                 f"FAIL: cargo build failed (rc={proc.returncode}); no artifact written:\n{proc.stderr[-2000:]}",
@@ -309,9 +318,13 @@ def run_cli(argv: list[str] | None = None) -> int:
     assert tuple(sorted(artifact.keys())) == tuple(sorted(REQUIRED_FIELDS))
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = args.out.with_suffix(args.out.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(args.out)
+    tmp_path = args.out.with_name(f".{args.out.name}.tmp.{os.getpid()}")
+    try:
+        tmp_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        tmp_path.replace(args.out)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     within_budget = size_mb <= args.threshold_mb
     status = "PASS" if within_budget else "OVER_BUDGET"

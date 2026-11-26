@@ -68,7 +68,7 @@ def find_estimates_path(
             return direct
         if base.is_dir():
             isolated = sorted(
-                base.glob(f"pi-perf-runs/*/criterion_extensions/{rel}"),
+                (p for p in base.glob(f"pi-perf-runs/*/criterion_extensions/{rel}") if p.is_file()),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
@@ -86,7 +86,7 @@ def read_sample_us(sample_path: Path) -> tuple[list[float] | None, str | None]:
         return None, None
     try:
         data: Any = json.loads(sample_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return None, f"invalid Criterion sample file {sample_path}: {exc}"
     if not isinstance(data, dict):
         return None, f"Criterion sample file {sample_path} must be a JSON object"
@@ -155,11 +155,15 @@ def run_self_test() -> int:
             assert artifact["percentile_source"] == "criterion_sample_json"
             assert artifact["estimates_sha256"] == sha256_file(estimates_path)
 
-            # 3. Negative controls: invalid budget and malformed sample.json fail closed.
+            # 3. Negative controls: invalid budget, path-traversal fixture, malformed sample.json, and null median fail closed.
             neg_out = root / "neg_cold_load.json"
             assert run_cli(["--workdir", str(root), "--out", str(neg_out), "--budget-threshold-us", "0"]) == 1
             assert run_cli(["--workdir", str(root), "--out", str(neg_out), "--budget-threshold-us", "nan"]) == 1
+            assert run_cli(["--workdir", str(root), "--out", str(neg_out), "--fixture", "../escape"]) == 1
             sample_path.write_text("{not valid json", encoding="utf-8")
+            assert run_cli(["--workdir", str(root), "--out", str(neg_out)]) == 1
+            sample_path.unlink()
+            estimates_path.write_text(json.dumps({"mean": {"point_estimate": 1000.0}, "median": None}), encoding="utf-8")
             assert run_cli(["--workdir", str(root), "--out", str(neg_out)]) == 1
             assert not neg_out.exists()
     finally:
@@ -188,6 +192,9 @@ def run_cli(argv: list[str] | None = None) -> int:
     if args.self_test:
         return run_self_test()
 
+    if not args.fixture or "/" in args.fixture or "\\" in args.fixture or args.fixture in (".", ".."):
+        print(f"FAIL: --fixture must be a safe fixture name, got {args.fixture!r}", file=sys.stderr)
+        return 1
     if not math.isfinite(args.budget_threshold_us) or args.budget_threshold_us <= 0.0:
         print(
             f"FAIL: --budget-threshold-us must be finite and > 0, got {args.budget_threshold_us}",
@@ -207,6 +214,8 @@ def run_cli(argv: list[str] | None = None) -> int:
 
     try:
         est = json.loads(estimates_path.read_text(encoding="utf-8"))
+        if not isinstance(est, dict):
+            raise ValueError("estimates.json root must be a JSON object")
         mean_ns = est["mean"]["point_estimate"]
         median_ns = est.get("median", {}).get("point_estimate", mean_ns)
         stddev_ns = est.get("std_dev", {}).get("point_estimate", 0.0)
@@ -216,7 +225,7 @@ def run_cli(argv: list[str] | None = None) -> int:
             raise ValueError(f"invalid median.point_estimate={median_ns!r}")
         if not is_num_strict(stddev_ns) or stddev_ns < 0:
             raise ValueError(f"invalid std_dev.point_estimate={stddev_ns!r}")
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError) as exc:
         print(f"FAIL: invalid Criterion estimates {estimates_path}: {exc}", file=sys.stderr)
         return 1
 
@@ -262,9 +271,13 @@ def run_cli(argv: list[str] | None = None) -> int:
     }
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = args.out.with_suffix(args.out.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp_path.replace(args.out)
+    tmp_path = args.out.with_name(f".{args.out.name}.tmp.{os.getpid()}")
+    try:
+        tmp_path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_path.replace(args.out)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     print(
         f"wrote {args.out}: fixture={args.fixture} ({percentile_source}, n={sample_count}) "

@@ -111,7 +111,8 @@ complete -c pi -f -a '(__pi_dynamic)' 2>/dev/null || true
 /// Named validation error for unknown flags.
 pub fn complete(flag: &str, prefix: &str, out: &mut dyn std::io::Write) -> Result<()> {
     let candidates = match flag {
-        "--model" | "--provider" | "--smol" | "--slow" => model_candidates(prefix),
+        "--model" | "--smol" | "--slow" => model_candidates(prefix),
+        "--provider" => provider_candidates(prefix),
         "--session" | "--resume" => session_candidates(prefix),
         other => {
             return Err(crate::error::Error::validation(format!(
@@ -120,18 +121,48 @@ pub fn complete(flag: &str, prefix: &str, out: &mut dyn std::io::Write) -> Resul
             )));
         }
     };
-    for candidate in candidates {
-        let _ = std::io::Write::write_fmt(out, format_args!("{candidate}\n"));
+    write_candidates(candidates, out)
+}
+
+fn write_candidates(candidates: Vec<String>, out: &mut dyn std::io::Write) -> Result<()> {
+    for mut candidate in candidates {
+        candidate.push('\n');
+        if !write_ignoring_broken_pipe(out, candidate.as_bytes())? {
+            break;
+        }
     }
     Ok(())
 }
 
+fn collect_provider_candidates<'a>(
+    providers: impl IntoIterator<Item = &'a str>,
+    prefix: &str,
+) -> Vec<String> {
+    let lowered = prefix.to_ascii_lowercase();
+    let mut unique = std::collections::BTreeSet::new();
+    for provider in providers {
+        if lowered.is_empty() || provider.to_ascii_lowercase().contains(&lowered) {
+            unique.insert(provider);
+        }
+    }
+    unique.into_iter().map(str::to_owned).collect()
+}
+
+fn provider_candidates(prefix: &str) -> Vec<String> {
+    let registry =
+        crate::models::ModelRegistry::load_for_listing_with_credential_resolver(None, |_| None);
+    collect_provider_candidates(
+        registry
+            .models()
+            .iter()
+            .map(|entry| entry.model.provider.as_str()),
+        prefix,
+    )
+}
+
 fn model_candidates(prefix: &str) -> Vec<String> {
-    let auth_path = crate::config::Config::global_dir().join("auth.json");
-    let Ok(auth) = crate::auth::AuthStorage::load(auth_path) else {
-        return Vec::new();
-    };
-    let registry = crate::models::ModelRegistry::load(&auth, None);
+    let registry =
+        crate::models::ModelRegistry::load_for_listing_with_credential_resolver(None, |_| None);
     let lowered = prefix.to_ascii_lowercase();
     let mut out = Vec::new();
     for entry in registry.models() {
@@ -199,9 +230,12 @@ mod tests {
 
     #[test]
     fn print_script_ignores_broken_pipe_without_panicking() -> Result<()> {
-        struct BrokenPipeWriter;
-        impl std::io::Write for BrokenPipeWriter {
+        struct CountingBrokenPipeWriter {
+            writes: usize,
+        }
+        impl std::io::Write for CountingBrokenPipeWriter {
             fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
                 Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "broken pipe",
@@ -212,9 +246,80 @@ mod tests {
             }
         }
         for shell in ["bash", "zsh", "fish"] {
-            print_script(shell, &mut BrokenPipeWriter)?;
+            let mut writer = CountingBrokenPipeWriter { writes: 0 };
+            print_script(shell, &mut writer)?;
+            assert_eq!(writer.writes, 1, "{shell} should stop on first BrokenPipe");
         }
+        let mut writer = CountingBrokenPipeWriter { writes: 0 };
+        write_candidates(
+            vec!["anthropic".to_string(), "openai".to_string()],
+            &mut writer,
+        )?;
+        assert_eq!(writer.writes, 1, "complete should stop on first BrokenPipe");
+        let mut model_writer = CountingBrokenPipeWriter { writes: 0 };
+        complete("--model", "", &mut model_writer)?;
+        let mut provider_writer = CountingBrokenPipeWriter { writes: 0 };
+        complete("--provider", "", &mut provider_writer)?;
         Ok(())
+    }
+
+    #[test]
+    fn print_script_propagates_non_broken_pipe_io_errors() {
+        struct PermissionDeniedWriter;
+        impl std::io::Write for PermissionDeniedWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "write denied",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
+        assert!(print_script("bash", &mut PermissionDeniedWriter).is_err());
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
+        assert!(
+            write_candidates(vec!["anthropic".to_string()], &mut PermissionDeniedWriter).is_err()
+        );
+    }
+
+    #[test]
+    fn provider_candidates_returns_unique_provider_names_only() {
+        assert_eq!(
+            collect_provider_candidates(["openai", "anthropic", "openai", "google"], ""),
+            vec![
+                "anthropic".to_string(),
+                "google".to_string(),
+                "openai".to_string(),
+            ]
+        );
+        assert_eq!(
+            collect_provider_candidates(["openai", "anthropic", "openai", "google"], "ANTH"),
+            vec!["anthropic".to_string()]
+        );
+
+        let providers = provider_candidates("");
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
+        assert!(
+            !providers.is_empty(),
+            "built-in catalog should always provide completion providers"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
+        assert!(
+            providers.iter().any(|name| name == "anthropic"),
+            "built-in provider list should include anthropic: {providers:?}"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
+        assert!(
+            providers.iter().all(|name| !name.contains('/')),
+            "provider completions must not include provider/model paths: {providers:?}"
+        );
+        let mut sorted = providers.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(providers, sorted);
     }
 
     #[test]
