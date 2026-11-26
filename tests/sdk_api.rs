@@ -486,6 +486,34 @@ printf '%s\n' '{"type":"response","id":"rpc-3","command":"compact","success":fal
     }
 
     #[test]
+    fn oversized_local_frames_leave_the_connection_and_controls_usable() {
+        let mut client = client(
+            r#"
+IFS= read -r -n 1024 request || exit 1
+case "$request" in *'"type":"abort"'*) ;; *) exit 1 ;; esac
+IFS= read -r -n 1024 request || exit 1
+case "$request" in *'"type":"get_state"'*) ;; *) exit 1 ;; esac
+printf '%s\n' '{"type":"response","id":"rpc-4","command":"get_state","success":true,"data":{"alive":true}}'
+"#,
+        );
+        let control = client.control_handle();
+        // Each message fits the byte limit by itself. Its encoded envelope
+        // crosses it. The child must receive only the later, valid commands.
+        let oversized = || "x".repeat(128 * 1024 * 1024);
+        let error = control.steer(oversized()).expect_err("oversized control");
+        assert!(matches!(error, sdk::Error::Validation(_)));
+        let error =
+            futures::executor::block_on(client.prompt(oversized())).expect_err("oversized prompt");
+        assert!(matches!(error, sdk::Error::Validation(_)));
+        assert_eq!(control.abort().expect("control remains usable"), "rpc-3");
+        let state =
+            futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+                .expect("connection remains aligned");
+        assert_eq!(state, json!({"alive":true}));
+        client.shutdown().expect("shutdown size-limit fixture");
+    }
+
+    #[test]
     fn malformed_ack_and_early_eof_revoke_the_transport() {
         for reply in [
             r#"{"type":"response","id":"rpc-1","command":"wrong","success":true}"#,

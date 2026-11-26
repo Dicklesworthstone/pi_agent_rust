@@ -912,9 +912,11 @@ without blocking the caller's executor. A slow reader, a partial JSON response,
 or a quiet provider stream leaves other futures on the same executor able to run.
 Each connection owns a stdin worker and a stdout worker. The stdin queue holds
 one pending frame; the stdout pump retains at most one queued frame and one
-additional frame it is preparing or delivering. The existing 128 MiB per-frame
-and pre-acknowledgement limits still apply. The completed event vector remains a
-caller-visible transcript and is not covered by the pump's queue bound.
+additional frame it is preparing or delivering. Each inbound or outbound JSON
+frame can contain up to 128 MiB before its newline. This includes JSON escaping,
+request IDs, and command metadata. An oversized command returns a local validation
+error before dispatch, so the same connection and control handles remain usable.
+The collecting methods also retain delivered events for their return value.
 
 Dropping an in-flight request or prompt future closes the entire connection,
 revokes retained control handles, and starts owned process-tree cleanup. This is

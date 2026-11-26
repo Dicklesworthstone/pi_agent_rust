@@ -1397,7 +1397,7 @@ const MAX_RPC_PENDING_MESSAGES: usize = 128;
 // Match the SDK's frame ceiling while leaving room for the 64 MiB native
 // content budget, JSON escaping, and command metadata. Bound allocation before
 // parsing: checking attachment sizes after serde has read stdin is too late.
-const MAX_RPC_INPUT_FRAME_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_RPC_INPUT_FRAME_BYTES: usize = 128 * 1024 * 1024;
 // At most two unread frames plus the reader's current frame are retained by
 // stdio ingress. A count-only queue of 1024 frames can otherwise retain many
 // GiB of valid attachment requests before the dispatcher reaches them.
@@ -18958,26 +18958,47 @@ fn parse_native_prompt_content_with_catalog(
 /// Native user messages are echoed by lifecycle events, so the normalized
 /// content itself must fit the transport budget before the prompt is accepted.
 fn validate_native_prompt_wire_budget(content: &[ContentBlock], max_bytes: usize) -> Result<()> {
-    struct ByteBudget(usize);
+    write_bounded_rpc_json(io::sink(), content, max_bytes, "native content JSON")
+}
 
-    impl io::Write for ByteBudget {
+/// Serialize compact JSON, stopping before writing any chunk that would cross
+/// the wire budget (including escaped text). The frame delimiter is separate.
+pub(crate) fn write_bounded_rpc_json(
+    writer: impl Write,
+    value: &(impl serde::Serialize + ?Sized),
+    max_bytes: usize,
+    label: &str,
+) -> Result<()> {
+    struct ByteBudget<W> {
+        inner: W,
+        remaining: usize,
+    }
+
+    impl<W: Write> Write for ByteBudget<W> {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_sub(bytes.len())
-                .ok_or_else(|| io::Error::other("native content JSON exceeds wire budget"))?;
-            Ok(bytes.len())
+            if bytes.len() > self.remaining {
+                return Err(io::ErrorKind::FileTooLarge.into());
+            }
+            let written = self.inner.write(bytes)?;
+            self.remaining -= written;
+            Ok(written)
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            self.inner.flush()
         }
     }
 
-    serde_json::to_writer(&mut ByteBudget(max_bytes), content).map_err(|_| {
-        Error::validation(format!(
-            "native content JSON exceeds the {max_bytes} byte wire limit"
-        ))
+    let writer = ByteBudget {
+        inner: writer,
+        remaining: max_bytes,
+    };
+    serde_json::to_writer(writer, value).map_err(|error| {
+        if error.io_error_kind() == Some(io::ErrorKind::FileTooLarge) {
+            Error::validation(format!("{label} exceeds the {max_bytes} byte wire limit"))
+        } else {
+            error.into()
+        }
     })
 }
 
