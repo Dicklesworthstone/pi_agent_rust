@@ -30,6 +30,11 @@ capability-gated hostcall interface.
 | `node:net` | Stub | `createConnection` (stub), `Socket` (stub); `createServer` throws -- network APIs outside sandbox |
 | `node:readline` | Partial | `createInterface`, `promises.createInterface` -- questions use `pi.ui('input')` when available and resolve to empty strings otherwise |
 
+The promise-based Node `pipeline` accepts an `AbortSignal` for stream and
+iterable sources. A cancelled pipeline destroys its stages and waits for their
+cleanup. The `finished` callback and promise APIs also accept a signal. Aborting
+one of those observers leaves the stream available to its other consumers.
+
 ### Web Streams
 
 The global Web Streams constructors and `node:stream/web` exports support

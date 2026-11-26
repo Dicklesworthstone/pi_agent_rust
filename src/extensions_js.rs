@@ -19056,6 +19056,20 @@ function __streamAutoDestroys(stream) {
     (!writable || writable.autoDestroy === true);
 }
 
+function __streamValidateSignal(signal) {
+  if (signal !== undefined && (!signal || typeof signal.aborted !== "boolean" ||
+      typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")) {
+    throw new TypeError("signal must be an AbortSignal");
+  }
+}
+
+function __streamAbortError(signal) {
+  const error = __streamError("ABORT_ERR", "The operation was aborted");
+  error.name = "AbortError";
+  error.cause = signal.reason;
+  return error;
+}
+
 function __observeStreamCompletion(stream, options, callback) {
   if (!stream || typeof stream.on !== "function" || typeof stream.removeListener !== "function") {
     throw new TypeError("finished expects a stream-like object");
@@ -19064,24 +19078,27 @@ function __observeStreamCompletion(stream, options, callback) {
   const hasWritable = __streamHasWritable(stream);
   const readable = options.readable ?? hasReadable;
   const writable = options.writable ?? hasWritable;
+  const signal = options.signal;
+  __streamValidateSignal(signal);
   let readComplete = !readable || __streamReadComplete(stream);
   let writeComplete = !writable || __streamWriteComplete(stream);
   let closed = stream.closed === true;
   let settled = false;
   let cancelled = false;
   const remove = () => {
+    signal?.removeEventListener("abort", onAbort);
     stream.removeListener("end", onEnd);
     stream.removeListener("finish", onFinish);
     stream.removeListener("error", onError);
     stream.removeListener("close", onClose);
   };
   const cleanup = () => { cancelled = true; remove(); };
-  const complete = (error) => {
+  const complete = (error, observerAborted = false) => {
     if (cancelled || settled) return;
     settled = true;
     // An asynchronous destroy may still emit its error before close. Keep
     // this observer attached through that owned resource cleanup.
-    if (!error || !stream.destroyed || closed || stream.closed === true || !__streamEmitsClose(stream)) remove();
+    if (observerAborted || !error || !stream.destroyed || closed || stream.closed === true || !__streamEmitsClose(stream)) remove();
     __streamQueueMicrotask(() => {
       if (!cancelled) callback(error || null, stream);
     });
@@ -19109,6 +19126,9 @@ function __observeStreamCompletion(stream, options, callback) {
   const onEnd = () => { readComplete = true; check(); };
   const onFinish = () => { writeComplete = true; check(); };
   const onError = (error) => complete(__streamToError(error));
+  // finished() owns only this observer. Other readers and writers may still
+  // own the stream after the caller stops waiting for it.
+  const onAbort = () => { if (signal.aborted) complete(__streamAbortError(signal), true); };
   const onClose = () => {
     closed = true;
     if (settled) remove();
@@ -19119,6 +19139,10 @@ function __observeStreamCompletion(stream, options, callback) {
     stream.on("finish", onFinish);
     stream.on("error", onError);
     stream.on("close", onClose);
+    if (signal) {
+      signal.addEventListener("abort", onAbort);
+      if (signal.aborted) onAbort();
+    }
   } catch (error) {
     cleanup();
     throw error;
@@ -19143,6 +19167,11 @@ function finished(stream, options, callback) {
 
 function pipeline(...args) {
   const callback = typeof args[args.length - 1] === "function" ? args.pop() : null;
+  return __streamPipeline(args, callback);
+}
+
+function __streamPipeline(args, callback, signal) {
+  __streamValidateSignal(signal);
   const streams = args.length === 1 && Array.isArray(args[0]) ? args[0].slice() : args;
   if (streams.length < 2) throw new Error("pipeline requires at least two streams");
   const first = streams[0];
@@ -19163,13 +19192,19 @@ function pipeline(...args) {
       throw new TypeError(`pipeline destination at index ${index} is not writable`);
     }
   }
-  if (iterable) streams[0] = Readable.from(first);
+  // Before admission, even acquiring an iterator can open a resource.
+  const skipSource = iterable && signal?.aborted;
+  if (iterable && !skipSource) streams[0] = Readable.from(first);
   const last = streams[streams.length - 1];
-  const records = streams.map((stream, index) => ({
-    stream, readable: index < streams.length - 1, writable: index > 0,
-    complete: false, closed: stream.closed === true, waitClose: false,
-    observer: null, onError: null, onClose: null,
-  }));
+  const records = [];
+  for (let index = skipSource ? 1 : 0; index < streams.length; index++) {
+    const stream = streams[index];
+    records.push({
+      stream, readable: index < streams.length - 1, writable: index > 0,
+      complete: false, closed: stream.closed === true, waitClose: false,
+      observer: null, onError: null, onClose: null,
+    });
+  }
   const connections = [];
   let failure = null;
   let settingUp = true;
@@ -19185,6 +19220,7 @@ function pipeline(...args) {
     return error;
   };
   const cleanup = () => {
+    signal?.removeEventListener("abort", onAbort);
     for (const record of records) {
       record.observer?.();
       if (record.onError) record.stream.removeListener("error", record.onError);
@@ -19228,6 +19264,7 @@ function pipeline(...args) {
     destroying = false;
     maybeComplete();
   };
+  const onAbort = () => { if (signal.aborted) fail(__streamAbortError(signal)); };
   try {
     // Ownership guards outlive each completion observer. In particular, a
     // peer's asynchronous _destroy error must remain observed until close.
@@ -19253,6 +19290,10 @@ function pipeline(...args) {
         break;
       }
     }
+    if (signal && !failure) {
+      signal.addEventListener("abort", onAbort);
+      if (signal.aborted) onAbort();
+    }
     for (let index = 0; !failure && index < streams.length - 1; index++) {
       const source = streams[index];
       const destination = streams[index + 1];
@@ -19271,10 +19312,17 @@ function pipeline(...args) {
 
 const promises = {
   pipeline: (...args) => new Promise((resolve, reject) => {
-    pipeline(...args, (error, stream) => {
+    const tail = args[args.length - 1];
+    let signal;
+    if (tail && typeof tail === "object" && "signal" in tail &&
+        typeof tail.write !== "function" && !Array.isArray(tail)) {
+      if (tail.end === false) throw new TypeError("pipeline end: false is unsupported");
+      signal = args.pop().signal;
+    }
+    __streamPipeline(args, (error, stream) => {
       if (error) reject(error);
       else resolve(stream);
-    });
+    }, signal);
   }),
   finished: (stream, options) => new Promise((resolve, reject) => {
     __observeStreamCompletion(stream, options ?? {}, (error) => {
@@ -33159,10 +33207,11 @@ mod tests {
         // Iterable adapters also own pending next/value and return cleanup.
         // Pipe fanout waits for every sink and retains asynchronous teardown errors.
         // Web writable bridges await write callbacks and own abort cleanup.
+        // Pipeline abortion waits for teardown; finished owns only its observer.
         (
             "node:stream",
-            64_783,
-            "3e7b1706a96c120e2b19c7940e2b256a82fe786db241a82005ad7de0b16960bf",
+            66_733,
+            "9957b823290a5d7e03aefc52d9d7dade1dfbcd6e3a405472cdc9f68f98d4d3a9",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -49671,6 +49720,101 @@ return checks;
                 );
                 assert_eq!(observed["listeners"], json!([0, 0, 0]), "{name}: {result}");
             }
+        });
+    }
+
+    #[test]
+    fn pijs_stream_abort_cancels_owned_pipelines_and_only_the_selected_observer() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.streamAbortCases = {};
+                    (async () => {
+                        const { Readable, Writable, finished, promises } = await import("node:stream");
+                        const standalone = await import("node:stream/promises");
+                        const result = globalThis.streamAbortCases;
+                        const settle = async () => {
+                            for (let i = 0; i < 40; i++) await Promise.resolve();
+                        };
+                        const reason = new Error("extension stopped");
+                        const aborted = error => error?.name === "AbortError" &&
+                            error.code === "ABORT_ERR" && error.cause === reason;
+                        const cancelled = new AbortController();
+                        cancelled.abort(reason);
+                        let acquisitions = 0;
+                        const iterable = { *[Symbol.iterator]() { yield 1; } };
+                        const trackedSource = { [Symbol.iterator]() {
+                            acquisitions++;
+                            return iterable[Symbol.iterator]();
+                        } };
+                        const neverStarted = new Writable();
+                        try { await standalone.pipeline([trackedSource, neverStarted], { signal: cancelled.signal }); }
+                        catch (error) { result.preAborted = aborted(error) && neverStarted.closed && acquisitions === 0; }
+                        const unused = new Writable();
+                        try { await promises.pipeline(trackedSource, unused, { signal: {} }); }
+                        catch (error) { result.invalid = error instanceof TypeError && !unused.destroyed && acquisitions === 0; }
+
+                        const active = new AbortController();
+                        const close = [];
+                        const errors = [];
+                        const holdClose = (error, callback) => { errors.push(error); close.push(callback); };
+                        const source = new Readable({ read() {}, destroy: holdClose });
+                        let writes = 0;
+                        const sink = new Writable({ write() { writes++; }, destroy: holdClose });
+                        let outcome = "pending";
+                        const work = promises.pipeline(source, sink, { signal: active.signal })
+                            .then(() => { outcome = "finished"; }, error => { outcome = aborted(error) ? "aborted" : String(error); });
+                        source.push("first");
+                        await settle();
+                        active.abort(reason);
+                        await settle();
+                        result.teardown = writes === 1 && outcome === "pending" && close.length === 2 &&
+                            errors[0] === errors[1] && errors.every(aborted);
+                        for (const done of close) done();
+                        await work;
+                        result.closed = outcome === "aborted" && source.closed && sink.closed &&
+                            source.listenerCount("error") === 0 && sink.listenerCount("error") === 0;
+
+                        const waiting = new AbortController();
+                        const shared = new Writable({ autoDestroy: false });
+                        const independent = standalone.finished(shared);
+                        let observed;
+                        finished(shared, { signal: waiting.signal }, error => { observed = error; });
+                        const stop = promises.finished(shared, { signal: waiting.signal }).catch(error => error);
+                        waiting.abort(reason);
+                        await settle();
+                        result.observer = aborted(observed) && aborted(await stop) && !shared.destroyed &&
+                            shared.listenerCount("error") === 1;
+                        shared.end();
+                        await independent;
+                        result.independent = shared.writableFinished && shared.listenerCount("error") === 0;
+
+                        const completed = new AbortController();
+                        const output = [];
+                        await standalone.pipeline(["ok"], new Writable({
+                            write(chunk, encoding, done) { output.push(String(chunk)); done(); },
+                        }), { signal: completed.signal });
+                        completed.abort(reason);
+                        result.success = output.join("") === "ok";
+                    })().catch(error => { globalThis.streamAbortCases.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("exercise stream cancellation");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "streamAbortCases").await;
+            assert_eq!(
+                result,
+                json!({
+                    "preAborted": true, "invalid": true, "teardown": true, "closed": true,
+                    "observer": true, "independent": true, "success": true
+                })
+            );
         });
     }
 
