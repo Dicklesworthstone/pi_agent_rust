@@ -187,8 +187,8 @@ mod tests {
             let mut out = Vec::new();
             print_script(shell, &mut out).expect("script");
             let text = String::from_utf8(out).expect("utf8");
+            // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
             assert!(
-                // ubs:ignore test assertion
                 text.contains(expected_clap_marker),
                 "{shell} clap_complete output missing from writer ({expected_clap_marker})"
             );
