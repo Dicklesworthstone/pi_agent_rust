@@ -3801,7 +3801,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             || self.login_attempt.is_some()
             || self.fork_draft.is_some()
         {
-            self.status_message = Some("Finish the current operation before using /plan".to_string());
+            self.status_message =
+                Some("Finish the current operation before using /plan".to_string());
             return None;
         }
         let cx = Cx::current().unwrap_or_else(Cx::for_request);

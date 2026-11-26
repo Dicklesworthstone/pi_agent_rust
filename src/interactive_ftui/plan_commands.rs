@@ -607,4 +607,5 @@ fn render_review(review: &SessionPlanReview, id: Uuid) -> String {
 }
 
 #[cfg(test)]
+#[path = "plan_commands/tests.rs"]
 mod tests;

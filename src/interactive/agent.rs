@@ -1777,11 +1777,8 @@ impl PiApp {
                 }
                 self.agent_state = AgentState::Idle;
                 self.status_message = None;
-                self.messages.push(ConversationMessage::new(
-                    MessageRole::System,
-                    message,
-                    None,
-                ));
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, message, None));
                 self.scroll_to_bottom();
                 // Plan approval is a review boundary, never an instruction to
                 // drain a queued prompt into an execution turn.

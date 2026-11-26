@@ -77,7 +77,14 @@ async fn stage_and_commit_tree_navigation(
     agent
         .handle
         .session_mut()
-        .install_context_candidate(&mut live, candidate, true, &admission, "tree navigation", cx)
+        .install_context_candidate(
+            &mut live,
+            candidate,
+            true,
+            &admission,
+            "tree navigation",
+            cx,
+        )
         .await?;
     if branch_changed {
         agent.plans.clear_review();
@@ -132,7 +139,10 @@ fn install_memory_tree_navigation(
     let agent_messages = candidate.to_messages_for_current_path();
     let new_leaf_id = candidate.leaf_id().map(str::to_string);
     *live = candidate;
-    agent.handle.session_mut().invalidate_background_compaction();
+    agent
+        .handle
+        .session_mut()
+        .invalidate_background_compaction();
     agent.replace_messages(agent_messages);
     if let Some(prompt) = prompt {
         agent
@@ -528,7 +538,11 @@ impl PiApp {
         };
         // Summary generation calls the provider before the candidate installer.
         // A prior uncertain save must fence that request as well.
-        if let Err(error) = agent_guard.handle.session().ensure_provider_reentry_allowed() {
+        if let Err(error) = agent_guard
+            .handle
+            .session()
+            .ensure_provider_reentry_allowed()
+        {
             self.status_message = Some(format!("Branch switch is blocked: {error}"));
             return false;
         }
@@ -775,12 +789,18 @@ mod tests {
 
     fn approve_plan(agent: &mut InteractiveAgent) -> crate::plan::SessionPlanReview {
         let owner = crate::agent_cx::AgentCx::for_request();
-        let entered = runtime().block_on(agent.handle.enter_plan_mode(&owner)).unwrap();
+        let entered = runtime()
+            .block_on(agent.handle.enter_plan_mode(&owner))
+            .unwrap();
         assert!(!matches!(
             entered.persistence,
             crate::plan::PlanPersistence::Unconfirmed { .. }
         ));
-        assert!(agent.plan_state().submit_plan("Inspect then implement".to_string()));
+        assert!(
+            agent
+                .plan_state()
+                .submit_plan("Inspect then implement".to_string())
+        );
         let review = agent.handle.pending_plan_review().unwrap().unwrap();
         let approved = runtime()
             .block_on(agent.handle.approve_plan_review(&owner, &review))
@@ -1037,14 +1057,25 @@ mod tests {
             Some("prefix\nIndependent instructions\nsuffix")
         );
         let owner = crate::agent_cx::AgentCx::for_request();
-        let _ = runtime().block_on(agent.handle.enter_plan_mode(&owner)).unwrap();
-        assert!(agent.plan_state().submit_plan(old_review.text().to_string()));
+        let _ = runtime()
+            .block_on(agent.handle.enter_plan_mode(&owner))
+            .unwrap();
+        assert!(
+            agent
+                .plan_state()
+                .submit_plan(old_review.text().to_string())
+        );
         let current = agent.handle.pending_plan_review().unwrap().unwrap();
         assert!(!old_review.same_submission(&current));
-        assert!(runtime()
-            .block_on(agent.handle.approve_plan_review(&owner, &old_review))
-            .is_err());
-        assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::PendingApproval);
+        assert!(
+            runtime()
+                .block_on(agent.handle.approve_plan_review(&owner, &old_review))
+                .is_err()
+        );
+        assert_eq!(
+            agent.plan_state().mode(),
+            crate::plan::PlanMode::PendingApproval
+        );
     }
 
     #[test]
@@ -1060,7 +1091,10 @@ mod tests {
                 (live.header.id.clone(), live.leaf_id().map(str::to_string))
             };
             let summary = append_summary.then(|| {
-                (leaf.clone().unwrap(), "Same-branch continuation".to_string())
+                (
+                    leaf.clone().unwrap(),
+                    "Same-branch continuation".to_string(),
+                )
             });
             runtime()
                 .block_on(stage_and_commit_tree_navigation(
@@ -1080,8 +1114,7 @@ mod tests {
     #[test]
     fn staged_tree_failed_save_preserves_plan_but_fences_provider_reentry() {
         let temp = TempDir::new().unwrap();
-        let (mut raw_session, _, target) =
-            branched_session(Some(temp.path().join("sessions")));
+        let (mut raw_session, _, target) = branched_session(Some(temp.path().join("sessions")));
         raw_session.path = Some(temp.path().join("source.jsonl"));
         let session = Arc::new(Mutex::new(raw_session));
         let mut agent = test_agent(Arc::clone(&session), true);
@@ -1111,7 +1144,13 @@ mod tests {
         assert!(error.is_session_persistence());
         assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Approved);
         assert_eq!(agent.system_prompt(), prompt.as_deref());
-        assert!(agent.handle.session().ensure_provider_reentry_allowed().is_err());
+        assert!(
+            agent
+                .handle
+                .session()
+                .ensure_provider_reentry_allowed()
+                .is_err()
+        );
         let live = session.try_lock().unwrap();
         assert_eq!(live.leaf_id(), leaf.as_deref());
         assert_eq!(serde_json::to_value(&live.entries).unwrap(), entries);
@@ -1144,7 +1183,13 @@ mod tests {
         assert_eq!(session.try_lock().unwrap().leaf_id(), leaf.as_deref());
         assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Approved);
         assert_eq!(agent.system_prompt(), Some(duplicated.as_str()));
-        assert!(agent.handle.session().ensure_provider_reentry_allowed().is_ok());
+        assert!(
+            agent
+                .handle
+                .session()
+                .ensure_provider_reentry_allowed()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1154,8 +1199,14 @@ mod tests {
             let session = Arc::new(Mutex::new(raw_session));
             let mut agent = test_agent(Arc::clone(&session), false);
             let owner = crate::agent_cx::AgentCx::for_request();
-            let _ = runtime().block_on(agent.handle.enter_plan_mode(&owner)).unwrap();
-            assert!(agent.plan_state().submit_plan("Inspect then implement".to_string()));
+            let _ = runtime()
+                .block_on(agent.handle.enter_plan_mode(&owner))
+                .unwrap();
+            assert!(
+                agent
+                    .plan_state()
+                    .submit_plan("Inspect then implement".to_string())
+            );
             let review = agent.handle.pending_plan_review().unwrap().unwrap();
             if approved {
                 let _ = runtime()
@@ -1177,14 +1228,16 @@ mod tests {
             .unwrap();
             assert_eq!(agent.plan_state().mode(), mode);
             assert_eq!(agent.system_prompt(), prompt.as_deref());
-            assert!(install_memory_tree_navigation(
-                &mut agent,
-                &mut live,
-                &id,
-                leaf.as_deref(),
-                Some("missing-entry"),
-            )
-            .is_err());
+            assert!(
+                install_memory_tree_navigation(
+                    &mut agent,
+                    &mut live,
+                    &id,
+                    leaf.as_deref(),
+                    Some("missing-entry"),
+                )
+                .is_err()
+            );
             assert_eq!(agent.plan_state().mode(), mode);
             assert_eq!(agent.system_prompt(), prompt.as_deref());
             install_memory_tree_navigation(
@@ -1198,9 +1251,11 @@ mod tests {
             drop(live);
             assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Off);
             assert_eq!(agent.system_prompt(), Some("Independent instructions"));
-            assert!(runtime()
-                .block_on(agent.handle.approve_plan_review(&owner, &review))
-                .is_err());
+            assert!(
+                runtime()
+                    .block_on(agent.handle.approve_plan_review(&owner, &review))
+                    .is_err()
+            );
         }
     }
 }

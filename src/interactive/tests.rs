@@ -1638,7 +1638,10 @@ async fn classic_plan_command(
     assert!(app.plan_request.is_none());
     assert_eq!(app.agent_state, AgentState::Idle);
     assert_eq!(app.messages.len(), previous_messages + 1);
-    assert!(app.agent.try_lock().is_ok(), "owner released before completion");
+    assert!(
+        app.agent.try_lock().is_ok(),
+        "owner released before completion"
+    );
     message
 }
 
@@ -1669,8 +1672,12 @@ fn classic_plan_commands_review_exact_submission_and_remove_only_owned_context()
         .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
         .build()
         .unwrap();
-    let (mut app, mut receiver, events) =
-        classic_plan_fixture(dir.path().to_path_buf(), &runtime, Session::in_memory(), false);
+    let (mut app, mut receiver, events) = classic_plan_fixture(
+        dir.path().to_path_buf(),
+        &runtime,
+        Session::in_memory(),
+        false,
+    );
     runtime.block_on(async {
         let entered = classic_plan_command(&mut app, &mut receiver, "enter").await;
         assert!(entered.contains("Memory-only"));
@@ -1713,8 +1720,7 @@ fn classic_plan_commands_review_exact_submission_and_remove_only_owned_context()
         }
         let _ = classic_submit_plan(&app, CLASSIC_PLAN_PROPOSAL).await;
         let stale =
-            classic_plan_command(&mut app, &mut receiver, &format!("approve {first_id}"))
-                .await;
+            classic_plan_command(&mut app, &mut receiver, &format!("approve {first_id}")).await;
         assert!(stale.contains("PLAN_REVIEW_STALE"));
         assert_eq!(state.mode(), crate::plan::PlanMode::PendingApproval);
         assert_eq!(
@@ -1725,14 +1731,11 @@ fn classic_plan_commands_review_exact_submission_and_remove_only_owned_context()
         let report = classic_plan_command(&mut app, &mut receiver, "review").await;
         let reviewed_id = classic_review_id(&report);
         assert_ne!(reviewed_id, first_id);
-        app.pending_inputs
-            .push_back(PendingInput::Text("execution still needs an explicit submit".to_string()));
-        let approved = classic_plan_command(
-            &mut app,
-            &mut receiver,
-            &format!("approve {reviewed_id}"),
-        )
-        .await;
+        app.pending_inputs.push_back(PendingInput::Text(
+            "execution still needs an explicit submit".to_string(),
+        ));
+        let approved =
+            classic_plan_command(&mut app, &mut receiver, &format!("approve {reviewed_id}")).await;
         assert!(approved.contains("No execution turn was started"));
         assert_eq!(state.mode(), crate::plan::PlanMode::Approved);
         let suffix = "\nAdditional instructions from an unrelated extension.";
@@ -1788,8 +1791,7 @@ fn classic_plan_unconfirmed_approval_is_reported_and_saved_without_replaying_dec
         let durable_pending = std::fs::read(&path).unwrap();
         app.session.try_lock().unwrap().path = Some(blocked_parent.join("plan.jsonl"));
 
-        let report =
-            classic_plan_command(&mut app, &mut receiver, &format!("approve {id}")).await;
+        let report = classic_plan_command(&mut app, &mut receiver, &format!("approve {id}")).await;
         assert!(report.contains("Saving was NOT confirmed"));
         assert!(report.contains("Live plan state was not rolled back"));
         assert!(report.contains("/plan save"));
@@ -1812,8 +1814,7 @@ fn classic_plan_unconfirmed_approval_is_reported_and_saved_without_replaying_dec
             std::fs::read(&blocked_parent).unwrap(),
             b"existing unrelated file"
         );
-        let replay =
-            classic_plan_command(&mut app, &mut receiver, &format!("approve {id}")).await;
+        let replay = classic_plan_command(&mut app, &mut receiver, &format!("approve {id}")).await;
         assert!(replay.contains("No displayed proposal"));
 
         app.session.try_lock().unwrap().path = Some(path.clone());
@@ -1845,12 +1846,19 @@ fn classic_stale_plan_completion_cannot_release_newer_foreground_request() {
         .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
         .build()
         .unwrap();
-    let (mut app, mut receiver, events) =
-        classic_plan_fixture(dir.path().to_path_buf(), &runtime, Session::in_memory(), false);
+    let (mut app, mut receiver, events) = classic_plan_fixture(
+        dir.path().to_path_buf(),
+        &runtime,
+        Session::in_memory(),
+        false,
+    );
     runtime.block_on(async {
         assert!(app.submit_message("/plan enter").is_none());
         let completion = classic_plan_event(&mut receiver).await;
-        let PiMsg::PlanCommandFinished { owner_session_id, .. } = &completion else {
+        let PiMsg::PlanCommandFinished {
+            owner_session_id, ..
+        } = &completion
+        else {
             panic!("expected a real plan completion");
         };
         let owner_session_id = owner_session_id.clone();

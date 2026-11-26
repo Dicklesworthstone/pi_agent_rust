@@ -6,8 +6,8 @@ use asupersync::sync::{Mutex, OwnedMutexGuard};
 use serde_json::{Value, json};
 
 use super::{
-    AgentState, Cmd, ConversationMessage, EXTENSION_EVENT_TIMEOUT_MS, InteractiveAgent, PiApp, PiMsg,
-    conversation_from_session,
+    AgentState, Cmd, ConversationMessage, EXTENSION_EVENT_TIMEOUT_MS, InteractiveAgent, PiApp,
+    PiMsg, conversation_from_session,
 };
 use crate::checkpoint::RetryPlan;
 use crate::extension_events::{SessionBeforeCompactOutcome, apply_session_before_compact_response};
@@ -2412,12 +2412,18 @@ mod tests {
         approve: bool,
     ) -> crate::plan::SessionPlanReview {
         let owner = crate::agent_cx::AgentCx::for_request();
-        let entered = runtime().block_on(agent.handle.enter_plan_mode(&owner)).unwrap();
+        let entered = runtime()
+            .block_on(agent.handle.enter_plan_mode(&owner))
+            .unwrap();
         assert!(!matches!(
             entered.persistence,
             crate::plan::PlanPersistence::Unconfirmed { .. }
         ));
-        assert!(agent.plan_state().submit_plan("Inspect then implement".to_string()));
+        assert!(
+            agent
+                .plan_state()
+                .submit_plan("Inspect then implement".to_string())
+        );
         let review = agent.handle.pending_plan_review().unwrap().unwrap();
         if approve {
             let approved = runtime()
@@ -2493,7 +2499,13 @@ mod tests {
             ))
             .unwrap_err();
         assert!(error.is_session_persistence());
-        assert!(agent.handle.session().ensure_provider_reentry_allowed().is_err());
+        assert!(
+            agent
+                .handle
+                .session()
+                .ensure_provider_reentry_allowed()
+                .is_err()
+        );
         assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Approved);
         assert_eq!(agent.system_prompt(), prompt.as_deref());
         assert_eq!(serde_json::to_value(agent.messages()).unwrap(), messages);
