@@ -615,20 +615,22 @@ impl GitLabProvider {
     /// Build a GitLab Chat request from the agent context.
     #[allow(clippy::too_many_lines)]
     pub fn build_request(context: &Context<'_>) -> Result<GitLabChatRequest> {
-        let (primary_index, primary_user) = context
+        let primary_index = context
             .messages
             .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, message)| {
-                if let Message::User(user) = message {
-                    Some((index, user))
-                } else {
-                    None
-                }
+            .rposition(|msg| match msg {
+                Message::User(_) => true,
+                Message::Custom(custom) => !custom.content.trim().is_empty(),
+                _ => false,
             })
             .ok_or_else(|| Error::provider("gitlab", "GitLab Chat requires a user text message"))?;
-        if let UserContent::Blocks(blocks) = &primary_user.content
+        // An appended extension instruction must not turn an unsupported user
+        // attachment into silently discarded history.
+        let latest_user_input = context.messages.iter().rev().find_map(|msg| match msg {
+            Message::User(user) => Some(&user.content),
+            _ => None,
+        });
+        if let Some(UserContent::Blocks(blocks)) = latest_user_input
             && blocks
                 .iter()
                 .any(|block| !matches!(block, ContentBlock::Text(_)))
@@ -639,21 +641,10 @@ impl GitLabProvider {
             ));
         }
         let mut request_text_bytes = 0usize;
-        charge_request_text(
-            &mut request_text_bytes,
-            user_content_text_bytes(&primary_user.content),
-        )?;
         let has_trailing_tool_turns = context.messages[primary_index + 1..]
             .iter()
             .any(|msg| matches!(msg, Message::Assistant(_) | Message::ToolResult(_)));
-        let user_text = user_content_text(&primary_user.content);
-        if user_text.trim().is_empty() {
-            return Err(Error::provider(
-                "gitlab",
-                "GitLab Chat requires non-empty text in the latest user message",
-            ));
-        }
-
+        let mut primary_text = None;
         let mut additional_context = Vec::new();
 
         if let Some(system) = &context.system_prompt {
@@ -685,30 +676,21 @@ impl GitLabProvider {
             )?;
         }
 
-        let history_end = if has_trailing_tool_turns {
-            context.messages.len()
-        } else {
-            primary_index
-        };
-
-        for (i, msg) in context.messages[..history_end].iter().enumerate() {
-            match msg {
-                Message::User(user_msg) => {
-                    let text = user_content_text(&user_msg.content);
-                    if !text.trim().is_empty() {
-                        let rendered = format!("[User]: {text}");
-                        if i != primary_index {
-                            charge_request_text(&mut request_text_bytes, rendered.len())?;
-                        }
-                        push_context_item(
-                            &mut additional_context,
-                            GitLabContextItem {
-                                category: "file".to_string(),
-                                id: format!("message-{i}"),
-                                content: rendered,
-                            },
-                        )?;
+        for (i, msg) in context.messages.iter().enumerate() {
+            let text = match msg {
+                Message::User(user) => {
+                    charge_request_text(
+                        &mut request_text_bytes,
+                        user_content_text_bytes(&user.content),
+                    )?;
+                    user_content_text(&user.content)
+                }
+                Message::Custom(custom) => {
+                    if custom.content.trim().is_empty() {
+                        continue;
                     }
+                    charge_request_text(&mut request_text_bytes, custom.content.len())?;
+                    custom.content.clone()
                 }
                 Message::Assistant(asst_msg) => {
                     let mut parts = Vec::new();
@@ -746,6 +728,7 @@ impl GitLabProvider {
                             },
                         )?;
                     }
+                    continue;
                 }
                 Message::ToolResult(tool_result) => {
                     let body = tool_result
@@ -770,17 +753,37 @@ impl GitLabProvider {
                             content: rendered,
                         },
                     )?;
+                    continue;
                 }
-                Message::Custom(_) => {}
+            };
+            if text.trim().is_empty() {
+                if i == primary_index {
+                    return Err(Error::provider(
+                        "gitlab",
+                        "GitLab Chat requires non-empty text in the latest user message",
+                    ));
+                }
+            } else if i == primary_index && !has_trailing_tool_turns {
+                primary_text = Some(text);
+            } else {
+                charge_request_text(&mut request_text_bytes, "[User]: ".len())?;
+                push_context_item(
+                    &mut additional_context,
+                    GitLabContextItem {
+                        category: "file".to_string(),
+                        id: format!("message-{i}"),
+                        content: format!("[User]: {text}"),
+                    },
+                )?;
             }
         }
 
-        let content = if has_trailing_tool_turns {
+        let content = if let Some(text) = primary_text {
+            text
+        } else {
             let continuation = "Continue solving the user's request using the tool execution results in additional_context. Emit <pi_tool_call> if another tool step is required, or provide the final answer.".to_string();
             charge_request_text(&mut request_text_bytes, continuation.len())?;
             continuation
-        } else {
-            user_text
         };
 
         Ok(GitLabChatRequest {
@@ -1246,6 +1249,78 @@ mod tests {
         assert_eq!(req.content, "Tell me more.");
         // Should have 2 context items: first user msg + assistant response.
         assert_eq!(req.additional_context.len(), 2);
+    }
+
+    #[test]
+    fn custom_inputs_reach_gitlab_as_user_text_in_transcript_order() {
+        let custom = |content: &str| {
+            Message::Custom(crate::model::CustomMessage {
+                content: content.into(),
+                custom_type: "extension-event".into(),
+                display: false,
+                details: Some(serde_json::json!({"private": "host-only"})),
+                timestamp: 0,
+            })
+        };
+        let ctx = Context::owned(None, vec![custom("extension prompt")], Vec::new());
+        let request = GitLabProvider::build_request(&ctx).expect("custom-only turn");
+        assert_eq!(request.content, "extension prompt");
+        assert!(request.additional_context.is_empty());
+
+        let mut messages = vec![
+            custom("earlier extension input"),
+            Message::User(UserMessage {
+                content: UserContent::Text("original task".into()),
+                timestamp: 0,
+            }),
+            custom("correct the interrupted draft"),
+        ];
+        let ctx = Context::owned(Some("system".into()), messages.clone(), Vec::new());
+        let request = GitLabProvider::build_request(&ctx).expect("retry turn");
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "content": "correct the interrupted draft",
+                "with_clean_history": true,
+                "additional_context": [
+                    {"category": "file", "id": "system-prompt", "content": "[System]: system"},
+                    {"category": "file", "id": "message-0", "content": "[User]: earlier extension input"},
+                    {"category": "file", "id": "message-1", "content": "[User]: original task"}
+                ]
+            }),
+        );
+
+        messages.push(Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "id".into(),
+            tool_name: "read".into(),
+            content: vec![ContentBlock::Text(TextContent::new("file contents"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        }));
+        let ctx = Context::owned(None, messages, Vec::new());
+        let request = GitLabProvider::build_request(&ctx).expect("tool continuation");
+        assert!(request.content.starts_with("Continue solving"));
+        assert_eq!(request.additional_context.len(), 4);
+        assert_eq!(
+            request.additional_context[2].content,
+            "[User]: correct the interrupted draft"
+        );
+        assert!(request.additional_context[3].content.ends_with("file contents"));
+    }
+
+    #[test]
+    fn gitlab_custom_inputs_share_the_request_text_limit() {
+        let oversized = Message::Custom(crate::model::CustomMessage {
+            content: "x".repeat(MAX_GITLAB_REQUEST_TEXT_BYTES + 1),
+            custom_type: "extension-event".into(),
+            display: true,
+            details: None,
+            timestamp: 0,
+        });
+        let ctx = Context::owned(None, vec![oversized], Vec::new());
+        let error = GitLabProvider::build_request(&ctx).expect_err("oversized custom input");
+        assert!(error.to_string().contains("byte limit"));
     }
 
     #[test]

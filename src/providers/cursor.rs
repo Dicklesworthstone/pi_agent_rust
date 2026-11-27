@@ -384,17 +384,18 @@ fn render_user_content(content: &UserContent) -> String {
 /// unary-request / streaming-response `AgentService/Run` endpoint, preserving
 /// multi-turn conversation history, tool schemas, and `ToolResult` continuations.
 fn build_cursor_turn_context(context: &Context<'_>) -> Option<(Option<String>, String)> {
-    let last_user_idx = context
+    let (last_user_idx, latest_user) = context
         .messages
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(idx, msg)| matches!(msg, Message::User(_)).then_some(idx))?;
-
-    let latest_user = match &context.messages[last_user_idx] {
-        Message::User(user) => render_user_content(&user.content),
-        _ => unreachable!(),
-    };
+        .find_map(|(idx, msg)| match msg {
+            Message::User(user) => Some((idx, render_user_content(&user.content))),
+            Message::Custom(custom) if !custom.content.trim().is_empty() => {
+                Some((idx, custom.content.clone()))
+            }
+            _ => None,
+        })?;
     let has_trailing_tool_turns = context.messages[last_user_idx + 1..]
         .iter()
         .any(|msg| matches!(msg, Message::Assistant(_) | Message::ToolResult(_)));
@@ -463,6 +464,9 @@ fn build_cursor_turn_context(context: &Context<'_>) -> Option<(Option<String>, S
                     "is_error": result.is_error,
                     "content": text,
                 })
+            }
+            Message::Custom(custom) if !custom.content.trim().is_empty() => {
+                serde_json::json!({"role": "user", "content": custom.content})
             }
             Message::Custom(_) => continue,
         };
@@ -1581,6 +1585,54 @@ mod tests {
         assert_eq!(
             payload["conversation_history"],
             serde_json::json!([{"role": "user", "content": "first"}])
+        );
+    }
+
+    #[test]
+    fn custom_inputs_reach_the_cursor_user_message_and_keep_their_order() {
+        use crate::model::{CustomMessage, UserMessage};
+
+        let custom = |content: &str| {
+            Message::Custom(CustomMessage {
+                content: content.into(),
+                custom_type: "extension-event".into(),
+                display: false,
+                details: Some(serde_json::json!({"private": "host-only"})),
+                timestamp: 0,
+            })
+        };
+        let ctx = Context::owned(None, vec![custom("extension prompt")], Vec::new());
+        let (system, user) = build_cursor_turn_context(&ctx).expect("custom-only turn");
+        assert!(system.is_none());
+        assert_eq!(user, "extension prompt");
+
+        let messages = vec![
+            custom("earlier extension input"),
+            Message::User(UserMessage {
+                content: UserContent::Text("original task".into()),
+                timestamp: 0,
+            }),
+            custom("correct the interrupted draft"),
+        ];
+        let ctx = Context::owned(Some("system".into()), messages, Vec::new());
+        let (system, user) = build_cursor_turn_context(&ctx).expect("retry turn");
+        let bytes = build_run_request("model", system.as_deref(), &user, "c", "m");
+        let run = descend(&bytes, 1).unwrap();
+        assert_eq!(read_string(run, 8).as_deref(), Some("system"));
+        let action = descend(run, 2).unwrap();
+        let user_action = descend(action, 1).unwrap();
+        let message = descend(user_action, 1).unwrap();
+        let text = read_string(message, 1).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "conversation_history": [
+                    {"role": "user", "content": "earlier extension input"},
+                    {"role": "user", "content": "original task"}
+                ],
+                "request": "correct the interrupted draft"
+            }),
         );
     }
 
