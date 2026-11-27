@@ -22,6 +22,55 @@ const SESSION_INDEX_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_INDEX_GENERATION_FILENAME: &str = "session-index.generation";
 const SESSION_INDEX_METADATA_VERSION: &str = "2";
 
+/// Path spellings used only to discover saved sessions. Keep the recorded
+/// directory intact and never canonicalize every historical workspace (which
+/// could include offline network shares) while listing one project.
+#[derive(Clone)]
+pub(crate) struct DiscoveryWorkspace {
+    spellings: Vec<String>,
+}
+
+impl DiscoveryWorkspace {
+    pub(crate) fn new(cwd: &Path) -> Self {
+        let mut spellings = vec![cwd.display().to_string()];
+        if cwd.is_absolute()
+            && let Ok(canonical) = cwd.canonicalize()
+            && let Some(text) = canonical.to_str()
+        {
+            if text != spellings[0] {
+                spellings.push(text.to_owned());
+            }
+            #[cfg(windows)]
+            {
+                // An extended path can designate a different directory from
+                // its plain spelling (e.g. a final dot). Verify the ordinary
+                // form before using it to select historical session rows.
+                let ordinary = text.strip_prefix(r"\\?\UNC\").map_or_else(
+                    || {
+                        text.strip_prefix(r"\\?\")
+                            .filter(|path| path.as_bytes().get(1) == Some(&b':'))
+                            .map(str::to_owned)
+                    },
+                    |unc| Some(format!(r"\\{unc}")),
+                );
+                if let Some(ordinary) = ordinary
+                    && !spellings.contains(&ordinary)
+                    && Path::new(&ordinary).canonicalize().ok().as_ref() == Some(&canonical)
+                {
+                    spellings.push(ordinary);
+                }
+            }
+        }
+        Self { spellings }
+    }
+
+    pub(crate) fn matches(&self, recorded: &str) -> bool {
+        self.spellings
+            .iter()
+            .any(|spelling| Path::new(spelling) == Path::new(recorded))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
     pub path: String,
@@ -180,28 +229,31 @@ impl SessionIndex {
     }
 
     pub fn list_sessions(&self, cwd: Option<&str>) -> Result<Vec<SessionMeta>> {
+        self.list_sessions_for_cwds(cwd.as_slice())
+    }
+
+    fn list_sessions_for_cwds(&self, cwds: &[&str]) -> Result<Vec<SessionMeta>> {
         self.with_lock(|conn| {
             init_schema(conn)?;
 
-            let (sql, params): (&str, Vec<Value>) = cwd.map_or_else(
-                || {
-                    (
-                        "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
-                         FROM sessions ORDER BY last_modified_ms DESC",
-                        vec![],
-                    )
-                },
-                |cwd| {
-                    (
-                        "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
-                         FROM sessions WHERE cwd=?1 ORDER BY last_modified_ms DESC",
-                        vec![Value::from(cwd.to_string())],
-                    )
-                },
+            let mut sql = String::from(
+                "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name FROM sessions",
             );
-
+            let mut params = Vec::with_capacity(cwds.len());
+            if !cwds.is_empty() {
+                sql.push_str(" WHERE cwd IN (");
+                for cwd in cwds {
+                    if !params.is_empty() {
+                        sql.push(',');
+                    }
+                    sql.push('?');
+                    params.push(Value::from((*cwd).to_owned()));
+                }
+                sql.push(')');
+            }
+            sql.push_str(" ORDER BY last_modified_ms DESC");
             let rows = conn
-                .query_sync(sql, &params)
+                .query_sync(&sql, &params)
                 .map_err(|e| Error::session(format!("Query failed: {e}")))?;
 
             let mut result = Vec::new();
@@ -215,13 +267,24 @@ impl SessionIndex {
     /// Discover a workspace through the derived index, falling back to the
     /// managed session namespace if that cache cannot be read or repaired.
     /// A recovered session need not live in this workspace's storage folder.
-    pub(crate) fn discover_sessions(&self, cwd: &str) -> Vec<SessionMeta> {
+    ///
+    /// Unlike `list_sessions(Some(cwd))`, discovery includes verified path
+    /// spellings of this workspace and repairs a stale index before reading.
+    pub fn discover_sessions(&self, cwd: &str) -> Vec<SessionMeta> {
+        self.discover_sessions_for_workspace(&DiscoveryWorkspace::new(Path::new(cwd)))
+    }
+
+    pub(crate) fn discover_sessions_for_workspace(
+        &self,
+        workspace: &DiscoveryWorkspace,
+    ) -> Vec<SessionMeta> {
+        let keys: Vec<_> = workspace.spellings.iter().map(String::as_str).collect();
         let indexed = (|| -> Result<Vec<SessionMeta>> {
             self.reindex_if_stale(Duration::from_secs(60))?;
-            let mut sessions = self.list_sessions(Some(cwd))?;
+            let mut sessions = self.list_sessions_for_cwds(&keys)?;
             if sessions.is_empty() {
                 self.reindex_all()?;
-                sessions = self.list_sessions(Some(cwd))?;
+                sessions = self.list_sessions_for_cwds(&keys)?;
             }
             Ok(sessions)
         })();
@@ -234,7 +297,7 @@ impl SessionIndex {
                     .filter_map(|path| {
                         let path = path.ok()?;
                         match build_meta_from_file(&path) {
-                            Ok(meta) if meta.cwd == cwd => Some(meta),
+                            Ok(meta) if workspace.matches(&meta.cwd) => Some(meta),
                             Ok(_) => None,
                             Err(error) => {
                                 tracing::warn!(
@@ -1763,6 +1826,31 @@ mod tests {
             .expect("list sessions cwd-a");
         assert_eq!(only_a.len(), 1);
         assert_eq!(only_a[0].id, "id-a");
+    }
+
+    #[test]
+    fn discovery_finds_canonical_attachments_from_another_workspace_spelling() {
+        let temp = tempfile::tempdir().expect("fixture");
+        let project = temp.path().join("project");
+        let other = temp.path().join("other");
+        let storage = temp.path().join("sessions");
+        for directory in [&project, &other, &storage] {
+            fs::create_dir(directory).expect("fixture directory");
+        }
+        for (id, cwd) in [("target", &project), ("unrelated", &other)] {
+            let cwd = cwd.canonicalize().expect("canonical cwd");
+            write_session_jsonl(
+                &storage.join(format!("{id}.jsonl")),
+                &make_header(id, cwd.to_str().expect("UTF-8 cwd")),
+                &[make_user_entry(None, "m1", "saved turn")],
+            );
+        }
+        let workspace = DiscoveryWorkspace::new(&project.join("."));
+        let index = SessionIndex::for_sessions_root(&storage);
+        let rows = index.discover_sessions(project.join(".").to_str().expect("UTF-8 cwd"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "target");
+        assert!(workspace.matches(&rows[0].cwd));
     }
 
     #[test]
