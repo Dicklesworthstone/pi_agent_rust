@@ -25,13 +25,10 @@
 //!
 //! ## Scope
 //!
-//! The single-turn text/thinking streaming path (system prompt + latest user
-//! message → streamed assistant text, thinking and token usage) is fully
-//! implemented and unit-tested. Cursor manages multi-turn history and tool
-//! execution through a stateful checkpoint/blob (`KvClientMessage`) channel and
-//! a separate `ExecServerMessage` tool round-trip; those are intentionally *not*
-//! reimplemented here (they cannot be reconstructed correctly without live
-//! protocol capture) and are documented as follow-up work rather than guessed.
+//! Pi streams text, thinking and token usage. It replays prior turns in the
+//! next user message and translates prompt-based tool calls locally. The
+//! native checkpoint/blob (`KvClientMessage`) and tool (`ExecServerMessage`)
+//! round-trips require a separate stateful protocol.
 
 use crate::error::{Error, Result};
 use crate::http::client::Client;
@@ -362,19 +359,6 @@ fn build_run_request(
     message
 }
 
-/// Extract the text of the most recent user message from the conversation.
-///
-/// Cursor's `Run` request carries a single `UserMessage`; the agent loop resends
-/// the full history each turn, so the latest user turn is what drives this
-/// request. Prior turns (assistant/tool history) are managed server-side by
-/// Cursor via its checkpoint channel, which is not reimplemented here.
-fn latest_user_text(messages: &[Message]) -> Option<String> {
-    messages.iter().rev().find_map(|message| match message {
-        Message::User(user) => Some(render_user_content(&user.content)),
-        _ => None,
-    })
-}
-
 fn render_user_content(content: &UserContent) -> String {
     match content {
         UserContent::Text(text) => text.clone(),
@@ -431,73 +415,69 @@ fn build_cursor_turn_context(context: &Context<'_>) -> Option<(Option<String>, S
             &context.tools,
         ));
     }
-    if history_end > 0 {
-        let mut transcript = Vec::new();
-        for msg in &context.messages[..history_end] {
-            match msg {
-                Message::User(user) => {
-                    let text = render_user_content(&user.content);
-                    if !text.trim().is_empty() {
-                        transcript.push(format!("[User]\n{text}"));
-                    }
-                }
-                Message::Assistant(asst) => {
-                    let mut parts = Vec::new();
-                    for block in &asst.content {
-                        match block {
-                            ContentBlock::Text(t) if !t.text.trim().is_empty() => {
-                                parts.push(t.text.clone());
-                            }
-                            ContentBlock::ToolCall(tc) => {
-                                let args = serde_json::to_string(&tc.arguments)
-                                    .unwrap_or_else(|_| "{}".to_string());
-                                parts.push(format!(
-                                    "{}{{\"id\":{},\"name\":{},\"arguments\":{args}}}{}",
-                                    crate::provider::PI_TOOL_CALL_OPEN,
-                                    serde_json::to_string(&tc.id)
-                                        .unwrap_or_else(|_| "\"call\"".to_string()),
-                                    serde_json::to_string(&tc.name)
-                                        .unwrap_or_else(|_| "\"tool\"".to_string()),
-                                    crate::provider::PI_TOOL_CALL_CLOSE,
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !parts.is_empty() {
-                        transcript.push(format!("[Assistant]\n{}", parts.join("\n")));
-                    }
-                }
-                Message::ToolResult(tr) => {
-                    let body = tr
-                        .content
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text(t) => Some(t.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    transcript.push(format!(
-                        "[ToolResult id={} name={} is_error={}]\n{body}",
-                        tr.tool_call_id, tr.tool_name, tr.is_error
-                    ));
-                }
-                Message::Custom(_) => {}
+    // Cursor accepts one UserMessage per Run. Replay conversation data there:
+    // tool output and earlier messages must never become custom_system_prompt.
+    // Encode the transcript as JSON so content cannot introduce extra turns.
+    let mut history = Vec::new();
+    for message in &context.messages[..history_end] {
+        let turn = match message {
+            Message::User(user) => {
+                serde_json::json!({"role": "user", "content": render_user_content(&user.content)})
             }
-        }
-        if !transcript.is_empty() {
-            system_sections.push(format!(
-                "<conversation_history>\n{}\n</conversation_history>",
-                transcript.join("\n\n")
-            ));
-        }
+            Message::Assistant(assistant) => {
+                let content: Vec<_> = assistant
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => {
+                            Some(serde_json::json!({"type": "text", "text": text.text}))
+                        }
+                        ContentBlock::ToolCall(call) => Some(serde_json::json!({
+                            "type": "tool_call",
+                            "id": call.id,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if content.is_empty() {
+                    continue;
+                }
+                serde_json::json!({"role": "assistant", "content": content})
+            }
+            Message::ToolResult(result) => {
+                let text = result
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                serde_json::json!({
+                    "role": "tool",
+                    "id": result.tool_call_id,
+                    "name": result.tool_name,
+                    "is_error": result.is_error,
+                    "content": text,
+                })
+            }
+            Message::Custom(_) => continue,
+        };
+        history.push(turn);
     }
 
-    let user_text = if has_trailing_tool_turns {
-        "Continue from the latest [ToolResult] entries in <conversation_history>. Emit <pi_tool_call> if another tool step is needed, otherwise provide your final answer.".to_string()
+    let request = if has_trailing_tool_turns {
+        "Continue the conversation using the latest assistant turn and tool results.".to_string()
     } else {
         latest_user
+    };
+    let user_text = if history.is_empty() {
+        request
+    } else {
+        serde_json::json!({"conversation_history": history, "request": request}).to_string()
     };
     let effective_system = (!system_sections.is_empty()).then(|| system_sections.join("\n\n"));
     Some((effective_system, user_text))
@@ -1579,7 +1559,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_user_text_prefers_last_user_message() {
+    fn multi_turn_history_stays_in_user_message_without_a_system_prompt() {
         use crate::model::{AssistantMessage, UserMessage};
         use std::sync::Arc;
         let messages = vec![
@@ -1593,11 +1573,19 @@ mod tests {
                 timestamp: 0,
             }),
         ];
-        assert_eq!(latest_user_text(&messages).as_deref(), Some("second"));
+        let ctx = Context::owned(None, messages, Vec::new());
+        let (system, user) = build_cursor_turn_context(&ctx).expect("user turn");
+        assert!(system.is_none());
+        let payload: serde_json::Value = serde_json::from_str(&user).expect("conversation JSON");
+        assert_eq!(payload["request"], "second");
+        assert_eq!(
+            payload["conversation_history"],
+            serde_json::json!([{"role": "user", "content": "first"}])
+        );
     }
 
     #[test]
-    fn latest_user_text_joins_text_blocks() {
+    fn single_turn_preserves_plain_user_text() {
         use crate::model::UserMessage;
         let messages = vec![Message::User(UserMessage {
             content: UserContent::Blocks(vec![
@@ -1606,10 +1594,10 @@ mod tests {
             ]),
             timestamp: 0,
         })];
-        assert_eq!(
-            latest_user_text(&messages).as_deref(),
-            Some("line one\nline two")
-        );
+        let ctx = Context::owned(None, messages, Vec::new());
+        let (system, user) = build_cursor_turn_context(&ctx).expect("user turn");
+        assert!(system.is_none());
+        assert_eq!(user, "line one\nline two");
     }
 
     // ── response decoding ───────────────────────────────────────────────
@@ -1932,7 +1920,7 @@ mod tests {
         assert_eq!(asst1.usage.output, 14);
         assert_eq!(asst1.usage.total_tokens, 64);
 
-        // Turn 2: verify multi-turn history + ToolResult serialize into custom_system_prompt.
+        // Turn 2: inspect the encoded system and user fields of the next request.
         let ctx2 = Context::owned(
             Some("Base system.".to_string()),
             vec![
@@ -1960,10 +1948,35 @@ mod tests {
         );
         let (effective_sys, cont_prompt) =
             build_cursor_turn_context(&ctx2).expect("turn 2 context");
-        let sys = effective_sys.expect("system prompt present");
-        assert!(sys.contains("Base system."));
-        assert!(sys.contains("<conversation_history>"));
-        assert!(sys.contains("[package]\nname = \"pi\""));
-        assert!(cont_prompt.contains("Continue from the latest [ToolResult]"));
+        let bytes = build_run_request("model", effective_sys.as_deref(), &cont_prompt, "c2", "m2");
+        let run = descend(&bytes, 1).expect("run request");
+        let system = read_string(run, 8).expect("system prompt");
+        assert_eq!(
+            system,
+            format!(
+                "Base system.\n\n{}",
+                crate::provider::format_prompt_tool_instructions(&ctx2.tools)
+            )
+        );
+        let action = descend(run, 2).expect("action");
+        let user_action = descend(action, 1).expect("user action");
+        let message = descend(user_action, 1).expect("user message");
+        let text = read_string(message, 1).expect("user text");
+        let payload: serde_json::Value = serde_json::from_str(&text).expect("conversation JSON");
+        let history = payload["conversation_history"].as_array().expect("turns");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0]["content"], "Read Cargo.toml");
+        assert_eq!(history[1]["role"], "assistant");
+        assert_eq!(history[1]["content"][1]["id"], "cur_1");
+        assert_eq!(history[1]["content"][1]["arguments"]["path"], "Cargo.toml");
+        assert_eq!(
+            history[2],
+            serde_json::json!({
+                "role": "tool", "name": "read", "id": "cur_1", "is_error": false,
+                "content": "[package]\nname = \"pi\"",
+            })
+        );
+        let request = payload["request"].as_str().expect("request");
+        assert!(request.starts_with("Continue"));
     }
 }
