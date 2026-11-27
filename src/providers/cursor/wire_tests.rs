@@ -742,6 +742,81 @@ fn diagnostic_context() -> Context<'static> {
 }
 
 #[test]
+fn cursor_rejects_current_raw_images_before_sending_and_accepts_later_text_turns() {
+    use crate::model::{
+        ContentBlock, CustomMessage, ImageContent, Message, TextContent, UserContent, UserMessage,
+    };
+
+    let image = ContentBlock::Image(ImageContent {
+        mime_type: "image/png".into(),
+        data: "AA==".into(),
+    });
+    let user = |blocks| {
+        Message::User(UserMessage {
+            content: UserContent::Blocks(blocks),
+            timestamp: 0,
+        })
+    };
+    let image_only = user(vec![image.clone()]);
+    let mixed = user(vec![
+        ContentBlock::Text(TextContent::new("Describe this")),
+        image,
+    ]);
+    let correction = Message::Custom(CustomMessage {
+        content: "Retry the interrupted answer".into(),
+        custom_type: "stream-rule".into(),
+        details: None,
+        display: false,
+        timestamp: 0,
+    });
+
+    // This fixture accepts exactly one connection, reserved for the valid
+    // text turn after the three local refusals.
+    let mut wire = encode_frame(0, &text_message(b"accepted"));
+    wire.extend(encode_frame(CONNECT_END_STREAM_FLAG, b"{}"));
+    let (url, server) = cursor_http_server(200, "application/connect+proto", wire);
+    let provider = CursorProvider::new("cursor-text-only").with_base_url(url);
+    let options = StreamOptions {
+        api_key: Some("fixture-key".into()),
+        ..StreamOptions::default()
+    };
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for messages in [
+            vec![image_only],
+            vec![mixed.clone()],
+            vec![mixed.clone(), correction],
+        ] {
+            let ctx = Context::owned(None, messages, Vec::new());
+            let result = provider
+                .stream(&ctx, &options)
+                .now_or_never()
+                .expect("current raw images must be rejected before transport I/O");
+            let Err(error) = result else {
+                panic!("unsupported image sent to Cursor")
+            };
+            assert!(error.to_string().contains("does not support image input"));
+        }
+
+        let text = user(vec![ContentBlock::Text(TextContent::new(
+            "A text-only follow-up",
+        ))]);
+        let ctx = Context::owned(None, vec![mixed, text], Vec::new());
+        let mut output = provider.stream(&ctx, &options).await.unwrap();
+        let mut preview = String::new();
+        while let Some(event) = output.next().await {
+            if let StreamEvent::TextDelta { delta, .. } = event.unwrap() {
+                preview.push_str(&delta);
+            }
+        }
+        assert_eq!(preview, "accepted");
+    });
+    server.join().expect("text-only follow-up reached Cursor");
+}
+
+#[test]
 fn cursor_http_errors_are_bounded_redacted_and_keep_the_actual_status() {
     let credential = "cursor+credential/%42";
     let encoded = "cursor%2Bcredential%2F%2542";

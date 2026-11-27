@@ -1305,6 +1305,23 @@ impl Provider for CursorProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        // Native agent sessions have already projected unsupported images to
+        // text. Direct callers must not send a question stripped of its image.
+        let latest_user = context.messages.iter().rev().find_map(|msg| match msg {
+            Message::User(user) => Some(&user.content),
+            _ => None,
+        });
+        if let Some(UserContent::Blocks(blocks)) = latest_user
+            && blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(_)))
+        {
+            return Err(Error::provider(
+                &self.provider,
+                "Cursor does not support image input in the latest user message",
+            ));
+        }
+
         let env_token = std::env::var("CURSOR_API_KEY")
             .ok()
             .or_else(|| std::env::var("CURSOR_ACCESS_TOKEN").ok());
