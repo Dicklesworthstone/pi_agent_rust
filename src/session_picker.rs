@@ -13,7 +13,9 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, encode_cwd};
 use crate::session_index::session_file_stats;
-use crate::session_index::{SessionIndex, SessionMeta, build_meta_from_file, is_session_file_path};
+use crate::session_index::{
+    DiscoveryWorkspace, SessionIndex, SessionMeta, build_meta_from_file, is_session_file_path,
+};
 use crate::theme::{Theme, TuiStyles};
 
 mod browse;
@@ -251,9 +253,9 @@ pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
 pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec<SessionMeta> {
     let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
     let project_session_dir = base_dir.join(encode_cwd(cwd));
-    let cwd_key = cwd.display().to_string();
+    let workspace = DiscoveryWorkspace::new(cwd);
     let index = SessionIndex::for_sessions_root(&base_dir);
-    let mut sessions = index.discover_sessions(&cwd_key);
+    let mut sessions = index.discover_sessions_for_workspace(&workspace);
 
     let mut missing_paths = Vec::new();
     let mut by_path = HashMap::new();
@@ -294,7 +296,7 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
         // The storage folder is historical provenance. Reattachment moves
         // discovery to the latest binding even when this file was found by
         // scanning its original project's folder.
-        if Path::new(&meta.cwd) != cwd {
+        if !workspace.matches(&meta.cwd) {
             continue;
         }
         if meta.id.is_empty() {
@@ -1209,6 +1211,39 @@ mod tests {
         assert!(found.metas.is_empty());
         assert!(found.failed_paths.is_empty());
         assert_eq!(take_session_scan_parse_count(), 0);
+    }
+
+    #[test]
+    fn project_picker_matches_the_attached_workspace_after_index_and_disk_merge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("sessions");
+        let project = tmp.path().join("project");
+        let child = project.join("child");
+        fs::create_dir_all(&child).expect("project");
+        let requested = child.join("..");
+        let historical = storage.join("old-storage-folder");
+        let scanned = storage.join(encode_cwd(&requested));
+        fs::create_dir_all(&historical).expect("historical sessions");
+        fs::create_dir_all(&scanned).expect("current sessions");
+        let canonical = project.canonicalize().expect("canonical project");
+        for (id, cwd, folder) in [
+            ("attached", &canonical, &historical),
+            ("another-workspace", &child, &scanned),
+        ] {
+            let mut header = SessionHeader::new();
+            header.id = id.to_owned();
+            header.cwd = cwd.display().to_string();
+            fs::write(
+                folder.join(format!("{id}.jsonl")),
+                serde_json::to_vec(&header).expect("encode header"),
+            )
+            .expect("write session");
+        }
+
+        let rows = list_sessions_for_project(&requested, Some(&storage));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "attached");
+        assert_eq!(rows[0].cwd, canonical.display().to_string());
     }
 
     #[test]
