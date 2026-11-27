@@ -28520,7 +28520,8 @@ class __pi_HostcallStream {
     constructor(callId, options = undefined) {
         this.callId = callId;
         this.buffer = [];
-        this.waitResolve = null;
+        this.firstRead = null;
+        this.lastRead = null;
         this.done = false;
         this.closedByConsumer = false;
         this.bufferLimit = 16;
@@ -28553,7 +28554,7 @@ class __pi_HostcallStream {
         this.stallTimer = setTimeout(() => {
             this.stallTimer = null;
             if (this.done) return;
-            if (this.waitResolve) return;
+            if (this.firstRead) return;
             if (this.buffer.length < this.bufferLimit) return;
             const seconds = Math.max(1, Math.round(timeoutMs / 1000));
             console.warn(`Stream stalled: JS consumer did not pull for ${seconds}s`);
@@ -28566,6 +28567,24 @@ class __pi_HostcallStream {
             }
         }, timeoutMs);
     }
+    _requestFrame() {
+        if (!this.done && typeof __pi_http_stream_pull_native === 'function') {
+            __pi_http_stream_pull_native(this.callId);
+        }
+    }
+    _shiftRead() {
+        const read = this.firstRead;
+        this.firstRead = read.next;
+        if (!this.firstRead) this.lastRead = null;
+        return read;
+    }
+    _finishReads(error) {
+        while (this.firstRead) {
+            const read = this._shiftRead();
+            if (error !== undefined) read.reject(error);
+            else read.resolve({ value: undefined, done: true });
+        }
+    }
     pushChunk(chunk, isFinal) {
         if (this.closedByConsumer) {
             return;
@@ -28574,15 +28593,15 @@ class __pi_HostcallStream {
             this.done = true;
             this._clearStallTimer();
         }
-        if (this.waitResolve) {
-            const resolve = this.waitResolve;
-            this.waitResolve = null;
+        if (this.firstRead) {
             this._clearStallTimer();
-            if (isFinal && chunk === null) {
-                resolve({ value: undefined, done: true });
-            } else {
-                resolve({ value: chunk, done: false });
+            if (!isFinal || chunk !== null) {
+                this._shiftRead().resolve({ value: chunk, done: false });
             }
+            // Native credit is a single bit. Re-arm it after delivery when
+            // another already-issued next() is still waiting for its frame.
+            if (isFinal) this._finishReads();
+            else if (this.firstRead) this._requestFrame();
         } else {
             this.buffer.push({ chunk, isFinal });
             if (!this.done && this.buffer.length >= this.bufferLimit) {
@@ -28596,18 +28615,14 @@ class __pi_HostcallStream {
         }
         this.done = true;
         this._clearStallTimer();
-        if (this.waitResolve) {
-            const rej = this.waitResolve;
-            this.waitResolve = null;
-            rej({ __error: error });
+        if (this.firstRead) {
+            this._finishReads(error);
         } else {
             this.buffer.push({ __error: error });
         }
     }
     next() {
-        if (!this.done && typeof __pi_http_stream_pull_native === 'function') {
-            __pi_http_stream_pull_native(this.callId);
-        }
+        this._requestFrame();
         if (this.buffer.length > 0) {
             const entry = this.buffer.shift();
             if (!this.done) {
@@ -28627,10 +28642,10 @@ class __pi_HostcallStream {
         }
         this._clearStallTimer();
         return new Promise((resolve, reject) => {
-            this.waitResolve = (result) => {
-                if (result && result.__error) reject(result.__error);
-                else resolve(result);
-            };
+            const read = { resolve, reject, next: null };
+            if (this.lastRead) this.lastRead.next = read;
+            else this.firstRead = read;
+            this.lastRead = read;
         });
     }
     return() {
@@ -28646,7 +28661,7 @@ class __pi_HostcallStream {
         }
         this.done = true;
         this.buffer = [];
-        this.waitResolve = null;
+        this._finishReads();
         this._clearStallTimer();
         return Promise.resolve({ value: undefined, done: true });
     }
@@ -33263,8 +33278,8 @@ mod tests {
         // UTF-8 encoding (f774e7185), adding 4,300 reviewed bytes.
         (
             BRIDGE_RECEIPT,
-            327_273,
-            "01c93fc327ab8f954e777e7c0170a55500659c5a07d827104cb2404ce8c795bc",
+            327_818,
+            "ddd85a04980ae6e85041705fd341ab60715fcc4b1852432917311ad50da2a062",
         ),
         // Demand-driven file reads add byte ranges and owned descriptor cleanup.
         // Incremental write acknowledgements, descriptor ownership and amortized
@@ -39139,6 +39154,76 @@ return checks;
     }
 
     #[test]
+    fn pijs_deferred_http_completes_overlapping_reads_in_order() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            for (terminal, expected) in [
+                (
+                    HostcallOutcome::StreamChunk {
+                        sequence: 2,
+                        chunk: json!("last"),
+                        is_final: true,
+                    },
+                    json!(["head", "body", "last", "EOF"]),
+                ),
+                (
+                    HostcallOutcome::Error {
+                        code: "io".to_string(),
+                        message: "connection lost".to_string(),
+                    },
+                    json!(["head", "body", "io", "io"]),
+                ),
+            ] {
+                runtime
+                    .eval(
+                        r"
+                        globalThis.results = [];
+                        {
+                            const stream = pi.http({url:'https://example.com/', stream:true});
+                            Promise.all(Array.from({length: 4}, () => stream.next().then(
+                                frame => frame.done ? 'EOF' : frame.value,
+                                error => error.code,
+                            ))).then(frames => { globalThis.results = frames; });
+                        }
+                        ",
+                    )
+                    .await
+                    .expect("enqueue overlapping reads");
+                let requests = runtime.drain_hostcall_requests();
+                assert_eq!(requests.len(), 1);
+                let call_id = &requests[0].call_id;
+                let producer = DeferredHttpTestStream::new(
+                    vec![
+                        HostcallOutcome::StreamChunk {
+                            sequence: 0,
+                            chunk: json!("head"),
+                            is_final: false,
+                        },
+                        HostcallOutcome::StreamChunk {
+                            sequence: 1,
+                            chunk: json!("body"),
+                            is_final: false,
+                        },
+                        terminal,
+                    ],
+                    false,
+                );
+                let polls = Rc::clone(&producer.polls);
+                runtime
+                    .defer_hostcall_stream(call_id, Box::pin(producer))
+                    .expect("defer stream");
+                for _ in 0..3 {
+                    runtime.tick().await.expect("deliver next requested frame");
+                }
+                assert_eq!(polls.get(), 3);
+                assert_eq!(get_global_json(&runtime, "results").await, expected);
+            }
+        });
+    }
+
+    #[test]
     fn pijs_deferred_http_cancel_drops_pending_future_immediately() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
@@ -39159,7 +39244,11 @@ return checks;
             runtime.tick().await.expect("poll pending headers");
             assert_eq!(drops.get(), 0);
             runtime
-                .eval("response.return(); response.return();")
+                .eval(
+                    "Promise.all([response.next(), response.next()]).then(frames => { \
+                       globalThis.cancelledReads = frames.map(frame => frame.done); }); \
+                     response.return(); response.return();",
+                )
                 .await
                 .expect("cancel twice");
             assert_eq!(drops.get(), 1, "cancel must drop without a later tick");
@@ -39167,6 +39256,10 @@ return checks;
             assert!(!runtime.is_hostcall_active(call_id));
             runtime.tick().await.expect("deliver cancellation sentinel");
             assert_eq!(runtime.pending_hostcall_count(), 0);
+            assert_eq!(
+                get_global_json(&runtime, "cancelledReads").await,
+                json!([true, true])
+            );
         });
     }
 
