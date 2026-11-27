@@ -97,6 +97,13 @@ compdef _pi_dynamic pi 2>/dev/null || true
 #[allow(clippy::needless_raw_string_hashes)]
 const FISH_DYNAMIC_WRAPPER: &str = r#"
 # pi dynamic values (bd-cv653.7.2): models + sessions via `pi __complete`
+function __pi_dynamic_context
+    set -l tokens (commandline -opc)
+    test (count $tokens) -gt 0; or return 1
+    set -l flag $tokens[-1]
+    contains -- $flag --model --provider --smol --slow --session --resume
+end
+
 function __pi_dynamic
     set -l tokens (commandline -opc)
     set -l flag $tokens[-1]
@@ -105,7 +112,9 @@ function __pi_dynamic
             pi __complete $flag (commandline -ct) 2>/dev/null
     end
 end
-complete -c pi -f -a '(__pi_dynamic)' 2>/dev/null || true
+# Only suppress file completions while completing dynamic values. An
+# unconditional '-f' here disabled normal file/path completion for all pi commands.
+complete -c pi -n '__pi_dynamic_context' -f -a '(__pi_dynamic)' 2>/dev/null || true
 "#;
 
 /// Answer `pi __complete <flag> [prefix]` candidates (one per line).
@@ -267,6 +276,23 @@ mod tests {
                 "{shell} should delegate before registering the wrapper"
             );
         }
+    }
+
+    #[test]
+    fn fish_dynamic_values_do_not_disable_other_file_completions() {
+        let mut output = Vec::new();
+        print_script("fish", &mut output).expect("fish completion script");
+        let script = String::from_utf8(output).expect("UTF-8 fish completion script");
+        let wrapper = script
+            .rfind("function __pi_dynamic_context")
+            .map(|offset| &script[offset..])
+            .expect("fish dynamic context guard");
+        assert!(wrapper.contains("contains -- $flag --model --provider --smol --slow --session --resume"));
+        assert!(wrapper.contains("complete -c pi -n '__pi_dynamic_context' -f -a '(__pi_dynamic)'"));
+        assert!(
+            !wrapper.contains("complete -c pi -f -a '(__pi_dynamic)'"),
+            "fish must not unconditionally disable file completion"
+        );
     }
 
     #[test]
