@@ -23820,6 +23820,19 @@ impl AgentSession {
         require_incomplete_tail: bool,
         authority: &ProviderTransitionAuthority,
     ) -> Result<()> {
+        self.restore_retry_tail_outcome(cx, require_incomplete_tail, authority)
+            .await
+            .map(|_| ())
+    }
+
+    /// Retain the rewind outcome for native callers without changing the
+    /// recovery drivers' public contract or duplicating the durable transition.
+    async fn restore_retry_tail_outcome(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        require_incomplete_tail: bool,
+        authority: &ProviderTransitionAuthority,
+    ) -> Result<bool> {
         let admission = &authority.gate;
         let session_store = Arc::clone(&self.session);
         let mut inner = await_session_preparation(authority.abort.as_ref(), async {
@@ -23841,7 +23854,7 @@ impl AgentSession {
         let needs_persist_check =
             save_enabled && (candidate.path.is_some() || !candidate.entries.is_empty());
         if !reverted && !needs_persist_check {
-            return Ok(());
+            return Ok(false);
         }
 
         let restored_messages = reverted.then(|| candidate.to_messages_for_current_path());
@@ -23876,7 +23889,7 @@ impl AgentSession {
             *inner = candidate;
         }
         admission.clear();
-        Ok(())
+        Ok(reverted)
     }
 
     /// Everything a fallback-chain swap does to the session and the live agent.
@@ -27350,20 +27363,36 @@ impl AgentSession {
         .await
     }
 
+    /// Abandon the last user turn only after its rewind is durably accepted.
+    /// Rewinding leaves the current branch, so any live plan review, approval,
+    /// owned prompt context and prepared compaction must retire with it.
+    /// Failed or interrupted persistence preserves the live view and fences
+    /// later provider requests until the session is reopened.
     pub async fn revert_last_user_message(&mut self) -> Result<bool> {
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let mut session = self
-            .session
-            .lock(cx.cx())
+        let admission = self.provider_admission_gate();
+        admission.ensure_allowed()?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission_gate();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
+        let store = Arc::clone(&self.session);
+        let mut live = OwnedMutexGuard::lock(store, cx.cx())
             .await
-            .map_err(|e| Error::session(e.to_string()))?;
-
-        let reverted = session.revert_last_user_message();
-        if reverted {
-            let messages = session.to_messages_for_current_path();
-            self.agent.replace_messages(messages);
+            .map_err(|error| Error::session(error.to_string()))?;
+        let mut candidate = live.clone();
+        if !candidate.revert_last_user_message() {
+            return Ok(false);
         }
-        Ok(reverted)
+        self.install_context_candidate(
+            &mut live,
+            candidate,
+            true,
+            &admission,
+            "native user-turn rewind",
+            cx.cx(),
+        )
+        .await?;
+        Ok(true)
     }
 
     /// Revert only the incomplete trailing assistant output of a failed request
@@ -27372,21 +27401,17 @@ impl AgentSession {
     /// *resumes* the turn (`run_continue_with_abort`) rather than replaying it
     /// from the user message (pi_agent_rust#125). Syncs the agent's in-memory
     /// transcript to the reverted session path so a subsequent resume streams
-    /// from the last completed state.
+    /// from the last completed state. Uses the same durable, admitted recovery
+    /// path as automatic retries: completed tools and the current turn's plan
+    /// approval remain valid, while stale background compaction is discarded.
     pub async fn revert_incomplete_response(&mut self) -> Result<bool> {
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let mut session = self
-            .session
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(e.to_string()))?;
-
-        let reverted = session.revert_incomplete_response();
-        if reverted {
-            let messages = session.to_messages_for_current_path();
-            self.agent.replace_messages(messages);
-        }
-        Ok(reverted)
+        let admission = self.provider_admission_gate();
+        admission.ensure_allowed()?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission_gate();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
+        self.restore_retry_tail_outcome(&cx, false, &authority).await
     }
 
     async fn dispatch_input_event(

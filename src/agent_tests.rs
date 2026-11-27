@@ -7262,6 +7262,8 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum PublicRecovery {
         Retry,
+        RevertUser,
+        RevertIncomplete,
         CommitFailover,
         WalkFailover,
         RestorePrimary,
@@ -7281,6 +7283,10 @@ mod tests {
         );
         match operation {
             PublicRecovery::Retry => session.restore_retry_tail(&cx, true).await,
+            PublicRecovery::RevertUser => session.revert_last_user_message().await.map(|_| ()),
+            PublicRecovery::RevertIncomplete => {
+                session.revert_incomplete_response().await.map(|_| ())
+            }
             PublicRecovery::CommitFailover => {
                 let request = FailoverSwapRequest {
                     entry: target,
@@ -7384,6 +7390,8 @@ mod tests {
         runtime.block_on(async {
             for operation in [
                 PublicRecovery::Retry,
+                PublicRecovery::RevertUser,
+                PublicRecovery::RevertIncomplete,
                 PublicRecovery::CommitFailover,
                 PublicRecovery::WalkFailover,
                 PublicRecovery::RestorePrimary,
@@ -7440,6 +7448,8 @@ mod tests {
         runtime.block_on(async {
             for operation in [
                 PublicRecovery::Retry,
+                PublicRecovery::RevertUser,
+                PublicRecovery::RevertIncomplete,
                 PublicRecovery::CommitFailover,
                 PublicRecovery::WalkFailover,
                 PublicRecovery::RestorePrimary,
@@ -7519,6 +7529,8 @@ mod tests {
         runtime.block_on(async {
             for operation in [
                 PublicRecovery::Retry,
+                PublicRecovery::RevertUser,
+                PublicRecovery::RevertIncomplete,
                 PublicRecovery::CommitFailover,
                 PublicRecovery::WalkFailover,
                 PublicRecovery::RestorePrimary,
@@ -7572,6 +7584,99 @@ mod tests {
                 // away; cancellation may leave its earlier write in flight.
                 asupersync::runtime::spawn_blocking(|| {}).await;
             }
+        });
+    }
+
+    #[test]
+    fn native_rewinds_persist_the_selected_path_and_retire_prepared_compaction() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async {
+            for incomplete_only in [false, true] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (mut session, provider, _) = public_recovery_fixture(dir.path());
+                let store = Arc::clone(&session.session);
+                let cx = AgentCx::for_current_or_request();
+                let (path, entry_ids) = {
+                    let mut stored = store.lock(cx.cx()).await.expect("session");
+                    stored.save().await.expect("save original history");
+                    (
+                        stored.path.clone().expect("saved path"),
+                        stored
+                            .entries
+                            .iter()
+                            .map(|entry| entry.base().id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                session.park_pending_compaction_for_test(&runtime_handle, None);
+                assert!(session.has_pending_background_compaction());
+                let changed = if incomplete_only {
+                    session.revert_incomplete_response().await
+                } else {
+                    session.revert_last_user_message().await
+                }
+                .expect("durable rewind");
+                assert!(changed);
+                assert!(!session.has_pending_background_compaction());
+                let expected_messages = if incomplete_only {
+                    vec![user_message("accepted input")]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    serde_json::to_value(session.agent.messages()).expect("live messages"),
+                    serde_json::to_value(&expected_messages).expect("expected messages"),
+                );
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen accepted rewind");
+                assert_eq!(
+                    serde_json::to_value(reopened.to_messages_for_current_path())
+                        .expect("durable messages"),
+                    serde_json::to_value(expected_messages).expect("expected messages"),
+                );
+                assert_eq!(
+                    reopened.leaf_id(),
+                    store.try_lock().expect("live session").leaf_id(),
+                );
+                for id in entry_ids {
+                    assert!(
+                        reopened.get_entry(&id).is_some(),
+                        "rewinding must retain abandoned history for branch navigation",
+                    );
+                }
+                assert!(provider.calls().lock().expect("calls").is_empty());
+                session
+                    .ensure_provider_reentry_allowed()
+                    .expect("accepted rewind remains usable");
+            }
+        });
+    }
+
+    #[test]
+    fn native_incomplete_rewind_reports_no_change_but_checks_persistence() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (mut session, provider, _) = public_recovery_fixture(dir.path());
+            assert!(session.revert_incomplete_response().await.expect("first rewind"));
+            assert!(
+                !session
+                    .revert_incomplete_response()
+                    .await
+                    .expect("no incomplete tail")
+            );
+            let blocked = dir.path().join("blocked.jsonl");
+            std::fs::create_dir(&blocked).expect("unwritable session target");
+            session.session.try_lock().expect("session").path = Some(blocked);
+            let error = session
+                .revert_incomplete_response()
+                .await
+                .expect_err("a no-tail recovery cannot skip durable verification");
+            assert!(error.is_session_persistence());
+            assert!(session.ensure_provider_reentry_allowed().is_err());
+            assert!(provider.calls().lock().expect("calls").is_empty());
         });
     }
 

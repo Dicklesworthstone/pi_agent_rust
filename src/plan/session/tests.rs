@@ -375,6 +375,133 @@ fn retry_and_user_rewind_remove_approval_from_the_abandoned_context() {
 }
 
 #[test]
+fn native_rewind_distinguishes_branch_departure_from_same_turn_recovery() {
+    for save in [false, true] {
+        for incomplete_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut stored = Session::in_memory();
+            if save {
+                stored.path = Some(temp.path().join("native-plan-rewind.jsonl"));
+            }
+            let (mut handle, _) = fixture(stored, save);
+            let owner = AgentCx::for_request();
+            let _ = run(handle.enter_plan_mode(&owner)).unwrap();
+            let review = submit(&handle);
+            let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
+            let prompt = handle.session().agent.system_prompt().unwrap().to_string();
+            let state = handle.session().agent.plan_state();
+            let store = handle.session_store();
+            let messages = {
+                let mut stored = store.try_lock().unwrap();
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text("implement the plan".to_string()),
+                    timestamp: Some(0),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: crate::model::AssistantMessage {
+                        content: vec![crate::model::ContentBlock::Text(
+                            crate::model::TextContent::new("interrupted output"),
+                        )],
+                        api: "openai-completions".to_string(),
+                        provider: "openai".to_string(),
+                        model: "plan-control-fixture".to_string(),
+                        usage: crate::model::Usage::default(),
+                        stop_reason: crate::model::StopReason::Error,
+                        stop_details: None,
+                        error_message: Some("connection interrupted".to_string()),
+                        timestamp: 0,
+                    },
+                });
+                stored.to_messages_for_current_path()
+            };
+            handle.session_mut().agent.replace_messages(messages);
+            let changed = if incomplete_only {
+                run(handle.session_mut().revert_incomplete_response())
+            } else {
+                run(handle.session_mut().revert_last_user_message())
+            }
+            .unwrap();
+            assert!(changed);
+            if incomplete_only {
+                assert_eq!(state.mode(), PlanMode::Approved);
+                assert_eq!(state.approved_plan().as_deref(), Some(review.text()));
+                assert!(state.allows_effects(ToolEffects::write()));
+                assert_eq!(
+                    handle.session().agent.system_prompt(),
+                    Some(prompt.as_str()),
+                );
+            } else {
+                assert_eq!(state.mode(), PlanMode::Planning);
+                assert!(state.plan().is_none());
+                assert!(!state.allows_effects(ToolEffects::write()));
+                assert_eq!(
+                    handle.session().agent.system_prompt(),
+                    Some("original instructions"),
+                );
+            }
+            handle
+                .session()
+                .ensure_provider_reentry_allowed()
+                .expect("accepted rewind");
+        }
+    }
+}
+
+#[test]
+fn failed_native_rewind_preserves_the_approved_branch_and_prompt() {
+    for incomplete_only in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut stored = Session::in_memory();
+        stored.path = Some(temp.path().join("native-plan-failed-rewind.jsonl"));
+        let (mut handle, _) = fixture(stored, true);
+        let owner = AgentCx::for_request();
+        let _ = run(handle.enter_plan_mode(&owner)).unwrap();
+        let review = submit(&handle);
+        let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
+        let store = handle.session_store();
+        let source = {
+            let mut stored = store.try_lock().unwrap();
+            stored.append_message(crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Text("keep this turn".to_string()),
+                timestamp: Some(0),
+            });
+            stored.append_message(crate::session::SessionMessage::Assistant {
+                message: crate::model::AssistantMessage {
+                    content: vec![crate::model::ContentBlock::Text(
+                        crate::model::TextContent::new("partial response"),
+                    )],
+                    api: "openai-completions".to_string(),
+                    provider: "openai".to_string(),
+                    model: "plan-control-fixture".to_string(),
+                    usage: crate::model::Usage::default(),
+                    stop_reason: crate::model::StopReason::Error,
+                    stop_details: None,
+                    error_message: Some("connection interrupted".to_string()),
+                    timestamp: 0,
+                },
+            });
+            stored.path = Some(temp.path().to_path_buf());
+            stored.leaf_id().unwrap().to_string()
+        };
+        let prompt = handle.session().agent.system_prompt().unwrap().to_string();
+        let result = if incomplete_only {
+            run(handle.session_mut().revert_incomplete_response())
+        } else {
+            run(handle.session_mut().revert_last_user_message())
+        };
+        assert!(result.unwrap_err().is_session_persistence());
+        assert_eq!(store.try_lock().unwrap().leaf_id(), Some(source.as_str()));
+        assert_eq!(handle.session().agent.plan_state().mode(), PlanMode::Approved);
+        assert_eq!(
+            handle.session().agent.plan_state().approved_plan().as_deref(),
+            Some(review.text()),
+        );
+        assert_eq!(handle.session().agent.system_prompt(), Some(prompt.as_str()));
+        assert!(handle.session().ensure_provider_reentry_allowed().is_err());
+    }
+}
+
+#[test]
 fn append_only_context_replacement_keeps_the_current_plan_and_prompt() {
     let (mut handle, owner, review) = pending();
     let _ = run(handle.approve_plan_review(&owner, &review)).unwrap();
