@@ -1306,7 +1306,11 @@ mod tests {
             request.additional_context[2].content,
             "[User]: correct the interrupted draft"
         );
-        assert!(request.additional_context[3].content.ends_with("file contents"));
+        assert!(
+            request.additional_context[3]
+                .content
+                .ends_with("file contents")
+        );
     }
 
     #[test]

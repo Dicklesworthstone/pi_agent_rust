@@ -1876,6 +1876,43 @@ pub mod configured_tests {
         OAuthCallbackPortLockGuard(Some(guard))
     }
 
+    fn reserve_localhost_ipv4_listener() -> (TcpListener, u16) {
+        for _ in 0..64 {
+            let ipv4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .expect("reserve IPv4 OAuth callback port");
+            let port = ipv4.local_addr().expect("reserved IPv4 address").port();
+            match TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+                Ok(_ipv6) => return (ipv4, port),
+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(_) => return (ipv4, port),
+            }
+        }
+        panic!("could not reserve a free loopback OAuth callback port on IPv4/IPv6");
+    }
+
+    fn reserve_localhost_ipv6_listener() -> Option<(TcpListener, u16)> {
+        for _ in 0..64 {
+            let Ok(ipv6) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+                return None;
+            };
+            let port = ipv6.local_addr().expect("occupied address").port();
+            match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                Ok(_ipv4) => return Some((ipv6, port)),
+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(err) => panic!("reserve IPv4 companion port: {err}"),
+            }
+        }
+        panic!("could not reserve a free loopback OAuth callback port on IPv6/IPv4");
+    }
+
+    /// Reserve an ephemeral loopback port currently free on IPv4 and (when
+    /// supported) IPv6 so configured-client OAuth tests never collide with
+    /// fixed port 3000 or another listener on the host.
+    pub(crate) fn reserve_localhost_callback_port() -> u16 {
+        let (_listener, port) = reserve_localhost_ipv4_listener();
+        port
+    }
+
     pub struct OAuthFixture {
         pub(crate) origin: String,
         methods: Vec<String>,
@@ -2272,9 +2309,7 @@ pub mod configured_tests {
         let temp = tempfile::tempdir().expect("credential directory");
         let binding = AuthBinding::new(temp.path(), "configured", &fixture.resource())
             .expect("configured auth binding");
-        let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("callback port reservation");
-        let port = reservation.local_addr().expect("reserved address").port();
-        drop(reservation);
+        let port = reserve_localhost_callback_port();
         let redirect = format!("http://localhost:{port}/registered%20callback");
         let options = McpOAuthConfig {
             client_id: Some("configured-client".to_string()),
@@ -2429,9 +2464,7 @@ pub mod configured_tests {
                 .expect("public client binding");
             let browser = Arc::new(Mutex::new(Vec::new()));
             let callback = browser_callback(Arc::clone(&browser), fixture.metadata().issuer);
-            let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("callback port");
-            let port = reservation.local_addr().expect("callback address").port();
-            drop(reservation);
+            let port = reserve_localhost_callback_port();
             let options = McpOAuthConfig {
                 client_id: Some("public-configured-client".to_string()),
                 scope: scope.map(str::to_string),
@@ -2668,8 +2701,7 @@ pub mod configured_tests {
 
     #[test]
     fn occupied_callback_port_never_falls_back_to_an_unregistered_port() {
-        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("occupied callback port");
-        let port = occupied.local_addr().expect("occupied address").port();
+        let (occupied, port) = reserve_localhost_ipv4_listener();
         let redirect = format!("http://localhost:{port}/registered%20callback");
         for options in [
             McpOAuthConfig {
@@ -2759,10 +2791,9 @@ pub mod configured_tests {
 
     #[test]
     fn a_localhost_callback_also_receives_a_browser_on_ipv6_loopback() {
-        let Ok(occupied) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+        let Some((occupied, port)) = reserve_localhost_ipv6_listener() else {
             return; // This host has no IPv6 loopback for a browser to use.
         };
-        let port = occupied.local_addr().expect("occupied address").port();
         let redirect = format!("http://localhost:{port}/callback");
         let options = McpOAuthConfig {
             redirect_uri: Some(redirect.clone()),

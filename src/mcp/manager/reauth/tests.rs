@@ -4,6 +4,7 @@
 use super::*;
 use crate::mcp::auth::configured_tests::{
     CapturedRequest, OAuthFixture, browser_callback, fixture_response, http_response,
+    reserve_localhost_callback_port,
 };
 use crate::mcp::config::McpDiscovery;
 use crate::mcp::trust::TrustDecision;
@@ -98,12 +99,13 @@ fn file_manager(temp: &tempfile::TempDir, url: &str) -> (McpManager, PathBuf, Pa
     std::fs::create_dir_all(&global).expect("global directory");
     let source = workspace.join(".pi/mcp.json");
     let shadow = global.join("mcp.json");
+    let callback_port = reserve_localhost_callback_port();
     std::fs::write(&source, json!({
         "$schema":"fixture-schema", "clientFlags":{"preserve":true},
         "mcpServers":{
             "remote":{"url":url,"cwd":"${workspaceFolder}","timeout":5000,
                 "headers":{"aUtHoRiZaTiOn":"Bearer expired","X-Tenant":"workspace"},
-                "oauth":{"clientId":"fixture-public-client"}},
+                "oauth":{"clientId":"fixture-public-client","callbackPort":callback_port}},
             "untouched":{"url":format!("{url}/other"),"headers":{"Authorization":"Bearer other"}}
         }
     }).to_string()).expect("winning project definition");
@@ -180,9 +182,19 @@ fn reauth_repairs_only_the_winning_source_and_restores_live_and_reloaded_tools()
             source_value["mcpServers"]["remote"]["cwd"],
             "${workspaceFolder}"
         );
+        let expected_callback_port = old
+            .config
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.callback_port)
+            .expect("fixture callback port");
         assert_eq!(
             source_value["mcpServers"]["remote"]["oauth"]["clientId"],
             "fixture-public-client"
+        );
+        assert_eq!(
+            source_value["mcpServers"]["remote"]["oauth"]["callbackPort"],
+            json!(expected_callback_port)
         );
         assert_eq!(
             source_value["mcpServers"]["untouched"]["headers"]["Authorization"],

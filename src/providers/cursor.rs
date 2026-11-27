@@ -384,18 +384,19 @@ fn render_user_content(content: &UserContent) -> String {
 /// unary-request / streaming-response `AgentService/Run` endpoint, preserving
 /// multi-turn conversation history, tool schemas, and `ToolResult` continuations.
 fn build_cursor_turn_context(context: &Context<'_>) -> Option<(Option<String>, String)> {
-    let (last_user_idx, latest_user) = context
-        .messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, msg)| match msg {
-            Message::User(user) => Some((idx, render_user_content(&user.content))),
-            Message::Custom(custom) if !custom.content.trim().is_empty() => {
-                Some((idx, custom.content.clone()))
-            }
-            _ => None,
-        })?;
+    let (last_user_idx, latest_user) =
+        context
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, msg)| match msg {
+                Message::User(user) => Some((idx, render_user_content(&user.content))),
+                Message::Custom(custom) if !custom.content.trim().is_empty() => {
+                    Some((idx, custom.content.clone()))
+                }
+                _ => None,
+            })?;
     let has_trailing_tool_turns = context.messages[last_user_idx + 1..]
         .iter()
         .any(|msg| matches!(msg, Message::Assistant(_) | Message::ToolResult(_)));
