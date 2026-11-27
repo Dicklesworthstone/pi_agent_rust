@@ -68,7 +68,9 @@ _pi_dynamic() {
             return 0
             ;;
     esac
-    return 1
+    # Preserve clap's full subcommand/flag/file completion for every other word.
+    # This wrapper only takes ownership of the six dynamic value positions.
+    _pi "$@"
 }
 complete -o default -F _pi_dynamic pi 2>/dev/null || true
 "#;
@@ -86,7 +88,8 @@ _pi_dynamic() {
             return 0
             ;;
     esac
-    return 1
+    # Hand ordinary positions back to the generated completion function.
+    _pi "$@"
 }
 compdef _pi_dynamic pi 2>/dev/null || true
 "#;
@@ -236,6 +239,34 @@ mod tests {
             assert!(text.contains("__complete"), "{shell} wrapper missing");
         }
         assert!(print_script("powershell", &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn dynamic_shell_wrappers_preserve_generated_completions() {
+        for (shell, delegate, wrapper_registration) in [
+            ("bash", "    _pi \"$@\"", "complete -o default -F _pi_dynamic pi"),
+            ("zsh", "    _pi \"$@\"", "compdef _pi_dynamic pi"),
+        ] {
+            let mut output = Vec::new();
+            print_script(shell, &mut output).expect("completion script");
+            let script = String::from_utf8(output).expect("UTF-8 completion script");
+            let wrapper = script
+                .rfind("_pi_dynamic() {")
+                .map(|offset| &script[offset..])
+                .expect("dynamic wrapper is emitted");
+            assert!(
+                wrapper.contains(delegate),
+                "{shell} must delegate non-dynamic words to clap's handler"
+            );
+            assert!(
+                wrapper.contains(wrapper_registration),
+                "{shell} must register its delegating wrapper"
+            );
+            assert!(
+                wrapper.find(delegate) < wrapper.find(wrapper_registration),
+                "{shell} should delegate before registering the wrapper"
+            );
+        }
     }
 
     #[test]
