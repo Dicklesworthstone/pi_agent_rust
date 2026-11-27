@@ -9965,9 +9965,7 @@ pub(crate) async fn run_bash_command_pty(
     if cx.checkpoint().is_err() {
         return Ok(bash_cancelled_before_start(timeout_secs));
     }
-    let child = pair
-        .slave
-        .spawn_command(pty_cmd)
+    let child = spawn_pty_command(pair.slave.as_ref(), pty_cmd)
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell} on PTY: {e}")))?;
     let mut child = PtyProcessGuard::new(child, shell_state);
     // Drop our handle to the slave side so the master sees EOF when the child
@@ -18400,6 +18398,36 @@ pub fn guard_unix_process_spawn<T>(spawn: impl FnOnce() -> T) -> T {
     spawn()
 }
 
+/// Cross-platform wrapper around [`guard_unix_process_spawn`] for internal
+/// subprocess spawns that do not go through [`spawn_command_with_job_discipline`].
+pub(crate) fn guard_process_spawn<T>(spawn: impl FnOnce() -> T) -> T {
+    #[cfg(unix)]
+    {
+        guard_unix_process_spawn(spawn)
+    }
+    #[cfg(not(unix))]
+    {
+        spawn()
+    }
+}
+
+/// Spawn a command onto a PTY slave while holding `OPENPTY_CLOEXEC_GATE`'s
+/// shared read lock on Unix so concurrent PTY-vs-PTY allocations cannot inherit
+/// each other's transiently non-`FD_CLOEXEC` slave descriptors.
+pub(crate) fn spawn_pty_command(
+    slave: &dyn portable_pty::SlavePty,
+    command: portable_pty::CommandBuilder,
+) -> std::result::Result<Box<dyn portable_pty::Child + Send + Sync>, String> {
+    let result = {
+        #[cfg(unix)]
+        let _guard = OPENPTY_CLOEXEC_GATE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slave.spawn_command(command)
+    };
+    result.map_err(|err| err.to_string())
+}
+
 /// Open a native PTY pair while preventing concurrent guarded subprocess spawns
 /// from inheriting the descriptors before `portable-pty` marks them `FD_CLOEXEC`.
 pub(crate) fn open_pty_pair(
@@ -25229,10 +25257,20 @@ mod tests {
             use std::sync::atomic::{AtomicBool, Ordering};
             use std::time::Instant;
 
-            struct ChildReaper(Vec<std::process::Child>);
+            struct ChildReaper {
+                plain: Vec<std::process::Child>,
+                pty: Vec<(
+                    Box<dyn portable_pty::MasterPty + Send>,
+                    Box<dyn portable_pty::Child + Send + Sync>,
+                )>,
+            }
             impl Drop for ChildReaper {
                 fn drop(&mut self) {
-                    for child in &mut self.0 {
+                    for child in &mut self.plain {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    for (_master, child) in &mut self.pty {
                         let _ = child.kill();
                         let _ = child.wait();
                     }
@@ -25255,15 +25293,28 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let spawner_stop = Arc::clone(&stop);
             let handle = thread::spawn(move || {
-                let mut children = ChildReaper(Vec::new());
-                while !spawner_stop.load(Ordering::Acquire) && children.0.len() < 16 {
+                let mut children = ChildReaper {
+                    plain: Vec::new(),
+                    pty: Vec::new(),
+                };
+                while !spawner_stop.load(Ordering::Acquire)
+                    && (children.plain.len() + children.pty.len()) < 16
+                {
                     let mut cmd = Command::new("/bin/sh");
                     cmd.args(["-c", "exec sleep 10"])
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
                         .stderr(Stdio::null());
-                    if let Ok(child) = guard_unix_process_spawn(|| cmd.spawn()) {
-                        children.0.push(child);
+                    if let Ok(child) = guard_process_spawn(|| cmd.spawn()) {
+                        children.plain.push(child);
+                    }
+                    if let Ok(other_pair) = open_pty_pair(portable_pty::PtySize::default()) {
+                        let mut pty_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+                        pty_cmd.args(["-c", "exec sleep 10"]);
+                        if let Ok(child) = spawn_pty_command(other_pair.slave.as_ref(), pty_cmd) {
+                            drop(other_pair.slave);
+                            children.pty.push((other_pair.master, child));
+                        }
                     }
                     thread::sleep(Duration::from_millis(1));
                 }

@@ -1036,9 +1036,8 @@ fn open_in_browser(url: &str) -> std::io::Result<()> {
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(drop)
+        .stderr(std::process::Stdio::null());
+    crate::tools::guard_process_spawn(|| command.spawn()).map(drop)
 }
 
 /// A thinking entry while thinking is hidden: one line saying how much.

@@ -181,7 +181,7 @@ fn spawn(
     }
     let native = {
         let _owner = owner.cx().clone().set_current_restricted();
-        pair.slave.spawn_command(command).map_err(|error| {
+        crate::tools::spawn_pty_command(pair.slave.as_ref(), command).map_err(|error| {
             tool_err(
                 "DAP_TERMINAL_SPAWN",
                 format!("cannot launch debuggee: {error}"),

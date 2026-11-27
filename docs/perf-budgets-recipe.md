@@ -154,7 +154,13 @@ registry):
   scripts use, still fails open.)
 - `RCH_BUILD_TIMEOUT_SEC=3600` / `RCH_TEST_TIMEOUT_SEC=7200` raise rch's
   300 s / 1800 s defaults, which a cold all-targets check or test of this
-  crate exceeds.
+  crate exceeds. When invoking `dsr quality --tool pi_agent_rust` directly,
+  also raise DSR's own per-check timeout ceiling (default 3600 s) so Check 5
+  and Check 6 are not killed mid-compile with exit 124:
+  `TMPDIR=/tmp TEMP=/tmp TMP=/tmp DSR_QUALITY_TIMEOUT=7200 dsr quality --tool pi_agent_rust --check-timeout 7200`. When running `dsr quality --tool pi_agent_rust` cold on
+  contended workers, also pass `DSR_QUALITY_TIMEOUT=7200` (or
+  `--check-timeout 7200`) so DSR's outer per-check supervisor (default 3600 s)
+  does not kill Check 5 or Check 6 before RCH's 7200 s test budget completes.
 
 Run the recipe from the primary checkout path (`/data/projects/pi_agent_rust`
 on the swarm host), not from a temporary worktree, and do not edit the tree

@@ -593,10 +593,9 @@ fn remove_sidecar_dir_best_effort(sidecar_path: &Path, trash_cmd: &str) -> Resul
 }
 
 fn try_trash_with_cmd(path: &Path, trash_cmd: &str) -> bool {
-    let child = std::process::Command::new(trash_cmd)
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .spawn();
+    let mut command = std::process::Command::new(trash_cmd);
+    command.arg(path).stdin(std::process::Stdio::null());
+    let child = crate::tools::guard_process_spawn(|| command.spawn());
     let mut child = match child {
         Ok(child) => child,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,

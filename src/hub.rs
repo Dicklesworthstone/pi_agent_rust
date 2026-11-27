@@ -1743,9 +1743,7 @@ fn spawn_pty(spec: &LaunchSpec, request: &ServiceRequest) -> Result<SpawnedServi
         reg.ensure_accepting_starts()?;
         reg.check_request(request)?;
     }
-    let child = pair
-        .slave
-        .spawn_command(cmd)
+    let child = crate::tools::spawn_pty_command(pair.slave.as_ref(), cmd)
         .map_err(|e| Error::tool("hub", format!("Failed to spawn service: {e}")))?;
     drop(pair.slave);
     Ok(SpawnedService {

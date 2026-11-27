@@ -10971,7 +10971,7 @@ fn run_tool_with_timeout(
         command.current_dir(cwd);
     }
 
-    let mut child = command.spawn()?;
+    let mut child = crate::tools::guard_process_spawn(|| command.spawn())?;
     let started = Instant::now();
     let mut timed_out = false;
     loop {

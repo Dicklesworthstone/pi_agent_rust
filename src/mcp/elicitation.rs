@@ -825,7 +825,7 @@ async fn open_external_url(url: &str) -> io::Result<()> {
     // Do not attach the user's browser to a kill-on-close Windows Job or an
     // agent process group. The existing guard owns only the launcher itself.
     let mut child = crate::tools::ProcessGuard::new(
-        command.spawn()?,
+        crate::tools::guard_process_spawn(|| command.spawn())?,
         crate::tools::ProcessCleanupMode::ChildOnly,
     );
     let deadline = Instant::now() + Duration::from_secs(5);
