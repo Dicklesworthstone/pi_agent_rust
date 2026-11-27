@@ -395,11 +395,10 @@ impl TmuxWheelGuard {
     fn run_tmux_command_line(command: &str) {
         use std::io::Write as _;
 
-        let Ok(mut child) = std::process::Command::new("tmux")
-            .args(["source-file", "-"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        else {
+        let mut cmd = std::process::Command::new("tmux");
+        cmd.args(["source-file", "-"])
+            .stdin(std::process::Stdio::piped());
+        let Ok(mut child) = crate::tools::guard_process_spawn(|| cmd.spawn()) else {
             return;
         };
 

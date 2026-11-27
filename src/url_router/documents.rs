@@ -1100,14 +1100,15 @@ fn ssh_write_document_inner(
         ));
     }
     let script = remote_write_script(&target.path, original);
-    let mut child = std::process::Command::new("ssh")
+    let mut command = std::process::Command::new("ssh");
+    command
         .args(ssh_command_flags())
         .arg(&target.host)
         .arg(&script)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = crate::tools::guard_process_spawn(|| command.spawn())
         .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: failed to run ssh: {e}")))?;
     // A remote refusal can close stdin before a large payload finishes. Reap
     // the process and read its named diagnostic even when that write breaks.
@@ -1393,14 +1394,15 @@ fn transfer_push(local: &Path, remote: &SshTarget) -> Result<serde_json::Value> 
         src.seek(std::io::SeekFrom::Start(resumed_from))
             .map_err(|e| Error::tool("transfer", format!("seek {resumed_from}: {e}")))?;
         let script = format!("cat >> {}", sh_quote(&remote.path));
-        let mut child = std::process::Command::new("ssh")
+        let mut command = std::process::Command::new("ssh");
+        command
             .args(ssh_command_flags())
             .arg(&remote.host)
             .arg(&script)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        let mut child = crate::tools::guard_process_spawn(|| command.spawn())
             .map_err(|e| Error::tool("transfer", format!("PI_SSH_BACKEND: spawn: {e}")))?;
         {
             let mut stdin = child
@@ -1446,14 +1448,15 @@ fn transfer_pull(remote: &SshTarget, local: &Path) -> Result<serde_json::Value> 
             resumed_from + 1,
             sh_quote(&remote.path)
         );
-        let mut child = std::process::Command::new("ssh")
+        let mut command = std::process::Command::new("ssh");
+        command
             .args(ssh_command_flags())
             .arg(&remote.host)
             .arg(&script)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        let mut child = crate::tools::guard_process_spawn(|| command.spawn())
             .map_err(|e| Error::tool("transfer", format!("PI_SSH_BACKEND: spawn: {e}")))?;
         {
             let mut stdout = child
