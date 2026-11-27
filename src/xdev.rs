@@ -581,6 +581,15 @@ impl Tool for XdevTool {
             .union(crate::tools::ToolEffects::process())
     }
 
+    fn effects_for_input(&self, input: &Value) -> crate::tools::ToolEffects {
+        match input.get("action").and_then(Value::as_str).unwrap_or("list") {
+            "list" | "describe" | "promote" => crate::tools::ToolEffects::read(),
+            // Only the Agent can resolve a run target's effects. Other hosts
+            // must retain the conservative union rather than infer authority.
+            _ => self.effects(),
+        }
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,

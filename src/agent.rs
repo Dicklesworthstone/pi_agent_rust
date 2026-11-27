@@ -3457,7 +3457,7 @@ impl Agent {
                 return None;
             }
             let registry = self.tools.snapshot();
-            let live_index = if registry.get("xdev").is_some() {
+            let live_index = if registry.has_generated_dispatcher() {
                 let promoted = self
                     .promoted_tools
                     .lock()
@@ -6902,12 +6902,19 @@ impl Agent {
         // Resolve before any policy await: an invalid route must not acquire
         // an unapproved target through a callback that changes the registry.
         // The executor checks the dispatcher and target again before running.
-        let xdev_target = match Self::resolve_xdev_run(&self.tools.snapshot(), &tool_call) {
-            Ok(target) => target,
-            Err(mut output) => {
-                self.mask_secrets_in_output(&mut output);
-                return (output, true);
-            }
+        let (native_dispatcher, xdev_target) = {
+            let registry = self.tools.snapshot();
+            let target = match Self::resolve_xdev_run(&registry, &tool_call) {
+                Ok(target) => target,
+                Err(mut output) => {
+                    self.mask_secrets_in_output(&mut output);
+                    return (output, true);
+                }
+            };
+            (
+                tool_call.name == "xdev" && registry.has_generated_dispatcher(),
+                target,
+            )
         };
         let mut policy_calls = vec![&tool_call];
         if let Some(target) = &xdev_target {
@@ -6983,18 +6990,15 @@ impl Agent {
             (output, true)
         } else {
             let tool_started_at = Instant::now();
-            let outcome = if parallel_only {
-                self.execute_tool_without_hooks_with_admission(
+            let outcome = self
+                .execute_tool_without_hooks_with_admission(
                     &tool_call,
                     Arc::clone(&on_event),
                     expected_session,
-                    true,
+                    parallel_only,
+                    native_dispatcher,
                 )
-                .await
-            } else {
-                self.execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), expected_session)
-                    .await
-            };
+                .await;
             record_local_tool_latency(&latency, tool_started_at.elapsed());
             outcome
         };
@@ -7061,23 +7065,26 @@ impl Agent {
         {
             return;
         }
+        Self::mask_tool_output_with_vault(output, &self.secrets_vault);
+    }
+
+    fn mask_tool_output_with_vault(output: &mut ToolOutput, vault: &crate::secrets::SecretVault) {
         for block in &mut output.content {
             if let ContentBlock::Text(t) = block {
-                t.text = self.secrets_vault.mask(&t.text);
+                t.text = vault.mask(&t.text);
             }
         }
         if let Some(details) = &mut output.details {
-            *details = crate::secrets::mask_known_json(details, &self.secrets_vault)
-                .unwrap_or_else(|error| {
-                    // A diagnostic cannot retain raw output as a fallback.
-                    // Keep the tool's execution outcome, but replace unsafe
-                    // details with an explicit, value-free omission record.
-                    json!({
-                        "schema": crate::secrets::SECRETS_SCHEMA,
-                        "detailsOmitted": true,
-                        "reason": error.to_string(),
-                    })
-                });
+            *details = crate::secrets::mask_known_json(details, vault).unwrap_or_else(|error| {
+                // A diagnostic cannot retain raw output as a fallback.
+                // Keep the tool's execution outcome, but replace unsafe
+                // details with an explicit, value-free omission record.
+                json!({
+                    "schema": crate::secrets::SECRETS_SCHEMA,
+                    "detailsOmitted": true,
+                    "reason": error.to_string(),
+                })
+            });
         }
     }
 
@@ -7317,6 +7324,9 @@ impl Agent {
         if registry.get("xdev").is_none() {
             return Err(Self::tool_not_found_output("xdev"));
         }
+        if !registry.has_generated_dispatcher() {
+            return Ok(None);
+        }
         let name = tool_call
             .arguments
             .get("name")
@@ -7351,27 +7361,27 @@ impl Agent {
         Ok(Some(target))
     }
 
-    /// xdev dispatcher interception (bd-cv653.1.6). `run` executes the inner
-    /// tool through the normal `Tool::execute` contract (its own input
-    /// validation produces the named errors); `promote` moves the tool into
-    /// the live schema and invalidates the def cache. Returns `None` for
-    /// `list`/`describe` (the XdevTool handles those itself).
+    /// Native discovery interception using the executor's admitted snapshot.
+    /// Run shares the direct invocation lifecycle; promotion changes the next
+    /// provider schema. List/describe remain owned by the generated tool.
     async fn dispatch_xdev(
         &self,
+        registry: &ToolRegistry,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
         expected_session: Option<&str>,
         parallel_only: bool,
     ) -> Option<ToolOutput> {
-        // The dispatcher must itself be mounted. Keep the same snapshot for
-        // its target so a disabled xdev cannot execute or promote other tools.
-        let registry = self.tools.snapshot();
-        registry.get("xdev")?;
+        // A same-name host/extension tool retains its own execution contract.
+        // Keep the admitted snapshot for both dispatcher and target.
+        if !registry.has_generated_dispatcher() {
+            return None;
+        }
         let args = &tool_call.arguments;
         let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
         match action {
             "run" => {
-                let inner_call = match Self::resolve_xdev_run(&registry, tool_call) {
+                let inner_call = match Self::resolve_xdev_run(registry, tool_call) {
                     Ok(Some(target)) => target,
                     Ok(None) => return None,
                     Err(output) => return Some(output),
@@ -7379,52 +7389,16 @@ impl Agent {
                 let Some(inner) = registry.get(&inner_call.name) else {
                     return Some(Self::tool_not_found_output(&inner_call.name));
                 };
-                let inner_args = &inner_call.arguments;
-                // Retain the same handle for this check and execution. A
-                // policy await may have replaced the previously read-only
-                // discovery target with an ordered or mutating tool.
-                if parallel_only && !inner.effects_for_input(inner_args).parallel_safe() {
-                    return Some(Self::parallel_tool_admission_changed(expected_session));
-                }
-                let protect = |parts: &[&str]| {
-                    let privacy = crate::text_completion::AuxiliaryPrivacy::from_settings(
-                        self.config.secrets.as_ref(),
-                    );
-                    self.project_auxiliary_inputs(parts, &privacy)
-                };
-                let host = AgentToolInvocationHost::new(self, on_event);
-                let snapshot_privacy = || {
-                    crate::text_completion::AuxiliaryPrivacySnapshot::with_vault(
-                        crate::text_completion::AuxiliaryPrivacy::from_settings(
-                            self.config.secrets.as_ref(),
-                        ),
-                        &self.secrets_vault,
+                let (output, _) = self
+                    .execute_resolved_tool(
+                        inner,
+                        &inner_call,
+                        tool_call,
+                        on_event,
+                        expected_session,
+                        parallel_only,
                     )
-                };
-                let output = inner
-                    .execute_with_invocation(
-                        &tool_call.id,
-                        inner_args.clone(),
-                        None,
-                        crate::tools::ToolInvocationContext {
-                            protect: &protect,
-                            host: if expected_session.is_none() {
-                                Some(&host)
-                            } else {
-                                None
-                            },
-                            snapshot_privacy: &snapshot_privacy,
-                        },
-                    )
-                    .await
-                    .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
-                if self
-                    .check_invocation_session(expected_session)
-                    .await
-                    .is_ok()
-                {
-                    self.record_prewalk_evidence(inner, inner_args, &output);
-                }
+                    .await;
                 Some(output)
             }
             "promote" => {
@@ -7486,12 +7460,17 @@ impl Agent {
         Value::Object(details)
     }
 
-    /// Effective side effects for a tool call (bd-cv653.3.5): for `xdev run`
-    /// dispatches, the INNER tool's actual arguments decide (read-only runs
-    /// stay allowed in plan mode). Unknown names default to read-only here;
-    /// the not-found path produces its own error downstream.
+    /// Effective side effects for a call, including the native dispatcher's
+    /// actual target arguments. Same-name host tools keep their own effects.
     fn effects_for_call(&self, tool_call: &ToolCall) -> crate::tools::ToolEffects {
-        if tool_call.name == "xdev" {
+        Self::effects_for_call_in_registry(&self.tools.snapshot(), tool_call)
+    }
+
+    fn effects_for_call_in_registry(
+        registry: &ToolRegistry,
+        tool_call: &ToolCall,
+    ) -> crate::tools::ToolEffects {
+        if tool_call.name == "xdev" && registry.has_generated_dispatcher() {
             let action = tool_call
                 .arguments
                 .get("action")
@@ -7509,30 +7488,36 @@ impl Agent {
             // reach the tool unchanged so its conservative validation applies.
             let default_args = json!({});
             let inner_args = tool_call.arguments.get("args").unwrap_or(&default_args);
-            return self
-                .tools
-                .snapshot()
+            return registry
                 .get(inner)
                 .map_or_else(crate::tools::ToolEffects::read, |tool| {
                     tool.effects_for_input(inner_args)
                 });
         }
-        self.tools
-            .snapshot()
+        registry
             .get(&tool_call.name)
             .map_or_else(crate::tools::ToolEffects::read, |tool| {
                 tool.effects_for_input(&tool_call.arguments)
             })
     }
 
+    #[cfg(test)]
     async fn execute_tool_without_hooks(
         &self,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
         expected_session: Option<&str>,
     ) -> (ToolOutput, bool) {
-        self.execute_tool_without_hooks_with_admission(tool_call, on_event, expected_session, false)
-            .await
+        let native_dispatcher =
+            tool_call.name == "xdev" && self.tools.snapshot().has_generated_dispatcher();
+        self.execute_tool_without_hooks_with_admission(
+            tool_call,
+            on_event,
+            expected_session,
+            false,
+            native_dispatcher,
+        )
+        .await
     }
 
     async fn execute_tool_without_hooks_with_admission(
@@ -7541,16 +7526,32 @@ impl Agent {
         on_event: AgentEventHandler,
         expected_session: Option<&str>,
         parallel_only: bool,
+        expected_native_dispatcher: bool,
     ) -> (ToolOutput, bool) {
         if let Err(error) = self.check_invocation_session(expected_session).await {
             return (Self::xdev_text_output(&error.to_string(), true), true);
         }
-        // Plan-mode gate (bd-cv653.3.5): Planning/PendingApproval reject any
-        // tool whose effects intersect the mutation/process BARRIER set. For
-        // xdev run calls the INNER tool's effects decide, not the union.
+        let registry = self.tools.snapshot();
+        // Approval was for one route. Switching between a native dispatcher
+        // and a host tool while policy awaited must not acquire an unapproved
+        // target or execute an unrelated handler under the same name.
+        if tool_call.name == "xdev"
+            && registry.has_generated_dispatcher() != expected_native_dispatcher
+        {
+            return (
+                Self::xdev_text_output(
+                    "TOOL_DISPATCH_CHANGED: discovery dispatcher changed during tool approval; retry the call against the current tool catalog",
+                    true,
+                ),
+                true,
+            );
+        }
+        // Recheck plan effects against the same snapshot used for execution.
+        // Discovery runs use the actual target's effects; custom xdev tools
+        // cannot borrow the native dispatcher's read-only list/promote policy.
         if !self
             .plan_state
-            .allows_effects(self.effects_for_call(tool_call))
+            .allows_effects(Self::effects_for_call_in_registry(&registry, tool_call))
         {
             return (
                 Self::xdev_text_output(
@@ -7561,12 +7562,10 @@ impl Agent {
             );
         }
 
-        // Load modes (bd-cv653.1.6): intercept the xdev dispatcher's
-        // run/promote actions. The policy pipeline has already admitted both
-        // the dispatcher and the resolved target; this lookup rechecks routing.
         if tool_call.name == "xdev"
             && let Some(output) = self
                 .dispatch_xdev(
+                    &registry,
                     tool_call,
                     Arc::clone(&on_event),
                     expected_session,
@@ -7578,31 +7577,88 @@ impl Agent {
             return (output, is_error);
         }
 
-        // Find the tool in the current registry snapshot (kept alive for the
-        // duration of the call so the handle outlives the await below).
-        let registry = self.tools.snapshot();
         let Some(tool) = registry.get(&tool_call.name) else {
             return (Self::tool_not_found_output(&tool_call.name), true);
         };
+        self.execute_resolved_tool(
+            tool,
+            tool_call,
+            tool_call,
+            on_event,
+            expected_session,
+            parallel_only,
+        )
+        .await
+    }
 
-        let tool_name = tool_call.name.clone();
-        let tool_id = tool_call.id.clone();
-        let tool_args = tool_call.arguments.clone();
-        let update_event = Arc::clone(&on_event);
-
-        let update_callback = move |update: ToolUpdate| {
-            update_event(AgentEvent::ToolExecutionUpdate {
+    fn tool_update_callback(
+        &self,
+        tool_call: &ToolCall,
+        event_call: &ToolCall,
+        on_event: AgentEventHandler,
+    ) -> Box<dyn Fn(ToolUpdate) + Send + Sync> {
+        let tool_name = event_call.name.clone();
+        let tool_id = event_call.id.clone();
+        let dispatched_name = (tool_call.name != event_call.name).then(|| tool_call.name.clone());
+        // The Agent is immutably borrowed for execution, so this snapshot
+        // contains every secret known to the invocation without retaining an
+        // Agent reference in the tool's 'static update callback.
+        let progress_vault = (crate::secrets::SecretsMode::from_setting(
+            self.config.secrets.as_ref().and_then(|s| s.mode.as_deref()),
+        ) != crate::secrets::SecretsMode::Off)
+            .then(|| self.secrets_vault.clone());
+        let tool_args = progress_vault.as_ref().map_or_else(
+            || event_call.arguments.clone(),
+            |vault| {
+                crate::secrets::mask_known_json(&event_call.arguments, vault)
+                    .unwrap_or_else(|error| {
+                        json!({
+                            "schema": crate::secrets::SECRETS_SCHEMA,
+                            "argumentsOmitted": true,
+                            "reason": error.to_string(),
+                        })
+                    })
+            },
+        );
+        Box::new(move |update: ToolUpdate| {
+            let mut partial_result = ToolOutput {
+                content: update.content,
+                details: update.details,
+                is_error: false,
+            };
+            if let Some(name) = &dispatched_name {
+                partial_result.details = Some(Self::xdev_dispatch_details(
+                    name,
+                    partial_result.details.take(),
+                ));
+            }
+            if let Some(vault) = &progress_vault {
+                Self::mask_tool_output_with_vault(&mut partial_result, vault);
+            }
+            on_event(AgentEvent::ToolExecutionUpdate {
                 tool_call_id: tool_id.clone(),
                 tool_name: tool_name.clone(),
                 args: tool_args.clone(),
-                partial_result: ToolOutput {
-                    content: update.content,
-                    details: update.details,
-                    is_error: false,
-                },
+                partial_result,
             });
-        };
+        })
+    }
 
+    /// Invoke one retained tool handle through the same lifecycle whether it
+    /// was called directly or selected by the native discovery dispatcher.
+    /// `event_call` keeps progress attached to the provider's original call;
+    /// `tool_call` supplies the admitted target's arguments and identity.
+    async fn execute_resolved_tool(
+        &self,
+        tool: &dyn Tool,
+        tool_call: &ToolCall,
+        event_call: &ToolCall,
+        on_event: AgentEventHandler,
+        expected_session: Option<&str>,
+        parallel_only: bool,
+    ) -> (ToolOutput, bool) {
+        let update_callback =
+            self.tool_update_callback(tool_call, event_call, Arc::clone(&on_event));
         let _artifact_session_guard =
             self.config
                 .stream_options
@@ -7655,7 +7711,7 @@ impl Agent {
             .execute_with_invocation(
                 &tool_call.id,
                 tool_call.arguments.clone(),
-                Some(Box::new(update_callback)),
+                Some(update_callback),
                 context,
             )
             .await;
@@ -12096,6 +12152,431 @@ mod extensions_integration_tests {
         }
     }
 
+    struct StreamingArtifactTool {
+        name: &'static str,
+        root: PathBuf,
+        effects: ToolEffects,
+        observed: Arc<StdMutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Tool for StreamingArtifactTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn label(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Tool with streamed progress and retained output"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Extension
+        }
+
+        fn effects(&self) -> ToolEffects {
+            self.effects
+        }
+
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            input: Value,
+            on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            self.observed.lock().expect("invocations").push(input.clone());
+            let token = input.get("token").and_then(Value::as_str).unwrap_or("");
+            let mut text = format!("progress:{token}");
+            let mut details = Some(json!({
+                "echo": token,
+                "dispatchedVia": "tool-owned",
+                "tool": "tool-owned",
+                "resultDetails": { "preserved": true },
+            }));
+            assert!(crate::tools::attach_truncated_text_artifact(
+                Some(&self.root),
+                &mut text,
+                &mut details,
+                self.name,
+                tool_call_id,
+                "streaming-test",
+                "retained tool output",
+            ));
+            if let Some(on_update) = on_update {
+                on_update(ToolUpdate {
+                    content: vec![ContentBlock::Text(TextContent::new(text))],
+                    details: details.clone(),
+                });
+            }
+            if input.get("fail").and_then(Value::as_bool) == Some(true) {
+                return Err(Error::tool(self.name, "failure after streamed output"));
+            }
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("completed"))],
+                details,
+                is_error: false,
+            })
+        }
+    }
+
+    fn streaming_discovery_registry(
+        root: &Path,
+        observed: Arc<StdMutex<Vec<Value>>>,
+    ) -> ToolRegistry {
+        let config: crate::config::Config = serde_json::from_value(json!({
+            "tools": { "loadMode": { "progress_artifact": "discoverable" } },
+        }))
+        .expect("discovery config");
+        let mut registry = ToolRegistry::with_builtin_tool_policy(
+            &["read"],
+            root,
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
+        registry.push(Box::new(StreamingArtifactTool {
+            name: "progress_artifact",
+            root: root.to_path_buf(),
+            effects: ToolEffects::read(),
+            observed,
+        }));
+        registry
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn direct_and_discovered_tools_stream_masked_progress_and_session_artifacts() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for via_dispatcher in [false, true] {
+                for secrets_mode in ["obfuscate", "off"] {
+                    for fail in [false, true] {
+                        let root = tempfile::tempdir().expect("artifact workspace");
+                        let observed = Arc::new(StdMutex::new(Vec::new()));
+                        let tools =
+                            streaming_discovery_registry(root.path(), Arc::clone(&observed));
+                        let raw = "invocation-private-value";
+                        let mut agent = Agent::new(
+                            Arc::new(NoopProvider),
+                            tools,
+                            AgentConfig {
+                                stream_options: StreamOptions {
+                                    session_id: Some("progress-owner".to_string()),
+                                    ..StreamOptions::default()
+                                },
+                                secrets: Some(crate::secrets::SecretsSettings {
+                                    mode: Some(secrets_mode.to_string()),
+                                    extra_patterns: Some(vec![regex::escape(raw)]),
+                                }),
+                                ..AgentConfig::default()
+                            },
+                        );
+                        let visible = agent
+                            .secrets_transform_outbound_text(raw)
+                            .expect("outbound value");
+                        assert_eq!(visible == raw, secrets_mode == "off");
+                        let arguments = json!({ "token": visible, "fail": fail });
+                        let call = ToolCall {
+                            id: format!("progress-{}", root.path().display()),
+                            name: if via_dispatcher { "xdev" } else { "progress_artifact" }.into(),
+                            arguments: if via_dispatcher {
+                                json!({
+                                    "action": "run",
+                                    "name": "progress_artifact",
+                                    "args": arguments,
+                                })
+                            } else {
+                                arguments
+                            },
+                            thought_signature: None,
+                        };
+                        let updates = Arc::new(StdMutex::new(Vec::new()));
+                        let recorded = Arc::clone(&updates);
+                        let (output, is_error) = agent
+                            .execute_tool(
+                                call.clone(),
+                                Arc::new(move |event| {
+                                    if let AgentEvent::ToolExecutionUpdate {
+                                        tool_call_id,
+                                        tool_name,
+                                        args,
+                                        partial_result,
+                                    } = event
+                                    {
+                                        recorded.lock().expect("progress").push((
+                                            tool_call_id,
+                                            tool_name,
+                                            args,
+                                            partial_result,
+                                        ));
+                                    }
+                                }),
+                                test_turn_latency(),
+                            )
+                            .await;
+                        assert_eq!(is_error, fail);
+                        assert_eq!(output.is_error, fail);
+                        assert_eq!(observed.lock().expect("invocations").len(), 1);
+                        assert_eq!(observed.lock().expect("invocations")[0]["token"], raw);
+
+                        let updates = updates.lock().expect("progress");
+                        assert_eq!(
+                            updates.len(),
+                            1,
+                            "progress must arrive before the final result"
+                        );
+                        let (id, name, args, partial) = &updates[0];
+                        assert_eq!(id, &call.id);
+                        assert_eq!(name, &call.name);
+                        assert_eq!(args, &call.arguments, "restored secrets must not enter events");
+                        assert!(nested_parallel_output_text(partial).contains(&visible));
+                        let details = partial.details.as_ref().expect("progress details");
+                        let payload = if via_dispatcher {
+                            assert_eq!(details["dispatchedVia"], "xdev");
+                            assert_eq!(details["tool"], "progress_artifact");
+                            &details["resultDetails"]
+                        } else {
+                            details
+                        };
+                        assert_eq!(payload["echo"], visible);
+                        assert_eq!(payload["dispatchedVia"], "tool-owned");
+                        assert_eq!(payload["tool"], "tool-owned");
+                        assert_eq!(payload["resultDetails"]["preserved"], true);
+                        let artifact = &payload["artifact"];
+                        assert_eq!(artifact["sessionId"], "progress-owner");
+                        assert_eq!(
+                            std::fs::read_to_string(
+                                artifact["path"].as_str().expect("artifact path"),
+                            )
+                            .expect("retained output"),
+                            "retained tool output"
+                        );
+                        let metadata: Value = serde_json::from_str(
+                            &std::fs::read_to_string(
+                                artifact["metadataPath"].as_str().expect("metadata path"),
+                            )
+                            .expect("artifact metadata"),
+                        )
+                        .expect("artifact metadata JSON");
+                        assert_eq!(metadata["sessionId"], "progress-owner");
+                        if secrets_mode != "off" {
+                            assert!(!serde_json::to_string(partial).unwrap().contains(raw));
+                            assert!(!serde_json::to_string(&output).unwrap().contains(raw));
+                        }
+
+                        // Both success and failure release the invocation scope.
+                        let mut preview = "cleanup".to_string();
+                        let mut unscoped = None;
+                        assert!(crate::tools::attach_truncated_text_artifact(
+                            Some(root.path()),
+                            &mut preview,
+                            &mut unscoped,
+                            "progress_artifact",
+                            &call.id,
+                            "after-invocation",
+                            "cleanup witness",
+                        ));
+                        assert!(
+                            unscoped.as_ref().expect("unscoped artifact")["artifact"]
+                                .get("sessionId")
+                                .is_none()
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_discovery_queries_keep_read_only_parallel_admission() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().expect("workspace");
+            let observed = Arc::new(StdMutex::new(Vec::new()));
+            let agent = Agent::new(
+                Arc::new(NoopProvider),
+                streaming_discovery_registry(root.path(), Arc::clone(&observed)),
+                AgentConfig::default(),
+            );
+            agent.plan_state.enter_planning();
+            for action in ["list", "describe"] {
+                let call = ToolCall {
+                    id: format!("discovery-{action}"),
+                    name: "xdev".to_string(),
+                    arguments: json!({ "action": action, "name": "progress_artifact" }),
+                    thought_signature: None,
+                };
+                assert!(agent.effects_for_call(&call).parallel_safe());
+                let (output, error) = agent
+                    .execute_tool_in_session(
+                        call,
+                        Arc::new(|_| {}),
+                        test_turn_latency(),
+                        None,
+                        true,
+                        None,
+                    )
+                    .await;
+                assert!(!error, "{output:?}");
+                assert!(nested_parallel_output_text(&output).contains("progress_artifact"));
+            }
+            assert!(observed.lock().expect("target invocations").is_empty());
+            let registry = agent.tools.snapshot();
+            let dispatcher = registry.get("xdev").expect("native dispatcher");
+            assert!(
+                !dispatcher
+                    .effects_for_input(&json!({ "action": "run", "name": "progress_artifact" }))
+                    .parallel_safe(),
+                "unresolved dispatch must retain conservative effects"
+            );
+        });
+    }
+
+    #[test]
+    fn same_named_custom_dispatcher_keeps_its_handler_and_plan_effects() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().expect("workspace");
+            let target_calls = Arc::new(StdMutex::new(Vec::new()));
+            let custom_calls = Arc::new(StdMutex::new(Vec::new()));
+            let mut registry =
+                streaming_discovery_registry(root.path(), Arc::clone(&target_calls));
+            assert!(registry.has_generated_dispatcher());
+            registry.push(Box::new(StreamingArtifactTool {
+                name: "xdev",
+                root: root.path().to_path_buf(),
+                effects: ToolEffects::write(),
+                observed: Arc::clone(&custom_calls),
+            }));
+            assert!(!registry.has_generated_dispatcher());
+            let mut agent = Agent::new(
+                Arc::new(NoopProvider),
+                registry,
+                AgentConfig {
+                    system_prompt: Some(crate::xdev::format_managed_discoverable_section(&[])),
+                    ..AgentConfig::default()
+                },
+            );
+            let context = agent.request_context_json();
+            assert!(
+                !context["systemPrompt"]
+                    .as_str()
+                    .expect("prompt")
+                    .contains(crate::xdev::DISCOVERABLE_PROMPT_HEADER)
+            );
+            for action in ["list", "describe", "run", "promote"] {
+                let call = ToolCall {
+                    id: format!("custom-{action}"),
+                    name: "xdev".to_string(),
+                    arguments: json!({ "action": action, "name": "progress_artifact" }),
+                    thought_signature: None,
+                };
+                assert_eq!(agent.effects_for_call(&call), ToolEffects::write());
+                agent.plan_state.enter_planning();
+                let (blocked, error) = agent
+                    .execute_tool(call.clone(), Arc::new(|_| {}), test_turn_latency())
+                    .await;
+                assert!(error);
+                assert!(nested_parallel_output_text(&blocked).contains("plan"));
+                assert_eq!(custom_calls.lock().expect("custom invocations").len(), 0);
+                agent.plan_state.exit();
+                let (output, error) = agent
+                    .execute_tool(call, Arc::new(|_| {}), test_turn_latency())
+                    .await;
+                assert!(!error, "{output:?}");
+                assert_eq!(custom_calls.lock().expect("custom invocations").len(), 1);
+                custom_calls.lock().expect("custom invocations").clear();
+            }
+            assert!(target_calls.lock().expect("target invocations").is_empty());
+            assert!(agent.promoted_tools.lock().expect("promotions").is_empty());
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dispatcher_ownership_changes_during_approval_require_fresh_admission() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for starts_native in [false, true] {
+                for action in ["list", "run", "promote"] {
+                    let root = tempfile::tempdir().expect("workspace");
+                    let target_calls = Arc::new(StdMutex::new(Vec::new()));
+                    let custom_calls = Arc::new(StdMutex::new(Vec::new()));
+                    let registry =
+                        streaming_discovery_registry(root.path(), Arc::clone(&target_calls));
+                    let mut agent =
+                        Agent::new(Arc::new(NoopProvider), registry, AgentConfig::default());
+                    let native = agent.tools.snapshot();
+                    let mut custom = native.clone_shallow();
+                    custom.push(Box::new(StreamingArtifactTool {
+                        name: "xdev",
+                        root: root.path().to_path_buf(),
+                        effects: ToolEffects::read(),
+                        observed: Arc::clone(&custom_calls),
+                    }));
+                    let custom = Arc::new(custom);
+                    if !starts_native {
+                        agent.tools.update(|tools| *tools = custom.clone_shallow());
+                    }
+                    let replacement = if starts_native { custom } else { native };
+                    let shared = agent.tools.clone();
+                    agent.config.tool_approval = Some(Arc::new(move |_| {
+                        let shared = shared.clone();
+                        let replacement = Arc::clone(&replacement);
+                        Box::pin(async move {
+                            shared.update(|tools| *tools = replacement.clone_shallow());
+                            ToolApprovalDecision::Allow
+                        })
+                    }));
+                    let call = ToolCall {
+                        id: format!("changed-{starts_native}-{action}"),
+                        name: "xdev".to_string(),
+                        arguments: json!({
+                            "action": action,
+                            "name": "progress_artifact",
+                            "args": { "token": "ordinary" },
+                        }),
+                        thought_signature: None,
+                    };
+                    let (output, error) = agent
+                        .execute_tool(call.clone(), Arc::new(|_| {}), test_turn_latency())
+                        .await;
+                    assert!(error);
+                    assert!(nested_parallel_output_text(&output).contains("TOOL_DISPATCH_CHANGED"));
+                    assert!(target_calls.lock().expect("target invocations").is_empty());
+                    assert!(custom_calls.lock().expect("custom invocations").is_empty());
+                    assert!(agent.promoted_tools.lock().expect("promotions").is_empty());
+
+                    // The new catalog remains usable with a freshly admitted call.
+                    agent.config.tool_approval = None;
+                    let (output, error) = agent
+                        .execute_tool(call, Arc::new(|_| {}), test_turn_latency())
+                        .await;
+                    assert!(!error, "{output:?}");
+                    assert_eq!(
+                        custom_calls.lock().expect("custom invocations").len(),
+                        usize::from(starts_native)
+                    );
+                    assert_eq!(
+                        target_calls.lock().expect("target invocations").len(),
+                        usize::from(!starts_native && action == "run")
+                    );
+                }
+            }
+        });
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn managed_discovery_reaches_late_extensions_after_empty_provider_contexts() {
@@ -12258,7 +12739,13 @@ mod extensions_integration_tests {
                 };
                 let result = session
                     .agent
-                    .dispatch_xdev(&call, Arc::new(|_| {}), None, false)
+                    .dispatch_xdev(
+                        &session.agent.tools.snapshot(),
+                        &call,
+                        Arc::new(|_| {}),
+                        None,
+                        false,
+                    )
                     .await
                     .expect("native xdev execution");
                 assert!(!result.is_error);
@@ -12273,7 +12760,13 @@ mod extensions_integration_tests {
                 };
                 let result = session
                     .agent
-                    .dispatch_xdev(&promote, Arc::new(|_| {}), None, false)
+                    .dispatch_xdev(
+                        &session.agent.tools.snapshot(),
+                        &promote,
+                        Arc::new(|_| {}),
+                        None,
+                        false,
+                    )
                     .await
                     .expect("native xdev promotion");
                 assert!(!result.is_error);

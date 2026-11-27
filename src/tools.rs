@@ -6822,6 +6822,19 @@ impl ToolRegistry {
         self.discoverable.contains(name)
     }
 
+    /// Whether this snapshot still owns the native discovery dispatcher.
+    /// A host or extension may replace the name; its own implementation and
+    /// effects must then govern execution instead of the native interception.
+    pub(crate) fn has_generated_dispatcher(&self) -> bool {
+        self.generated_dispatcher.as_ref().is_some_and(|generated| {
+            let owned: Arc<dyn Tool> = generated.clone();
+            self.tools
+                .iter()
+                .find(|tool| tool.name() == "xdev")
+                .is_some_and(|tool| Arc::ptr_eq(tool, &owned))
+        })
+    }
+
     /// Promote a discoverable tool into the live schema set.
     pub fn mark_promoted(&mut self, name: &str) {
         if self.discoverable.remove(name) {

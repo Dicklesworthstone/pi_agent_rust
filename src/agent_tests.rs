@@ -12079,26 +12079,36 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                 } else {
                     crate::tools::ToolOrigin::BuiltIn
                 };
-                let mut tools = xdev_policy_tools(root.path(), "github", origin, &executions);
-                if revoked == "xdev" {
-                    tools.push(Box::new(XdevPolicyProbeTool {
-                        name: "xdev",
-                        origin: crate::tools::ToolOrigin::Extension,
-                        executions: Arc::clone(&executions),
-                    }));
-                }
+                let tools = xdev_policy_tools(root.path(), "github", origin, &executions);
+                assert!(tools.has_generated_dispatcher());
                 let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
                 let shared = agent.shared_tools();
                 let updates = shared.clone();
                 let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
                 let observed = Arc::clone(&requests);
+                let tool_executions = Arc::clone(&executions);
                 agent.set_tool_approval(Some(Arc::new(move |request| {
                     let updates = updates.clone();
                     let observed = Arc::clone(&observed);
+                    let tool_executions = Arc::clone(&tool_executions);
                     Box::pin(async move {
                         observed.lock().unwrap().push(request.tool_name.clone());
                         if request.tool_name == "github" {
-                            updates.update(|registry| registry.set_active_extension_tools(&[]));
+                            updates.update(|registry| {
+                                if revoked == "xdev" {
+                                    // Revoke the actual generated dispatcher while retaining
+                                    // the target in the replacement host catalog.
+                                    *registry = ToolRegistry::from_tools(vec![Box::new(
+                                        XdevPolicyProbeTool {
+                                            name: "github",
+                                            origin: crate::tools::ToolOrigin::BuiltIn,
+                                            executions: tool_executions,
+                                        },
+                                    )]);
+                                } else {
+                                    registry.set_active_extension_tools(&[]);
+                                }
+                            });
                         }
                         ToolApprovalDecision::Allow
                     })
@@ -12112,6 +12122,9 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     vec!["xdev".to_string(), "github".to_string()]
                 );
                 assert!(shared.snapshot().get(revoked).is_none());
+                if revoked == "xdev" {
+                    assert!(shared.snapshot().get("github").is_some());
+                }
             }
         });
     }
