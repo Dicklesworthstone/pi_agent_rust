@@ -959,7 +959,9 @@ pub(crate) fn parse_prompt_tool_call_json(
     allowed_tools: &std::collections::HashSet<String>,
     fallback_index: usize,
 ) -> Option<crate::model::ToolCall> {
-    let parsed = serde_json::from_str::<serde_json::Value>(raw_json.trim()).ok()?;
+    use crate::providers::openai::parse_unique_json_value;
+
+    let parsed = parse_unique_json_value(raw_json.trim()).ok()?;
     let obj = parsed.as_object()?;
     let name = obj.get("name")?.as_str()?.trim();
     if name.is_empty() || !allowed_tools.contains(name) {
@@ -967,7 +969,7 @@ pub(crate) fn parse_prompt_tool_call_json(
     }
     let arguments = match obj.get("arguments") {
         Some(val @ serde_json::Value::Object(_)) => val.clone(),
-        Some(serde_json::Value::String(raw_args)) => serde_json::from_str(raw_args)
+        Some(serde_json::Value::String(raw_args)) => parse_unique_json_value(raw_args)
             .ok()
             .filter(serde_json::Value::is_object)?,
         None => serde_json::json!({}),
@@ -1929,6 +1931,28 @@ mod tests {
                 assert_eq!(call.arguments, arguments, "split {split}");
             }
         }
+    }
+
+    #[test]
+    fn ambiguous_prompt_tool_fields_stay_text() {
+        let allowed = std::collections::HashSet::from(["echo".to_string()]);
+        for payload in [
+            r#"{"name":"other","name":"echo","arguments":{}}"#,
+            r#"{"name":"echo","arguments":{"items":[{"text":1,"te\u0078t":2}]}}"#,
+            r#"{"name":"echo","arguments":"{\"text\":1,\"text\":2}"}"#,
+        ] {
+            let text = format!("{PI_TOOL_CALL_OPEN}{payload}{PI_TOOL_CALL_CLOSE}");
+            let valid = r#"{"name":"echo","arguments":{"text":"ok"}}"#;
+            let mixed = format!("{text} {PI_TOOL_CALL_OPEN}{valid}{PI_TOOL_CALL_CLOSE}");
+            let (prose, calls) = extract_prompt_tool_calls(&mixed, &allowed);
+            assert_eq!(prose, format!("{text} "));
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].id, "pi_call_1");
+            assert_eq!(calls[0].arguments, serde_json::json!({"text": "ok"}));
+        }
+        let valid = r#"{"name":"echo","arguments":{"items":[{"text":1},{"text":2}]}}"#;
+        let call = parse_prompt_tool_call_json(valid, &allowed, 1).expect("separate objects");
+        assert_eq!(call.arguments["items"], serde_json::json!([{"text":1},{"text":2}]));
     }
 
     #[test]
