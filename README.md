@@ -922,6 +922,21 @@ cleanup before acknowledging the selection. Saved or forked submitted plans
 restore for fresh review, never with inherited execution approval. Planning
 controls are unavailable when built-in tools are disabled.
 
+**ACP clarification questions.** Editors can enable native `ask` by advertising
+`clientCapabilities.elicitation.form: {}` during initialization. When the host
+enables that tool, Pi presents questions through `elicitation/create` in both
+Code and Plan modes. Forms support single or multiple selections and an Other
+answer; accepted answers return through the ordinary native tool result.
+The editor's tool permission prompt still precedes the question, and answering
+does not approve a submitted plan or grant permission to write files.
+
+Declined, dismissed, malformed, or expired forms never choose a recommendation
+automatically. Session cancellation, live steering, and disconnects retire the
+owning request, so a late response cannot answer another question. Forms time
+out after five minutes and are for implementation decisions, not credentials
+or authentication. Clients without explicit form support do not receive the
+`ask` tool, and `--no-tools` remains authoritative.
+
 **ACP session forks.** Pi advertises the optional ACP v1 draft
 `sessionCapabilities.fork` capability. A client can create an active branch
 from the source's complete selected conversation:

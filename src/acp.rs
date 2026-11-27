@@ -35,6 +35,7 @@ mod client_files;
 mod client_terminals;
 mod commands;
 mod content;
+mod elicitation;
 mod history;
 mod mcp;
 mod planning;
@@ -187,6 +188,7 @@ struct AcpOutputShared {
     failed: AbortHandle,
     failure: AbortSignal,
     pending_permissions: PendingPermissionMap,
+    elicitation: elicitation::Requests,
     files: client_files::Requests,
     terminals: client_terminals::Requests,
 }
@@ -218,6 +220,7 @@ impl AcpOutputShared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.elicitation.close();
         self.files.close();
         self.terminals.close();
         self.failed.abort();
@@ -242,6 +245,7 @@ impl AcpOutput {
                 failed,
                 failure,
                 pending_permissions: Arc::new(StdMutex::new(HashMap::new())),
+                elicitation: elicitation::Requests::default(),
                 files: client_files::Requests::default(),
                 terminals: client_terminals::Requests::default(),
             }),
@@ -410,10 +414,9 @@ impl AcpOutput {
                 prompt.input.seal();
                 prompt.abort.abort();
             }
-            (
-                self.take_permissions(session_id),
-                self.shared.files.cancel_reads(session_id),
-            )
+            let mut requests = self.shared.files.cancel_reads(session_id);
+            requests.extend(self.shared.elicitation.cancel_session(session_id));
+            (self.take_permissions(session_id), requests)
         };
         self.cancel_permissions(cancelled);
         for request_id in reads {
@@ -484,7 +487,9 @@ impl AcpOutput {
             Vec::new()
         };
         let reads = if admitted.is_ok() && steer {
-            self.shared.files.cancel_reads(session_id)
+            let mut requests = self.shared.files.cancel_reads(session_id);
+            requests.extend(self.shared.elicitation.cancel_session(session_id));
+            requests
         } else {
             Vec::new()
         };
@@ -525,6 +530,7 @@ impl AcpOutput {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.shared.elicitation.close();
         self.shared.files.close();
         self.shared.terminals.shutdown(self);
         let drain = async {
@@ -1247,6 +1253,7 @@ async fn run_with_input(
 
                 if raw_message.get("method").is_none() {
                     if !route_permission_response(&raw_message, &pending_permissions, &cx)
+                        && !out_tx.shared.elicitation.route_response(&raw_message, &cx)
                         && !out_tx
                             .shared
                             .terminals
@@ -1286,6 +1293,7 @@ async fn run_with_input(
 
                 match request.method.as_str() {
                     "initialize" => {
+                        out_tx.shared.elicitation.negotiate(&request.params);
                         out_tx.shared.files.negotiate(&request.params);
                         out_tx.shared.terminals.negotiate(&request.params);
                         let result = handle_initialize();
@@ -2548,15 +2556,18 @@ fn build_acp_system_prompt(
     Ok(prompt)
 }
 
-/// Apply the host's requested tools or defaults plus trusted settings.
-/// Ask has no ACP form surface; submit_plan is installed by the native SDK
-/// only after entering plan mode, bound to this session's exact review owner.
-/// Every tool still reaches the editor's ordinary permission hook.
-fn acp_enabled_tools(cli: &crate::cli::Cli, config: &Config) -> Vec<String> {
-    const HOST_COUPLED: [&str; 2] = ["ask", "submit_plan"];
+/// Apply host tool policy and the editor's explicitly negotiated form UI.
+/// submit_plan is installed by the native SDK only after entering plan mode,
+/// bound to this session's exact review owner. Every tool still reaches the
+/// editor's ordinary permission hook; answering a form grants no permission.
+fn acp_enabled_tools(
+    cli: &crate::cli::Cli,
+    config: &Config,
+    form_supported: bool,
+) -> Vec<String> {
     cli.enabled_tools(config)
         .into_iter()
-        .filter(|name| !HOST_COUPLED.contains(name))
+        .filter(|name| *name != "submit_plan" && (*name != "ask" || form_supported))
         .map(String::from)
         .collect()
 }
@@ -2675,7 +2686,9 @@ fn build_acp_session_with_budget(
     auth.set_command_working_directory(&cwd)?;
 
     let mut cli = options.launch.selection_cli()?;
-    let enabled_tools = acp_enabled_tools(&cli, &options.config);
+    let form_supported = permission_client
+        .is_some_and(|client| client.out_tx.shared.elicitation.supported());
+    let enabled_tools = acp_enabled_tools(&cli, &options.config, form_supported);
     let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
     let tools = if cli.builtin_tools_disabled(&options.config) {
         ToolRegistry::without_builtins(Some(&options.config))
@@ -2820,6 +2833,12 @@ fn build_acp_session_with_budget(
             .with_api_key_override(cli.api_key.clone())
             .with_memory_settings(options.config.memory.as_ref());
     agent_session.set_child_fallback_policy(cli.subagent_fallback_policy.clone());
+    if enabled_tools.contains(&"ask") && let Some(client) = permission_client {
+        agent_session.agent.extend_tools(vec![elicitation::tool(
+            client.out_tx.clone(),
+            &session_id,
+        )]);
+    }
     if enabled_tools.contains(&"todo") {
         // The task list belongs to this session's authoritative branch-aware
         // store. In particular, restored and forked sessions must not retain
@@ -2966,7 +2985,9 @@ fn install_acp_skills_prompt(
             supplied
         };
     let cli = options.launch.selection_cli()?;
-    let enabled_tools = acp_enabled_tools(&cli, &options.config);
+    let ask_available = state.agent_session.as_ref()
+        .is_some_and(|handle| handle.session().agent.has_tool("ask"));
+    let enabled_tools = acp_enabled_tools(&cli, &options.config, ask_available);
     let enabled_tools_refs: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
     let prompt = build_acp_system_prompt(
         &cli,
@@ -3047,7 +3068,9 @@ async fn boot_acp_extensions(state: &mut AcpSessionState, options: &AcpOptions) 
     }
 
     let cli = workspace_options.launch.selection_cli()?;
-    let enabled_tools = acp_enabled_tools(&cli, &workspace_options.config);
+    let ask_available = state.agent_session.as_ref()
+        .is_some_and(|handle| handle.session().agent.has_tool("ask"));
+    let enabled_tools = acp_enabled_tools(&cli, &workspace_options.config, ask_available);
     let enabled_tools_refs: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
     let resolved_ext_policy = workspace_options
         .config
@@ -6533,7 +6556,7 @@ mod tests {
         let cli = AcpLaunchOptions::default()
             .selection_cli()
             .expect("neutral ACP CLI");
-        let tools = acp_enabled_tools(&cli, &Config::default());
+        let tools = acp_enabled_tools(&cli, &Config::default(), false);
         for expected in [
             "read",
             "bash",
@@ -6612,7 +6635,7 @@ mod tests {
             }
             assert_eq!(
                 handle.has_tool("todo"),
-                acp_enabled_tools(&cli, &config)
+                acp_enabled_tools(&cli, &config, false)
                     .iter()
                     .any(|name| name == "todo"),
                 "native task registration follows the selected tools",

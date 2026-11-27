@@ -3816,3 +3816,343 @@ fn dispatcher_disabled_tools_hide_and_reject_both_mode_selection_surfaces() {
     }));
     provider.finish(0);
 }
+
+fn editor_question_batch() -> Value {
+    json!({"questions": [
+        {
+            "id": "scope", "question": "Which scope should the plan describe?",
+            "options": [
+                {"label": "Small change", "description": "Keep the internals"},
+                {"label": "Full redesign", "description": "Replace the internals"},
+            ],
+            "recommended": 0,
+        },
+        {
+            "id": "checks", "question": "Which checks are required?", "multi": true,
+            "options": [{"label": "Unit tests"}, {"label": "Integration tests"}],
+        },
+        {
+            "id": "constraint", "question": "Which constraint guides the implementation?",
+            "options": [{"label": "Latency"}, {"label": "Memory"}],
+        },
+    ]})
+}
+
+fn editor_question_answer() -> Value {
+    json!({
+        "action": "accept",
+        "content": {
+            "question_0": "option_1",
+            "question_1": ["option_0", "option_1"],
+            "question_2": "other",
+            "other_2": "Preserve the public API",
+        },
+    })
+}
+
+#[test]
+fn native_ask_mount_requires_both_form_capability_and_host_tool_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let mut provider = ProviderFixture::new(Vec::new());
+    let runtime = runtime();
+    runtime.block_on(async {
+        for (capability, tools, no_tools, expected) in [
+            (Value::Null, "ask", false, false),
+            (json!({}), "ask", false, false),
+            (json!({"url": {}}), "ask", false, false),
+            (json!({"form": null}), "ask", false, false),
+            (json!({"form": true}), "ask", false, false),
+            (json!({"form": {}}), "ask", false, true),
+            (json!({"form": {}}), "read", false, false),
+            (json!({"form": {}}), "ask", true, false),
+        ] {
+            let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+            options.launch.tools = Some(tools.into());
+            options.launch.no_tools = no_tools;
+            options.launch.no_mcp = true;
+            options.launch.no_context_files = true;
+            let (sender, _receiver) = std::sync::mpsc::sync_channel(8);
+            let output = AcpOutput::new(sender);
+            output.shared.elicitation.negotiate(&json!({
+                "clientCapabilities": {"elicitation": capability},
+            }));
+            let client = AcpPermissionClient {
+                pending: Arc::clone(&output.shared.pending_permissions),
+                out_tx: output,
+                request_counter: Arc::new(AtomicU64::new(0)),
+                timeout: acp_permission_timeout(),
+                cx: AgentCx::for_current_or_request(),
+            };
+            let (_, state) = handle_session_new(
+                &json!({"cwd": root.path().canonicalize().unwrap()}),
+                &options, Some(&client),
+            ).unwrap();
+            assert_eq!(
+                state.agent_session.as_ref().unwrap().session().agent.has_tool("ask"),
+                expected,
+                "capability={capability}, tools={tools}, no_tools={no_tools}",
+            );
+        }
+    });
+    provider.finish(0);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatcher_forms_clarify_readonly_plans_and_forks_with_exact_native_answers() {
+    for through_xdev in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let ask = if through_xdev {
+            ("xdev", json!({"action": "run", "name": "ask", "args": editor_question_batch()}))
+        } else {
+            ("ask", editor_question_batch())
+        };
+        let mut provider = ProviderFixture::with_replies(
+            vec![200; 5],
+            vec![
+                Some(ask.clone()),
+                Some(("write", json!({"path": "blocked.txt", "content": "not approved"}))),
+                None,
+                Some(ask),
+                None,
+            ],
+        );
+        let runtime = runtime();
+        runtime.block_on(bounded_launch_controls(async {
+            let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+            options.launch.no_mcp = true;
+            options.launch.no_context_files = true;
+            options.config.ask_policy = Some("recommended".into());
+            if through_xdev {
+                let mut config = serde_json::to_value(&options.config).unwrap();
+                config["tools"] = json!({"loadMode": {"ask": "discoverable"}});
+                options.config = serde_json::from_value(config).unwrap();
+            } else {
+                options.launch.tools = Some("ask,write".into());
+            }
+            let (input, incoming) = asupersync::channel::mpsc::channel(16);
+            let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+            let editor = async {
+                let mut transcript = Vec::new();
+                discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {"elicitation": {"form": {}}},
+                })).await;
+                let created = discovery_request(&input, &outgoing, &mut transcript, 2, "session/new", json!({"cwd": cwd})).await;
+                let source = created["result"]["sessionId"].as_str().unwrap().to_string();
+                let selected = discovery_request(&input, &outgoing, &mut transcript, 3, "session/set_mode", json!({
+                    "sessionId": source, "modeId": "plan",
+                })).await;
+                assert!(selected.get("error").is_none(), "{selected}");
+                let mut active = source.clone();
+                let mut original_form_id = None;
+                for (prompt_id, expected_requests) in [(4, 1), (6, 4)] {
+                    if prompt_id == 6 {
+                        let fork = discovery_request(&input, &outgoing, &mut transcript, 5, "session/fork", json!({
+                            "sessionId": source, "cwd": cwd,
+                        })).await;
+                        assert!(fork.get("error").is_none(), "{fork}");
+                        assert_eq!(fork["result"]["modes"]["currentModeId"], "plan");
+                        active = fork["result"]["sessionId"].as_str().unwrap().to_string();
+                        assert_ne!(active, source);
+                    }
+                    input.try_send(json!({
+                        "jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
+                        "params": {"sessionId": active, "prompt": [{"type": "text", "text": "Clarify the proposed implementation"}]},
+                    }).to_string()).unwrap();
+                    let mut permissions = Vec::new();
+                    let mut forms = 0;
+                    loop {
+                        let frame = next_planning_frame(&outgoing).await;
+                        if frame["method"] == "session/request_permission" {
+                            assert_eq!(frame["params"]["sessionId"], active);
+                            let name = frame["params"]["toolCall"]["title"].as_str().unwrap();
+                            assert!(matches!(name, "ask" | "xdev"), "planning must block write before asking permission");
+                            permissions.push(name.to_string());
+                            answer_planning_permission(&input, &frame, ACP_PERMISSION_ALLOW_ONCE);
+                        } else if frame["method"] == "elicitation/create" {
+                            forms += 1;
+                            assert_eq!(provider.requests.lock().unwrap().len(), expected_requests);
+                            assert_eq!(frame["params"]["sessionId"], active);
+                            assert_eq!(frame["params"]["toolCallId"], if prompt_id == 4 { "acp-tool-0" } else { "acp-tool-3" });
+                            assert_eq!(frame["params"]["mode"], "form");
+                            assert_eq!(permissions, if through_xdev {
+                                vec!["xdev".to_string(), "ask".to_string()]
+                            } else {
+                                vec!["ask".to_string()]
+                            }, "the native approval boundary precedes question presentation");
+                            let fields = &frame["params"]["requestedSchema"]["properties"];
+                            assert_eq!(fields["question_0"]["oneOf"][1]["title"], "Full redesign");
+                            assert_eq!(fields["question_1"]["type"], "array");
+                            assert_eq!(fields["other_2"]["type"], "string");
+                            assert!(!cwd.join("blocked.txt").exists());
+                            if let Some(old) = &original_form_id {
+                                assert_ne!(&frame["id"], old, "forks get fresh connection-owned requests");
+                                input.try_send(json!({"jsonrpc": "2.0", "id": old, "result": {
+                                    "action": "accept", "content": {"question_0": "option_0"},
+                                }}).to_string()).unwrap();
+                            } else {
+                                original_form_id = Some(frame["id"].clone());
+                            }
+                            input.try_send(json!({
+                                "jsonrpc": "2.0", "id": frame["id"], "result": editor_question_answer(),
+                            }).to_string()).unwrap();
+                        } else if frame.get("id") == Some(&json!(prompt_id)) {
+                            assert_eq!(frame["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+                            break;
+                        }
+                        transcript.push(frame);
+                    }
+                    assert_eq!(forms, 1);
+                }
+                assert!(!cwd.join("blocked.txt").exists(), "answering a form never approves a write");
+                let index = crate::session_index::SessionIndex::for_sessions_root(root.path());
+                index.reindex_all().unwrap();
+                let rows = index.list_sessions(None).unwrap();
+                for (id, expected_users) in [(&source, 1), (&active, 2)] {
+                    let path = &rows.iter().find(|row| &row.id == id).unwrap().path;
+                    let saved = Session::open(path).await.unwrap();
+                    assert_eq!(crate::plan::replayed_plan_mode(&saved), crate::plan::PlanMode::Planning);
+                    let messages = saved.to_messages_for_current_path();
+                    assert_eq!(messages.iter().filter(|message| matches!(message, Message::User(_))).count(), expected_users);
+                    let answered: Vec<_> = messages.iter().filter_map(|message| match message {
+                        Message::ToolResult(result) if !result.is_error && matches!(result.tool_name.as_str(), "ask" | "xdev") => Some(result),
+                        _ => None,
+                    }).collect();
+                    assert_eq!(answered.len(), expected_users, "answers are native tool results, not synthetic user prompts");
+                    for result in answered {
+                        let details = result.details.as_ref().unwrap();
+                        assert_eq!(details["autoAnswered"], false);
+                        assert_eq!(details["answers"][0]["questionId"], "scope");
+                        assert_eq!(details["answers"][0]["selected"], json!(["Full redesign"]));
+                        assert_eq!(details["answers"][1]["selected"], json!(["Unit tests", "Integration tests"]));
+                        assert_eq!(details["answers"][2]["other"], "Preserve the public API");
+                    }
+                }
+                input.try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string()).unwrap();
+            };
+            let (served, ()) = futures::join!(
+                Box::pin(run(options, incoming, AcpOutput::new(output))), editor,
+            );
+            served.unwrap();
+        }));
+        let requests = provider.finish(5);
+        let advertised = requests[0].1["tools"].as_array().unwrap();
+        assert_eq!(
+            advertised.iter().any(|tool| tool["function"]["name"] == "ask"),
+            !through_xdev,
+        );
+        if through_xdev {
+            assert!(advertised.iter().any(|tool| tool["function"]["name"] == "xdev"));
+        }
+        let tool_result = requests[1].1["messages"].as_array().unwrap().iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == "acp-tool-0")
+            .unwrap()["content"].as_str().unwrap();
+        assert!(tool_result.contains("Full redesign"));
+        assert!(tool_result.contains("Unit tests, Integration tests"));
+        assert!(tool_result.contains("Other: Preserve the public API"));
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatcher_declined_invalid_denied_and_cancelled_forms_never_invent_answers() {
+    for outcome in ["decline", "cancel", "invalid", "permission-denied", "session-cancel"] {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let mut provider = ProviderFixture::with_replies(
+            vec![200; 2],
+            vec![Some(("ask", editor_question_batch())), None],
+        );
+        let runtime = runtime();
+        runtime.block_on(bounded_launch_controls(async {
+            let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+            options.launch.tools = Some("ask".into());
+            options.launch.no_mcp = true;
+            options.launch.no_context_files = true;
+            options.config.ask_policy = Some("recommended".into());
+            let (input, incoming) = asupersync::channel::mpsc::channel(16);
+            let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+            let editor = async {
+                let mut transcript = Vec::new();
+                discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({
+                    "protocolVersion": 1, "clientCapabilities": {"elicitation": {"form": {}}},
+                })).await;
+                let created = discovery_request(&input, &outgoing, &mut transcript, 2, "session/new", json!({"cwd": cwd})).await;
+                let session = created["result"]["sessionId"].as_str().unwrap().to_string();
+                input.try_send(json!({
+                    "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                    "params": {"sessionId": session, "prompt": [{"type": "text", "text": "Ask me before proceeding"}]},
+                }).to_string()).unwrap();
+                let mut forms = 0;
+                let mut cancellation_sent = false;
+                loop {
+                    let frame = next_planning_frame(&outgoing).await;
+                    if frame["method"] == "session/request_permission" {
+                        assert_eq!(frame["params"]["toolCall"]["title"], "ask");
+                        answer_planning_permission(&input, &frame, if outcome == "permission-denied" {
+                            ACP_PERMISSION_REJECT_ONCE
+                        } else {
+                            ACP_PERMISSION_ALLOW_ONCE
+                        });
+                    } else if frame["method"] == "elicitation/create" {
+                        forms += 1;
+                        assert_ne!(outcome, "permission-denied");
+                        let result = match outcome {
+                            "decline" | "cancel" => json!({
+                                "action": outcome, "content": editor_question_answer()["content"],
+                            }),
+                            "invalid" => json!({
+                                "action": "accept", "content": {"question_0": "unoffered-choice"},
+                            }),
+                            "session-cancel" => {
+                                input.try_send(json!({
+                                    "jsonrpc": "2.0", "method": "session/cancel",
+                                    "params": {"sessionId": session},
+                                }).to_string()).unwrap();
+                                editor_question_answer()
+                            }
+                            _ => unreachable!(),
+                        };
+                        input.try_send(json!({
+                            "jsonrpc": "2.0", "id": frame["id"], "result": result,
+                        }).to_string()).unwrap();
+                    } else if frame["method"] == "$/cancel_request" {
+                        cancellation_sent = true;
+                    } else if frame.get("id") == Some(&json!(3)) {
+                        assert_eq!(frame["result"]["stopReason"], if outcome == "session-cancel" {
+                            ACP_STOP_REASON_CANCELLED
+                        } else {
+                            ACP_STOP_REASON_END_TURN
+                        });
+                        break;
+                    }
+                    transcript.push(frame);
+                }
+                assert_eq!(forms, usize::from(outcome != "permission-denied"));
+                assert_eq!(cancellation_sent, outcome == "session-cancel");
+                let index = crate::session_index::SessionIndex::for_sessions_root(root.path());
+                index.reindex_all().unwrap();
+                let path = index.list_sessions(None).unwrap().into_iter()
+                    .find(|row| row.id == session).unwrap().path;
+                let saved = Session::open(&path).await.unwrap();
+                let messages = saved.to_messages_for_current_path();
+                let question = messages.iter().find_map(|message| match message {
+                    Message::ToolResult(result) if result.tool_name == "ask" => Some(result),
+                    _ => None,
+                }).unwrap();
+                assert!(question.is_error);
+                assert!(question.details.as_ref().is_none_or(|details| details.get("answers").is_none()));
+                assert!(!serde_json::to_string(question).unwrap().contains("autoAnswered"));
+                assert_eq!(messages.iter().filter(|message| matches!(message, Message::User(_))).count(), 1);
+                input.try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string()).unwrap();
+            };
+            let (served, ()) = futures::join!(
+                Box::pin(run(options, incoming, AcpOutput::new(output))), editor,
+            );
+            served.unwrap();
+        }));
+        provider.finish(if outcome == "session-cancel" { 1 } else { 2 });
+    }
+}
