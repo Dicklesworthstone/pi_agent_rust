@@ -686,7 +686,14 @@ if [[ "$RUN_RUST" -eq 1 ]]; then
         USE_RCH=1
     fi
     if [[ "$USE_RCH" -eq 1 ]]; then
-        JOBS="${CARGO_BUILD_JOBS:-2}"
+        # Default to -j 2 on remote RCH workers (ignoring DSR's ambient local
+        # CARGO_BUILD_JOBS=16, which inflates RCH disk-budget admission to ~63 GiB
+        # and exhausts worker slot caps). Override explicitly via PI_SOAK_CARGO_BUILD_JOBS.
+        JOBS="${PI_SOAK_CARGO_BUILD_JOBS:-2}"
+        if [[ ! "$JOBS" =~ ^[0-9]+$ ]] || [[ "$JOBS" -eq 0 ]]; then
+            echo "Invalid PI_SOAK_CARGO_BUILD_JOBS=$JOBS (expected positive integer)" >&2
+            exit 2
+        fi
         if ! RCH_BUILD_TIMEOUT_SEC="${RCH_BUILD_TIMEOUT_SEC:-3600}" \
              RCH_TEST_TIMEOUT_SEC="${RCH_TEST_TIMEOUT_SEC:-3600}" \
              CARGO_BUILD_JOBS="$JOBS" \
