@@ -8407,6 +8407,15 @@ pub struct CustomEntry {
 /// Encode a working directory path for use in session directory names.
 pub fn encode_cwd(path: &std::path::Path) -> String {
     let s = path.display().to_string();
+    // canonicalize() returns an extended-length path on Windows. The namespace
+    // marker belongs to the path API, not to the project directory name: its
+    // question mark is illegal inside a filename. Preserve the spelling in the
+    // session header while using the same bucket as the ordinary drive or UNC.
+    #[cfg(windows)]
+    let s = s
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| s.strip_prefix(r"\\?\"))
+        .unwrap_or(&s);
     let s = s.trim_start_matches(['/', '\\']);
     let s = s.replace(['/', '\\', ':'], "-");
     format!("--{s}--")
@@ -18657,6 +18666,37 @@ mod tests {
             ordinary.push(component.as_os_str());
         }
         [ordinary, canonical]
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_workspace_can_save_in_the_ordinary_project_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let [ordinary, canonical] = windows_session_lock_test_roots(temp.path());
+        let sessions_root = temp.path().join("sessions");
+        let mut session = Session::create_with_dir(Some(sessions_root.clone()));
+        session.header.cwd = canonical.to_str().expect("UTF-8 fixture").to_owned();
+        session.append_message(make_test_message("first turn"));
+        run_async(async { session.save().await }).expect("save canonical workspace");
+
+        let saved = session.path.as_deref().expect("saved path");
+        assert_eq!(
+            saved.parent(),
+            Some(sessions_root.join(encode_cwd(&ordinary)).as_path())
+        );
+        let reopened = run_async(async { Session::open(saved.to_str().unwrap()).await })
+            .expect("reopen canonical workspace");
+        assert_eq!(reopened.header.cwd, session.header.cwd);
+        assert_eq!(reopened.entries.len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_unc_workspaces_keep_the_existing_unc_bucket() {
+        let ordinary = Path::new(r"\\server\share\work");
+        let canonical = Path::new(r"\\?\UNC\server\share\work");
+        assert_eq!(encode_cwd(ordinary), "--server-share-work--");
+        assert_eq!(encode_cwd(canonical), encode_cwd(ordinary));
     }
 
     #[cfg(windows)]
