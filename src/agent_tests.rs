@@ -12661,6 +12661,171 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
     }
 
     #[test]
+    fn jobs_effects_distinguish_observation_from_process_control() {
+        let jobs = crate::tools::JobsTool::new();
+        assert!(jobs.effects().processes());
+        for input in [json!({"action": "list"}), json!({"action": " LIST "})] {
+            let effects = jobs.effects_for_input(&input);
+            assert!(effects.reads() && effects.parallel_safe());
+            assert!(!effects.processes() && !effects.writes());
+        }
+        let wait = jobs.effects_for_input(&json!({
+            "action": " WaIt ", "jobId": "retained-task", "timeoutMs": 0,
+        }));
+        assert!(wait.reads() && wait.requires_ordered_execution());
+        assert!(!wait.parallel_safe() && !wait.processes() && !wait.writes());
+        for input in [
+            json!({"action": "cancel", "jobId": "retained-task"}),
+            json!({"action": "unknown"}),
+            json!({"action": 7}),
+            json!({"action": "wait", "timeoutMs": "unbounded"}),
+            json!({}),
+            Value::Null,
+        ] {
+            assert!(jobs.effects_for_input(&input).processes(), "{input}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn planning_observes_owned_background_results_without_cancelling_or_consuming_them() {
+        let _serial = crate::jobs::process_test_guard();
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for through_xdev in [false, true] {
+                for pending_review in [false, true] {
+                    let root = tempfile::tempdir().expect("job workspace");
+                    let config: crate::config::Config = serde_json::from_value(json!({
+                        "tools": {"loadMode": {"jobs": "discoverable"}},
+                    }))
+                    .expect("discovery config");
+                    let tools = ToolRegistry::new(&["jobs"], root.path(), Some(&config));
+                    assert!(tools.is_discoverable("jobs"));
+                    let approvals = Arc::new(StdMutex::new(Vec::new()));
+                    let requested = Arc::clone(&approvals);
+                    let agent = Agent::new(
+                        Arc::new(SilentProvider),
+                        tools,
+                        AgentConfig {
+                            tool_approval: Some(Arc::new(move |request| {
+                                requested.lock().expect("approvals").push(request.tool_name);
+                                Box::pin(async { ToolApprovalDecision::Allow })
+                            })),
+                            ..AgentConfig::default()
+                        },
+                    );
+                    let owner = agent.job_session_scope.session_id().await.expect("owner");
+                    let (release, ready) = futures::channel::oneshot::channel::<()>();
+                    let task = crate::jobs::spawn_owned_task(
+                        crate::jobs::admit_owned_task(&owner).expect("task admission"),
+                        "planning background result",
+                        AgentCx::for_request(),
+                        Duration::from_secs(30),
+                        Some(root.path()),
+                        crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(
+                            crate::text_completion::AuxiliaryPrivacy::default(),
+                        ),
+                        async move {
+                            ready.await.expect("release retained work");
+                            Ok(ToolOutput {
+                                content: vec![ContentBlock::Text(TextContent::new(
+                                    "retained analysis result",
+                                ))],
+                                details: Some(json!({"analysis": "complete"})),
+                                is_error: false,
+                            })
+                        },
+                    )
+                    .expect("publish owned task");
+                    agent.plan_state().enter_planning();
+                    if pending_review {
+                        agent.plan_state().submit_plan("Review this proposal".to_string());
+                    }
+                    let call = |arguments| {
+                        if through_xdev {
+                            xdev_call("run", Some("jobs"), Some(arguments))
+                        } else {
+                            ToolCall {
+                                id: "planning-jobs".to_string(),
+                                name: "jobs".to_string(),
+                                arguments,
+                                thought_signature: None,
+                            }
+                        }
+                    };
+                    let (listed, failed) = execute_xdev_policy_call(
+                        &agent,
+                        call(json!({"action": "list"})),
+                    )
+                    .await;
+                    assert!(!failed, "{listed:?}");
+                    assert_eq!(listed.details.as_ref().unwrap()["jobs"][0]["id"], task.id);
+                    let (polled, failed) = execute_xdev_policy_call(
+                        &agent,
+                        call(json!({"action": "wait", "jobId": task.id, "timeoutMs": 0})),
+                    )
+                    .await;
+                    assert!(!failed, "{polled:?}");
+                    assert_eq!(polled.details.as_ref().unwrap()["status"], "running");
+                    let admitted = approvals.lock().expect("approvals").len();
+                    assert_eq!(admitted, if through_xdev { 4 } else { 2 });
+                    let (blocked, failed) = execute_xdev_policy_call(
+                        &agent,
+                        call(json!({"action": "cancel", "jobId": task.id})),
+                    )
+                    .await;
+                    assert!(failed && blocked.is_error);
+                    assert!(assistant_text_content(&blocked.content).contains("PLAN_MODE_BLOCKED"));
+                    assert_eq!(approvals.lock().expect("approvals").len(), admitted);
+
+                    let foreign = Agent::new(
+                        Arc::new(SilentProvider),
+                        ToolRegistry::new(&["jobs"], root.path(), Some(&config)),
+                        AgentConfig::default(),
+                    );
+                    foreign.plan_state().enter_planning();
+                    let (hidden, failed) = execute_xdev_policy_call(
+                        &foreign,
+                        call(json!({"action": "list"})),
+                    )
+                    .await;
+                    assert!(!failed, "{hidden:?}");
+                    assert_eq!(hidden.details.as_ref().unwrap()["jobs"], json!([]));
+                    let (hidden, failed) = execute_xdev_policy_call(
+                        &foreign,
+                        call(json!({"action": "wait", "jobId": task.id, "timeoutMs": 0})),
+                    )
+                    .await;
+                    assert!(failed && hidden.is_error);
+                    assert!(assistant_text_content(&hidden.content).contains("PI_JOBS_UNKNOWN_ID"));
+
+                    release.send(()).expect("planning did not cancel owned work");
+                    let (settled, failed) = execute_xdev_policy_call(
+                        &agent,
+                        call(json!({"action": "wait", "jobId": task.id, "timeoutMs": 10_000})),
+                    )
+                    .await;
+                    assert!(!failed, "{settled:?}");
+                    let details = settled.details.as_ref().expect("settled descriptor");
+                    assert_eq!(details["status"], "exited");
+                    assert_eq!(details["result"]["details"]["analysis"], "complete");
+                    assert_eq!(crate::jobs::take_completion_notices(&owner).len(), 1);
+                    assert!(crate::jobs::take_completion_notices(&owner).is_empty());
+                    assert_eq!(crate::jobs::list(&owner).expect("retained job")[0].id, task.id);
+                    assert_eq!(
+                        agent.plan_state().mode(),
+                        if pending_review {
+                            crate::plan::PlanMode::PendingApproval
+                        } else {
+                            crate::plan::PlanMode::Planning
+                        },
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
     fn plan_gate_blocks_mutation_and_allows_reads() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

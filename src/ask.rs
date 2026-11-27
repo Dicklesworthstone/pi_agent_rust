@@ -809,9 +809,10 @@ impl crate::tools::Tool for AskTool {
 
     fn effects(&self) -> crate::tools::ToolEffects {
         // A host exposes one modal picker at a time. Treat user interaction as
-        // a scheduling barrier so one model turn cannot strand concurrent Ask
-        // requests behind a single active-card slot.
-        crate::tools::ToolEffects::write()
+        // an ordering constraint, not a filesystem mutation: planning needs
+        // clarification too. Keep approval, display and result publication in
+        // call order so concurrent questions cannot occupy one modal slot.
+        crate::tools::ToolEffects::read().with_ordered_execution()
     }
 
     async fn execute(
@@ -860,7 +861,13 @@ impl crate::tools::Tool for AskTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, ToolApprovalDecision};
+    use crate::model::{AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall};
+    use crate::provider::{Context, Provider, StreamOptions};
     use crate::tools::Tool as _;
+    use crate::tools::ToolRegistry;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn question(json: serde_json::Value) -> AskRequest {
         serde_json::from_value(json).expect("parse ask request")
@@ -954,8 +961,415 @@ mod tests {
     #[test]
     fn ask_tool_is_a_parallel_scheduling_barrier() {
         let effects = AskTool::new(AskPolicy::Error).effects();
-        assert!(effects.writes());
+        assert!(effects.requires_ordered_execution());
+        assert!(!effects.writes() && !effects.appends() && !effects.processes());
         assert!(!effects.parallel_safe());
+    }
+
+    /// Script only the model response. Scheduling, native tools, approval and
+    /// the host's real question channel all run through the production Agent.
+    struct QuestionBatchProvider {
+        calls: Vec<ToolCall>,
+        requests: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for QuestionBatchProvider {
+        fn name(&self) -> &str {
+            "ask-plan-test"
+        }
+
+        fn api(&self) -> &str {
+            "ask-plan-test"
+        }
+
+        fn model_id(&self) -> &str {
+            "question-batch"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>>
+        {
+            let first = self.requests.fetch_add(1, Ordering::SeqCst) == 0;
+            let reason = if first {
+                StopReason::ToolUse
+            } else {
+                StopReason::Stop
+            };
+            let message = AssistantMessage {
+                content: if first {
+                    self.calls
+                        .iter()
+                        .cloned()
+                        .map(ContentBlock::ToolCall)
+                        .collect()
+                } else {
+                    vec![ContentBlock::Text(crate::model::TextContent::new(
+                        "Questions resolved",
+                    ))]
+                },
+                api: self.api().into(),
+                provider: self.name().into(),
+                model: self.model_id().into(),
+                usage: crate::model::Usage::default(),
+                stop_reason: reason,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
+                reason,
+                message,
+            })])))
+        }
+    }
+
+    fn planning_question(id: &str, via_dispatcher: bool) -> ToolCall {
+        let input = serde_json::json!({
+            "questions": [{
+                "id": id,
+                "question": "Which implementation should the plan describe?",
+                "options": [{"label": "Small change"}, {"label": "Full redesign"}],
+                "recommended": 0,
+            }],
+        });
+        ToolCall {
+            id: id.into(),
+            name: if via_dispatcher { "xdev" } else { "ask" }.into(),
+            arguments: if via_dispatcher {
+                serde_json::json!({"action": "run", "name": "ask", "args": input})
+            } else {
+                input
+            },
+            thought_signature: None,
+        }
+    }
+
+    fn planning_registry(root: &std::path::Path, ask: &AskTool) -> ToolRegistry {
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "tools": {"loadMode": {"ask": "discoverable"}},
+        }))
+        .expect("ask discovery settings");
+        let mut tools = ToolRegistry::with_builtin_tool_policy(
+            &["ask", "write", "bash"],
+            root,
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
+        tools.extend(vec![Box::new(ask.clone()) as Box<dyn crate::tools::Tool>]);
+        assert!(tools.is_discoverable("ask"));
+        assert!(tools.get("xdev").is_some());
+        tools
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn planning_questions_preserve_approval_and_modal_order_without_allowing_mutations() {
+        asupersync::test_utils::run_test(|| async {
+            for pending_review in [false, true] {
+                for second_via_dispatcher in [false, true] {
+                    let root = tempfile::tempdir().expect("workspace");
+                    let ask = AskTool::new(AskPolicy::Error);
+                    let (requests, mut cards) = asupersync::channel::mpsc::channel(4);
+                    ask.install_channel_ui(requests);
+                    let provider = Arc::new(QuestionBatchProvider {
+                        calls: vec![
+                            planning_question("first-question", false),
+                            planning_question("second-question", second_via_dispatcher),
+                            ToolCall {
+                                id: "blocked-write".into(),
+                                name: "write".into(),
+                                arguments: serde_json::json!({
+                                    "path": "blocked.txt", "content": "no",
+                                }),
+                                thought_signature: None,
+                            },
+                            ToolCall {
+                                id: "blocked-process".into(),
+                                name: "bash".into(),
+                                arguments: serde_json::json!({
+                                    "command": "echo no > process.txt",
+                                }),
+                                thought_signature: None,
+                            },
+                        ],
+                        requests: AtomicUsize::new(0),
+                    });
+                    let approvals = Arc::new(Mutex::new(Vec::new()));
+                    let observed_approvals = Arc::clone(&approvals);
+                    let (release, released) = futures::channel::oneshot::channel::<()>();
+                    let first_approval = Arc::new(Mutex::new(Some(released)));
+                    let mut agent = Agent::new(
+                        provider.clone(),
+                        planning_registry(root.path(), &ask),
+                        AgentConfig {
+                            tool_approval: Some(Arc::new(move |request| {
+                                observed_approvals.lock().unwrap().push((
+                                    request.tool_call_id.clone(),
+                                    request.tool_name.clone(),
+                                ));
+                                let wait = if request.tool_call_id == "first-question" {
+                                    first_approval.lock().unwrap().take()
+                                } else {
+                                    None
+                                };
+                                Box::pin(async move {
+                                    if let Some(wait) = wait {
+                                        wait.await.expect("first approval released");
+                                    }
+                                    ToolApprovalDecision::Allow
+                                })
+                            })),
+                            ..AgentConfig::default()
+                        },
+                    );
+                    let plan = agent.plan_state();
+                    plan.enter_planning();
+                    if pending_review {
+                        assert!(plan.submit_plan(
+                            "An existing proposal awaits its exact review".into(),
+                        ));
+                    }
+                    let completed = Arc::new(Mutex::new(Vec::new()));
+                    let observed = Arc::clone(&completed);
+                    let mut turn = Box::pin(agent.run("Clarify the plan", move |event| {
+                        if let AgentEvent::ToolExecutionEnd {
+                            tool_call_id,
+                            result,
+                            ..
+                        } = event
+                        {
+                            observed.lock().unwrap().push((tool_call_id, result));
+                        }
+                    }));
+                    assert!(futures::poll!(turn.as_mut()).is_pending());
+                    assert_eq!(
+                        *approvals.lock().unwrap(),
+                        vec![("first-question".into(), "ask".into())],
+                    );
+                    assert!(
+                        cards.try_recv().is_err(),
+                        "a question cannot bypass its approval",
+                    );
+
+                    release.send(()).expect("first approval is waiting");
+                    assert!(futures::poll!(turn.as_mut()).is_pending());
+                    let first = cards
+                        .try_recv()
+                        .expect("first question is visible in plan mode");
+                    assert_eq!(
+                        first.request.questions[0].id.as_deref(),
+                        Some("first-question"),
+                    );
+                    assert!(
+                        cards.try_recv().is_err(),
+                        "only one modal question may be pending",
+                    );
+                    assert_eq!(
+                        approvals.lock().unwrap().len(),
+                        1,
+                        "later approval must also wait",
+                    );
+                    assert!(completed.lock().unwrap().is_empty());
+                    assert!(ask.respond_ui(
+                        &first.id,
+                        AskResponse {
+                            answers: vec![AskAnswer {
+                                question_id: "first-question".into(),
+                                selected: vec!["Full redesign".into()],
+                                other: None,
+                            }],
+                            dismissed: false,
+                        },
+                    ));
+
+                    assert!(futures::poll!(turn.as_mut()).is_pending());
+                    let second = cards
+                        .try_recv()
+                        .expect("second question follows the first result");
+                    assert_eq!(
+                        second.request.questions[0].id.as_deref(),
+                        Some("second-question"),
+                    );
+                    assert!(cards.try_recv().is_err());
+                    assert_eq!(completed.lock().unwrap().len(), 1);
+                    assert_eq!(completed.lock().unwrap()[0].0, "first-question");
+                    assert!(ask.respond_ui(
+                        &second.id,
+                        AskResponse {
+                            answers: vec![AskAnswer {
+                                question_id: "second-question".into(),
+                                selected: Vec::new(),
+                                other: Some(
+                                    "Preserve the public API while changing the internals".into(),
+                                ),
+                            }],
+                            dismissed: false,
+                        },
+                    ));
+                    assert_eq!(
+                        turn.await.expect("clarification turn").stop_reason,
+                        StopReason::Stop,
+                    );
+                    assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+                    assert!(!root.path().join("blocked.txt").exists());
+                    assert!(!root.path().join("process.txt").exists());
+                    assert_eq!(
+                        plan.mode(),
+                        if pending_review {
+                            crate::plan::PlanMode::PendingApproval
+                        } else {
+                            crate::plan::PlanMode::Planning
+                        },
+                    );
+                    let mut expected = vec![("first-question".into(), "ask".into())];
+                    if second_via_dispatcher {
+                        expected.push(("second-question".into(), "xdev".into()));
+                    }
+                    expected.push(("second-question".into(), "ask".into()));
+                    assert_eq!(
+                        *approvals.lock().unwrap(),
+                        expected,
+                        "mutations remain blocked before approval",
+                    );
+                    let completed = completed.lock().unwrap();
+                    assert_eq!(completed.len(), 4);
+                    for (_, output) in &completed[..2] {
+                        assert!(!output.is_error);
+                    }
+                    for (_, output) in &completed[2..] {
+                        assert!(output.is_error);
+                        assert!(output.content.iter().any(|block| matches!(block,
+                            ContentBlock::Text(text) if text.text.contains("PLAN_MODE_BLOCKED")
+                        )));
+                    }
+                    let transcript = serde_json::to_string(agent.messages())
+                        .expect("native transcript");
+                    assert!(transcript.contains("Full redesign"));
+                    assert!(transcript.contains("Preserve the public API"));
+                    assert!(transcript.contains("\"autoAnswered\":false"));
+                    assert_eq!(ask.close_channel_ui(), 0);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn plan_mode_question_denial_and_dismissal_never_fabricate_an_answer() {
+        asupersync::test_utils::run_test(|| async {
+            for via_dispatcher in [false, true] {
+                for denied in [false, true] {
+                    let root = tempfile::tempdir().expect("workspace");
+                    let ask = AskTool::new(AskPolicy::Recommended);
+                    let presented = Arc::new(AtomicUsize::new(0));
+                    let observed = Arc::clone(&presented);
+                    ask.set_handler(Arc::new(move |_| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async {
+                            Ok(AskResponse {
+                                answers: Vec::new(),
+                                dismissed: true,
+                            })
+                        })
+                    }));
+                    let mut agent = Agent::new(
+                        Arc::new(QuestionBatchProvider {
+                            calls: vec![planning_question("declined", via_dispatcher)],
+                            requests: AtomicUsize::new(0),
+                        }),
+                        planning_registry(root.path(), &ask),
+                        AgentConfig {
+                            tool_approval: Some(Arc::new(move |request| {
+                                Box::pin(async move {
+                                    if denied && request.tool_name == "ask" {
+                                        ToolApprovalDecision::deny("host denied the question")
+                                    } else {
+                                        ToolApprovalDecision::Allow
+                                    }
+                                })
+                            })),
+                            ..AgentConfig::default()
+                        },
+                    );
+                    agent.plan_state().enter_planning();
+                    agent.run("Ask before planning", |_| {}).await.expect("turn");
+                    assert_eq!(presented.load(Ordering::SeqCst), usize::from(!denied));
+                    let result = agent
+                        .messages()
+                        .iter()
+                        .find_map(|message| match message {
+                            Message::ToolResult(result) if result.tool_call_id == "declined" => {
+                                Some(result)
+                            }
+                            _ => None,
+                        })
+                        .expect("tool result");
+                    assert!(result.is_error);
+                    let rendered = serde_json::to_string(result).unwrap();
+                    assert!(!rendered.contains("autoAnswered"));
+                    assert!(!rendered.contains("A: Small change"));
+                    assert!(rendered.contains(if denied { "host denied" } else { "dismissed" }));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn cancelling_a_plan_question_retires_its_reply_before_any_late_answer() {
+        asupersync::test_utils::run_test(|| async {
+            for via_dispatcher in [false, true] {
+                let root = tempfile::tempdir().expect("workspace");
+                let ask = AskTool::new(AskPolicy::Recommended);
+                let (requests, mut cards) = asupersync::channel::mpsc::channel(1);
+                ask.install_channel_ui(requests);
+                let provider = Arc::new(QuestionBatchProvider {
+                    calls: vec![planning_question("cancelled", via_dispatcher)],
+                    requests: AtomicUsize::new(0),
+                });
+                let mut agent = Agent::new(
+                    provider.clone(),
+                    planning_registry(root.path(), &ask),
+                    AgentConfig::default(),
+                );
+                agent.plan_state().enter_planning();
+                let (abort, signal) = AbortHandle::new();
+                let mut turn = Box::pin(agent.run_with_abort(
+                    "Clarify before implementation",
+                    Some(signal),
+                    |_| {},
+                ));
+                assert!(futures::poll!(turn.as_mut()).is_pending());
+                let card = cards.try_recv().expect("plan question is pending");
+                abort.abort();
+                match turn.await {
+                    Err(Error::Aborted) => {}
+                    Ok(message) => assert_eq!(message.stop_reason, StopReason::Aborted),
+                    Err(error) => panic!("unexpected cancellation failure: {error}"),
+                }
+                assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+                assert!(!ask.respond_ui(
+                    &card.id,
+                    AskResponse {
+                        answers: vec![AskAnswer {
+                            question_id: "cancelled".into(),
+                            selected: vec!["Full redesign".into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    },
+                ));
+                assert_eq!(ask.close_channel_ui(), 0);
+                assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Planning);
+            }
+        });
     }
 
     /// Acceptance 3: no handler + recommended policy auto-answers with a

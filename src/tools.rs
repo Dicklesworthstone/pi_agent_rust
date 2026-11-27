@@ -11057,6 +11057,20 @@ impl Tool for JobsTool {
         ToolEffects::process()
     }
 
+    fn effects_for_input(&self, input: &serde_json::Value) -> ToolEffects {
+        let Ok(input) = JobsInput::deserialize(input) else {
+            return self.effects();
+        };
+        match input.action.trim().to_ascii_lowercase().as_str() {
+            "list" => ToolEffects::read(),
+            // A wait observes retained work without cancelling it or consuming
+            // its completion notice. Keep the wait in order so later calls can
+            // rely on the observed settlement, including during planning.
+            "wait" => ToolEffects::read().with_ordered_execution(),
+            _ => self.effects(),
+        }
+    }
+
     fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
         self.job_session_scope = scope;
     }
