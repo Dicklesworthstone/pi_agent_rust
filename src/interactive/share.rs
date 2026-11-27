@@ -14,9 +14,6 @@ use url::Url;
 use super::{AgentState, Cmd, PiApp, PiMsg};
 use crate::session::Session;
 
-#[cfg(feature = "clipboard")]
-use arboard::Clipboard as ArboardClipboard;
-
 const SHARE_COMMAND_OUTPUT_MAX_BYTES: u64 = 64 * 1024;
 const SHARE_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const SHARE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1035,16 +1032,7 @@ pub async fn run_share(
     let share_url = share_viewer_url.to_string();
     drop(temp_path);
 
-    // Copy viewer URL to clipboard (best-effort); under WSL through clip.exe,
-    // since arboard has no display there (GH #242).
-    let copied_via_wsl = super::commands::running_under_wsl()
-        && super::commands::copy_via_clip_exe(&share_url).is_ok();
-    #[cfg(feature = "clipboard")]
-    if !copied_via_wsl && let Ok(mut clipboard) = ArboardClipboard::new() {
-        let _ = clipboard.set_text(share_url.clone());
-    }
-    #[cfg(not(feature = "clipboard"))]
-    let _ = copied_via_wsl;
+    let _ = super::commands::set_system_clipboard_text(&share_url);
 
     // Paragraph breaks: the TUI renders this as markdown, and a single newline
     // soft-wraps into the warning sentence, which can split "Share URL:" or the

@@ -7934,10 +7934,9 @@ impl PiFtuiModel {
                             });
                         }
                         // The pasted screenshot is attached when the prompt
-                        // is sent, through its `@file` reference. Under WSL
-                        // the paste starts powershell.exe (seconds), so it
-                        // runs off the loop thread there.
-                        if crate::interactive::running_under_wsl() {
+                        // is sent, through its `@file` reference. PowerShell
+                        // captures run off the loop thread on Windows and WSL.
+                        if crate::interactive::windows_clipboard_images_use_powershell() {
                             return Cmd::task(move || PiFtuiMsg::PastedImage {
                                 request_id,
                                 reference: crate::interactive::paste_clipboard_image_ref(),

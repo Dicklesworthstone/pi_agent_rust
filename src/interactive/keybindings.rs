@@ -171,8 +171,7 @@ impl PiApp {
 
     #[allow(clippy::missing_const_for_fn)]
     pub(super) fn paste_image_from_clipboard() -> Option<PathBuf> {
-        // GH #242: WSL has no display for arboard; ask Windows for the image.
-        if super::commands::running_under_wsl()
+        if super::commands::windows_clipboard_images_use_powershell()
             && let Some(path) = paste_image_via_powershell()
         {
             return Some(path);
@@ -1067,50 +1066,108 @@ fn encode_custom_ui_key(key: &KeyMsg) -> Option<String> {
     }
 }
 
-/// The PowerShell that saves Windows' clipboard image as a PNG at
-/// `windows_path` (exit 1 when the clipboard holds no image).
-fn powershell_save_clipboard_png(windows_path: &str) -> String {
-    let quoted = windows_path.replace('\'', "''");
-    format!(
-        "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
-         $img = [System.Windows.Forms.Clipboard]::GetImage(); \
-         if ($null -eq $img) {{ exit 1 }}; \
-         $img.Save('{quoted}', [System.Drawing.Imaging.ImageFormat]::Png)"
-    )
+/// Encode in memory, then write binary bytes to the file descriptor inherited
+/// from Pi. No workspace path or clipboard content is interpreted as script.
+const CLIPBOARD_BITMAP_TO_PNG: &str = r"
+if ($null -eq $img) { exit 1 }
+$png = New-Object System.IO.MemoryStream
+try {
+    $img.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+    $png.Position = 0
+    $out = [Console]::OpenStandardOutput()
+    $png.CopyTo($out)
+    $out.Flush()
+} finally {
+    $png.Dispose()
+    $img.Dispose()
+}";
+
+fn windows_powershell() -> Option<std::process::Command> {
+    // Native Windows searches the current directory for unqualified programs.
+    // Invoke the system installation even when Pi runs in an untrusted project.
+    let executable = if cfg!(windows) {
+        let root = PathBuf::from(std::env::var_os("SystemRoot")?);
+        if !root.is_absolute() {
+            return None;
+        }
+        root.join("System32/WindowsPowerShell/v1.0/powershell.exe")
+    } else {
+        PathBuf::from("powershell.exe")
+    };
+    let mut command = std::process::Command::new(executable);
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-STA",
+        "-Command",
+    ]);
+    Some(command)
 }
 
-/// GH #242: under WSL, have `powershell.exe` save the Windows clipboard's
-/// image into the agent dir (where `@file` may read it), through the path
-/// `wslpath -w` gives for it. `None` when there is no image or either
-/// interop binary is missing. Interop output is discarded so it cannot
-/// reach the TUI.
 fn paste_image_via_powershell() -> Option<PathBuf> {
-    use std::process::{Command, Stdio};
     let dir = crate::config::Config::global_dir().join("pastes");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("pi-paste-{}.png", uuid::Uuid::new_v4().simple()));
-    let windows_path = Command::new("wslpath")
-        .arg("-w")
-        .arg(&path)
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())?;
-    let saved = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command"])
-        .arg(powershell_save_clipboard_png(windows_path.trim()))
+    let mut command = windows_powershell()?;
+    command.arg(format!(
+        "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; \
+         Add-Type -AssemblyName System.Drawing; \
+         $img = [System.Windows.Forms.Clipboard]::GetImage(); {CLIPBOARD_BITMAP_TO_PNG}"
+    ));
+    capture_clipboard_png(&mut command, &dir, std::time::Duration::from_secs(10))
+}
+
+fn capture_clipboard_png(
+    command: &mut std::process::Command,
+    dir: &Path,
+    timeout: std::time::Duration,
+) -> Option<PathBuf> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut png = tempfile::Builder::new()
+        .prefix("pi-paste-")
+        .suffix(".png")
+        .tempfile_in(dir)
+        .ok()?;
+    command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if saved && std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0) {
-        return Some(path);
+        .stdout(png.reopen().ok()?)
+        .stderr(Stdio::null());
+    crate::tools::isolate_command_process_group(command);
+    let child = crate::tools::spawn_command_with_job_discipline(command).ok()?;
+    let mut child =
+        crate::tools::ProcessGuard::new(child, crate::tools::ProcessCleanupMode::ProcessGroupTree);
+    let started = Instant::now();
+    while child.try_wait_child().ok()?.is_none() {
+        if started.elapsed() >= timeout {
+            let _ = child.terminate_and_wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    // A save that failed part-way can leave an empty or partial PNG behind.
-    let _ = std::fs::remove_file(&path);
-    None
+    // Retire any descendants still holding the writable output before
+    // validating or handing its path to the composer.
+    if !child.terminate_and_wait().ok()?.success() {
+        return None;
+    }
+    let file = png.as_file_mut();
+    let mut header = [0_u8; 33];
+    file.read_exact(&mut header).ok()?;
+    if !header.starts_with(b"\x89PNG\r\n\x1a\n")
+        || crate::terminal_images::image_dimensions(&header).is_none()
+    {
+        return None;
+    }
+    let mut end = [0_u8; 12];
+    file.seek(SeekFrom::End(-12)).ok()?;
+    file.read_exact(&mut end).ok()?;
+    if end != *b"\0\0\0\0IEND\xaeB\x60\x82" {
+        return None;
+    }
+    let (_file, path) = png.keep().ok()?;
+    Some(path)
 }
 
 #[cfg(test)]
@@ -1267,17 +1324,62 @@ mod tests {
         app
     }
 
-    /// GH #242: the PowerShell that saves a WSL paste targets the given
-    /// Windows path, single-quoted with embedded quotes doubled, and exits
-    /// non-zero when the clipboard holds no image.
+    #[cfg(unix)]
     #[test]
-    fn powershell_paste_script_quotes_the_target_path() {
-        let script = super::powershell_save_clipboard_png(
-            r"\\wsl.localhost\Ubuntu\home\o'neil\.pi\agent\pastes\p.png",
-        );
-        assert!(script.contains(r"$img.Save('\\wsl.localhost\Ubuntu\home\o''neil\"));
-        assert!(script.contains("[System.Drawing.Imaging.ImageFormat]::Png"));
-        assert!(script.contains("if ($null -eq $img) { exit 1 }"));
+    fn clipboard_capture_publishes_only_successful_png_and_reaps_slow_helper() {
+        use base64::Engine as _;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().expect("paste directory");
+        let dir = temp.path().join("sp ace's");
+        std::fs::create_dir(&dir).unwrap();
+        let capture = |script, timeout| {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            super::capture_clipboard_png(&mut command, &dir, timeout)
+        };
+        let timeout = Duration::from_secs(5);
+        assert!(capture("printf 'invalid output'", timeout).is_none());
+        assert!(capture(r"printf '\211PNG\r\n\032\n'; exit 1", timeout).is_none());
+        assert!(capture("exec sleep 60", Duration::ZERO).is_none());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        let expected = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==")
+            .unwrap();
+        let source = temp.path().join("source.png");
+        std::fs::write(&source, &expected[..expected.len() - 12]).unwrap();
+        let mut command = Command::new("cat");
+        command.arg(&source);
+        assert!(super::capture_clipboard_png(&mut command, &dir, timeout).is_none());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        std::fs::write(&source, &expected).unwrap();
+        let path = super::capture_clipboard_png(&mut command, &dir, timeout).unwrap();
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        assert_eq!(std::fs::read(path).unwrap(), expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_powershell_transfers_a_real_png_without_touching_the_clipboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = super::windows_powershell().expect("Windows PowerShell");
+        command.arg(format!(
+            "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Drawing; \
+             $img = [System.Drawing.Bitmap]::new(2, 3); {}",
+            super::CLIPBOARD_BITMAP_TO_PNG
+        ));
+        let path = super::capture_clipboard_png(
+            &mut command,
+            dir.path(),
+            std::time::Duration::from_secs(10),
+        )
+        .expect("capture bitmap");
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[12..24], b"IHDR\0\0\0\x02\0\0\0\x03");
+        assert!(bytes.ends_with(b"IEND\xaeB\x60\x82"));
     }
 
     #[test]

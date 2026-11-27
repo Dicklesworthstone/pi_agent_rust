@@ -58,11 +58,11 @@ native backends are macOS and Linux on X11; see the Computer section of
 
 ## Clipboard
 
-Pi attempts to use the system clipboard for `/copy` and image pasting.
+In both TUIs, `/copy` puts Unicode text on the native Windows clipboard. `/share` also copies the viewer URL when clipboard access succeeds. Pasting a screenshot saves a PNG under the agent's `pastes` directory and inserts an attachment in the composer. The default Windows build uses Windows PowerShell for image capture. Builds with both `clipboard` and `image-resize` use arboard for images.
 
-- Ensure you are running in a terminal that supports clipboard access if using remote sessions (e.g. via SSH).
-- If clipboard operations fail, Pi will typically fall back to printing the content or ignoring the paste.
-- **WSL**: the Linux `pi` binary has no X11/Wayland display inside WSL (unless WSLg is running), so Pi detects WSL and uses Windows' `clip.exe` for `/copy` and `/share`, and `powershell.exe` for image paste. Both are on `PATH` in a default WSL setup; no extra configuration is needed.
+Clipboard access requires an interactive desktop. If copying fails, `/copy` reports the fallback file path when it can save the text. An unsuccessful screenshot paste leaves the composer unchanged.
+
+Under WSL, the Linux binary uses `clip.exe` for text and `powershell.exe` for screenshots. Screenshot bytes travel through the helper's standard output, so the Windows process does not need direct access to the Linux workspace.
 
 ## Paths
 

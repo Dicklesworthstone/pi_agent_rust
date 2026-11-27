@@ -9,7 +9,7 @@ use crate::provider_metadata::{
     split_provider_model_spec,
 };
 
-#[cfg(feature = "clipboard")]
+#[cfg(all(feature = "clipboard", not(windows)))]
 use arboard::Clipboard as ArboardClipboard;
 
 const BASH_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1038,42 +1038,66 @@ pub fn copy_text_to_clipboard(text: &str) -> String {
         Ok(path)
     }
 
-    // GH #242: under WSL without WSLg there is no display for arboard, but
-    // WSL puts Windows' clip.exe on PATH.
-    if running_under_wsl() && copy_via_clip_exe(text).is_ok() {
-        return String::from("Copied to clipboard");
-    }
-
-    #[cfg(feature = "clipboard")]
-    {
-        match ArboardClipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
-        {
-            Ok(()) => String::from("Copied to clipboard"),
-            Err(err) => match write_fallback(text) {
-                Ok(path) => format!(
-                    "Clipboard support is disabled or unavailable ({err}). Wrote to {}",
-                    path.display()
-                ),
-                Err(io_err) => format!(
-                    "Clipboard support is disabled or unavailable ({err}); also failed to write fallback file: {io_err}"
-                ),
-            },
-        }
-    }
-
-    #[cfg(not(feature = "clipboard"))]
-    {
-        match write_fallback(text) {
-            Ok(path) => format!("Clipboard support is disabled. Wrote to {}", path.display()),
-            Err(err) => {
-                format!("Clipboard support is disabled; failed to write fallback file: {err}")
-            }
-        }
+    match set_system_clipboard_text(text) {
+        Ok(()) => String::from("Copied to clipboard"),
+        Err(error) => match write_fallback(text) {
+            Ok(path) => format!(
+                "Clipboard support is disabled or unavailable ({error}). Wrote to {}",
+                path.display()
+            ),
+            Err(io_error) => format!(
+                "Clipboard support is disabled or unavailable ({error}); also failed to write fallback file: {io_error}"
+            ),
+        },
     }
 }
 
-/// Whether this process runs inside WSL (GH #242).
-pub fn running_under_wsl() -> bool {
+/// Copy without creating a fallback file. Sharing a gist uses this path so a
+/// clipboard failure doesn't leave an extra copy of its secret URL on disk.
+pub(super) fn set_system_clipboard_text(text: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // CF_UNICODETEXT is NUL-terminated. Preserve the whole selection in
+        // the caller's fallback rather than reporting a partial copy.
+        if text.contains('\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows clipboard text contains an embedded NUL",
+            ));
+        }
+        clipboard_win::set_clipboard_string(text)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+
+    #[cfg(not(windows))]
+    {
+        if running_under_wsl() && copy_via_clip_exe(text).is_ok() {
+            return Ok(());
+        }
+        #[cfg(feature = "clipboard")]
+        {
+            ArboardClipboard::new()
+                .and_then(|mut clipboard| clipboard.set_text(text))
+                .map_err(std::io::Error::other)
+        }
+        #[cfg(not(feature = "clipboard"))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no system clipboard backend available",
+        ))
+    }
+}
+
+/// Native full builds use arboard directly. WSL and native Windows TUI builds
+/// without the optional image backend can read images via Windows PowerShell.
+pub(crate) fn windows_clipboard_images_use_powershell() -> bool {
+    if cfg!(windows) {
+        return !cfg!(all(feature = "clipboard", feature = "image-resize"));
+    }
+    running_under_wsl()
+}
+
+fn running_under_wsl() -> bool {
     wsl_detected(
         std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some(),
         std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -1089,6 +1113,7 @@ fn wsl_detected(wsl_env: bool, kernel_release: Option<&str>) -> bool {
 
 /// What `clip.exe` is fed: UTF-16LE with a byte-order mark. Plain UTF-8 is
 /// read in the console code page and garbles anything non-ASCII.
+#[cfg(any(not(windows), test))]
 fn clip_exe_payload(text: &str) -> Vec<u8> {
     let mut bytes = vec![0xFF, 0xFE];
     for unit in text.encode_utf16() {
@@ -1098,7 +1123,8 @@ fn clip_exe_payload(text: &str) -> Vec<u8> {
 }
 
 /// Put `text` on the Windows clipboard from inside WSL.
-pub fn copy_via_clip_exe(text: &str) -> std::io::Result<()> {
+#[cfg(not(windows))]
+fn copy_via_clip_exe(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let mut child = Command::new("clip.exe")
@@ -5466,6 +5492,13 @@ mod tests {
         ));
         assert!(!wsl_detected(false, Some("6.8.0-45-generic\n")));
         assert!(!wsl_detected(false, None));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_clipboard_refuses_text_that_windows_would_truncate() {
+        let error = super::set_system_clipboard_text("before\0after").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     /// clip.exe gets UTF-16LE with a BOM, so non-ASCII text survives.

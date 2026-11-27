@@ -4810,6 +4810,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "clipboard-win",
  "crc32c",
  "criterion",
  "crossbeam-queue",

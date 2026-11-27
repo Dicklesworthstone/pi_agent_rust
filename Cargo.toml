@@ -501,6 +501,8 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 # snapshot-vs-kill race that the parent-chain walk cannot. win32job keeps our
 # crate unsafe-free while encapsulating the Win32 FFI.
 [target.'cfg(windows)'.dependencies]
+# The native text clipboard is available in the Windows TUI without arboard.
+clipboard-win = { version = "5.4.3", optional = true }
 win32job = "2.0.3"
 # Nonblocking job-pipe readers; one process-wide reactor owns IOCP completions.
 mio = { version = "1.2.4", features = ["os-ext"] }
@@ -537,6 +539,7 @@ profiler = ["dep:pprof"]
 # Disabling it (`--no-default-features`) lets SDK/library consumers compile the
 # `pi` library without the terminal UI dependencies.
 tui = [
+    "dep:clipboard-win",
     "dep:crossterm",
     "dep:bubbletea",
     "dep:lipgloss",

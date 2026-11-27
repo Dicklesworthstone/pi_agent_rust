@@ -99,7 +99,8 @@ pub(crate) use self::agent::extension_commands_for_catalog;
 /// both; see the function's own note.
 pub(crate) use self::commands::copy_text_to_clipboard;
 pub(crate) use self::commands::resolve_model_selector;
-pub(crate) use self::commands::running_under_wsl;
+#[cfg(feature = "ftui")]
+pub(crate) use self::commands::windows_clipboard_images_use_powershell;
 pub use self::commands::{
     SlashCommand, model_entry_matches, parse_scoped_model_patterns, resolve_scoped_model_entries,
     strip_thinking_level_suffix,
