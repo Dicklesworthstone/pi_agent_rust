@@ -1249,6 +1249,110 @@ fn fetch_resolves_at_headers_and_streams_binary_bytes_to_both_clones() {
 }
 
 #[test]
+fn fetch_releases_bodyless_http_responses_at_headers() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+            .await
+            .expect("runtime");
+        for (method, status) in [("HEAD", 200), ("GET", 204), ("GET", 205), ("GET", 304)] {
+            runtime
+                .eval(&format!(
+                    r"
+                    globalThis.result = null;
+                    fetch('https://example.com/resource', {{ method: '{method}' }}).then(async res => {{
+                        globalThis.result = [res.status, res.headers.get('etag'), res.body === null,
+                            res.clone().body === null, await res.text(), (await res.bytes()).length, res.bodyUsed];
+                    }});
+                    "
+                ))
+                .await
+                .expect("start metadata-only request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let id = &requests[0].call_id;
+            runtime.complete_hostcall(
+                id,
+                HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: serde_json::json!({
+                        "status": status, "headers": {"etag": "revision"},
+                        "body": "must be ignored"
+                    }),
+                    is_final: false,
+                },
+            );
+            runtime.tick().await.expect("deliver headers");
+            runtime.drain_microtasks().await.expect("finish response");
+            assert!(!runtime.is_hostcall_active(id), "{method} {status}");
+            assert_eq!(
+                runtime.get_global_json("result").await.expect("response"),
+                serde_json::json!([status, "revision", true, true, "", 0, false]),
+                "{method} {status}"
+            );
+        }
+    });
+}
+
+#[test]
+fn fetch_stream_retires_interrupt_handlers_as_frames_arrive() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r"
+                globalThis.result = null;
+                (async () => {
+                    const original = Promise.prototype.then;
+                    const subscriptions = new WeakMap();
+                    let peak = 0;
+                    // Count reactions on each promise. Racing every frame against
+                    // the same pending cancellation promise retains one per frame.
+                    Promise.prototype.then = function(...args) {
+                        const count = (subscriptions.get(this) || 0) + 1;
+                        subscriptions.set(this, count);
+                        peak = Math.max(peak, count);
+                        return original.apply(this, args);
+                    };
+                    try {
+                        const response = await fetch('https://example.com/events');
+                        const bytes = await response.bytes();
+                        globalThis.result = [Array.from(bytes), peak];
+                    } finally { Promise.prototype.then = original; }
+                })();
+                ",
+            )
+            .await
+            .expect("start streaming fetch");
+        let requests = runtime.drain_hostcall_requests();
+        assert_eq!(requests.len(), 1);
+        let id = &requests[0].call_id;
+        for sequence in 0..=65 {
+            let chunk = match sequence {
+                0 => serde_json::json!({"status": 200}),
+                65 => serde_json::Value::Null,
+                _ => serde_json::json!({"body": "x"}),
+            };
+            runtime.complete_hostcall(
+                id,
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final: sequence == 65,
+                },
+            );
+            runtime.tick().await.expect("deliver frame");
+        }
+        runtime.drain_microtasks().await.expect("settle body read");
+        let result = runtime.get_global_json("result").await.expect("result");
+        assert_eq!(result[0], serde_json::json!(vec![b'x'; 64]));
+        let peak = result[1].as_u64().expect("reaction count");
+        assert!(peak < 16, "one promise retained {peak} subscriptions");
+    });
+}
+
+#[test]
 fn fetch_abort_before_headers_cancels_the_pending_hostcall() {
     futures::executor::block_on(async {
         let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))

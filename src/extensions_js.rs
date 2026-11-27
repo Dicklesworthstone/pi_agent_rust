@@ -32810,10 +32810,9 @@ if (typeof globalThis.fetch !== 'function') {
         let ended = false;
         let cancellation = null;
         let stopReason;
-        let rejectStopped;
-        const interrupted = new Promise((_, reject) => { rejectStopped = reject; });
-        // Abort can occur after headers but before the consumer asks for a byte.
-        interrupted.catch(() => {});
+        // The header read and body pulls are serialized. Keep only the active
+        // read interruptible, even for indefinitely long event streams.
+        let rejectRead = null;
         const cleanup = () => { if (signal) signal.removeEventListener('abort', onAbort); };
         const cancelHost = () => {
             if (cancellation) return cancellation;
@@ -32827,16 +32826,21 @@ if (typeof globalThis.fetch !== 'function') {
             stopped = true;
             stopReason = reason;
             cleanup();
-            rejectStopped(reason);
+            if (rejectRead) rejectRead(reason);
             if (controller) controller.error(reason);
             void cancelHost();
         };
         const onAbort = () => { if (signal.aborted) stop(abortReason()); };
         const next = async () => {
             if (stopped) throw stopReason;
-            const result = await Promise.race([iterator.next(), interrupted]);
-            if (stopped) throw stopReason;
-            return result;
+            try {
+                const result = await new Promise((resolve, reject) => {
+                    rejectRead = reject;
+                    Promise.resolve(iterator.next()).then(resolve, reject);
+                });
+                if (stopped) throw stopReason;
+                return result;
+            } finally { rejectRead = null; }
         };
 
         try {
@@ -32874,6 +32878,17 @@ if (typeof globalThis.fetch !== 'function') {
                 if (head.body === undefined && head.data !== undefined) head.body = head.data;
             }
             if (first.done || !head || !Number.isFinite(Number(head.status))) throw new TypeError('HTTP stream ended before response headers');
+            const status = Number(head.status);
+            const responseInit = { status, headers: head.headers || {}, url };
+            if (method === 'HEAD' || status === 204 || status === 205 || status === 304) {
+                // A metadata-only caller has no body to read or cancel.
+                // Release the transport at headers, including buffered hosts.
+                const response = new Response(null, responseInit);
+                ended = true;
+                cleanup();
+                void cancelHost();
+                return response;
+            }
             let initialBytes = chunkBytes(head);
             const responseBody = new globalThis.ReadableStream({
                 start(value) { controller = value; },
@@ -32897,7 +32912,7 @@ if (typeof globalThis.fetch !== 'function') {
                     return cancelHost();
                 },
             });
-            return new Response(responseBody, { status: Number(head.status), headers: head.headers || {}, url });
+            return new Response(responseBody, responseInit);
         } catch (error) {
             stop(error);
             throw error;
@@ -33278,8 +33293,8 @@ mod tests {
         // UTF-8 encoding (f774e7185), adding 4,300 reviewed bytes.
         (
             BRIDGE_RECEIPT,
-            327_818,
-            "ddd85a04980ae6e85041705fd341ab60715fcc4b1852432917311ad50da2a062",
+            328_507,
+            "74c56a4d1e492333c423dbee90dea248451bc1224c234aab75160e8ccd87a400",
         ),
         // Demand-driven file reads add byte ranges and owned descriptor cleanup.
         // Incremental write acknowledgements, descriptor ownership and amortized
