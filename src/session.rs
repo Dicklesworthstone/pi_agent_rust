@@ -3824,14 +3824,12 @@ fn select_v2_open_mode_for_resume(
 
 impl SessionOpenDiagnostics {
     fn record_orphaned_parents(&mut self, orphans: Vec<(String, String)>) {
-        self.orphaned_parent_links.extend(
-            orphans
-                .into_iter()
-                .map(|(entry_id, missing_parent_id)| SessionOpenOrphanedParentLink {
-                    entry_id,
-                    missing_parent_id,
-                }),
-        );
+        self.orphaned_parent_links.extend(orphans.into_iter().map(
+            |(entry_id, missing_parent_id)| SessionOpenOrphanedParentLink {
+                entry_id,
+                missing_parent_id,
+            },
+        ));
     }
 
     fn warning_lines(&self) -> Vec<String> {

@@ -1952,7 +1952,10 @@ mod tests {
         }
         let valid = r#"{"name":"echo","arguments":{"items":[{"text":1},{"text":2}]}}"#;
         let call = parse_prompt_tool_call_json(valid, &allowed, 1).expect("separate objects");
-        assert_eq!(call.arguments["items"], serde_json::json!([{"text":1},{"text":2}]));
+        assert_eq!(
+            call.arguments["items"],
+            serde_json::json!([{"text":1},{"text":2}])
+        );
     }
 
     #[test]

@@ -33257,12 +33257,14 @@ mod tests {
     /// only the two deliberately changed modules are re-pinned here.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         // Tee failures now reach idle consumers, and both cancellation callers
-        // retain source cleanup ownership. The four tee lifecycle regressions
-        // cover the deliberate 2,556-byte bridge change.
+        // retain source cleanup ownership. Subsequent bridge updates added
+        // ReadableStream.from (7cf056f7f), queued-read preservation in async
+        // iteration (95d73c0bc), and TextEncoder.encodeInto scalar-boundary
+        // UTF-8 encoding (f774e7185), adding 4,300 reviewed bytes.
         (
             BRIDGE_RECEIPT,
-            322_973,
-            "54b5aea47788c89842aa0eebf348847d16650617204aac681800ebc1f16539fe",
+            327_273,
+            "01c93fc327ab8f954e777e7c0170a55500659c5a07d827104cb2404ce8c795bc",
         ),
         // Demand-driven file reads add byte ranges and owned descriptor cleanup.
         // Incremental write acknowledgements, descriptor ownership and amortized
