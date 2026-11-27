@@ -31356,6 +31356,56 @@ if (typeof globalThis.fetch !== 'function') {
 
     if (typeof globalThis.ReadableStream !== 'function') {
         class ReadableStream {
+            static from(iterable) {
+                const object = value => value !== null && (typeof value === 'object' || typeof value === 'function');
+                if (!object(iterable)) throw new TypeError('Expected an iterable object');
+                const asyncMethod = iterable[Symbol.asyncIterator];
+                const sync = asyncMethod == null;
+                const method = sync ? iterable[Symbol.iterator] : asyncMethod;
+                const iterator = Reflect.apply(method, iterable, []);
+                if (!object(iterator)) throw new TypeError('Expected an iterator object');
+                const next = iterator.next;
+                let cancelled = false;
+                return new ReadableStream({
+                    async pull(controller) {
+                        if (cancelled) return;
+                        const result = Reflect.apply(next, iterator, []);
+                        const step = sync ? result : await result;
+                        if (!object(step)) throw new TypeError('Expected an iterator result');
+                        const done = !!step.done;
+                        let value;
+                        if (sync) {
+                            // Async-from-sync unwraps promised values, including the final one.
+                            const item = step.value;
+                            try { value = await item; }
+                            catch (error) {
+                                if (!done && !cancelled) {
+                                    try { iterator.return?.(); } catch (_) {}
+                                }
+                                throw error;
+                            }
+                        } else if (!done) {
+                            value = step.value;
+                        }
+                        if (cancelled) return;
+                        if (done) controller.close();
+                        else controller.enqueue(value);
+                    },
+                    async cancel(reason) {
+                        cancelled = true;
+                        const close = iterator.return;
+                        if (close == null) return;
+                        const result = Reflect.apply(close, iterator, [reason]);
+                        const step = sync ? result : await result;
+                        if (!object(step)) throw new TypeError('Expected an iterator return result');
+                        if (sync) {
+                            // A synchronous iterator's return also observes done before value.
+                            void step.done;
+                            await step.value;
+                        }
+                    },
+                }, { highWaterMark: 0 });
+            }
             constructor(source = {}, strategy = {}) {
                 if (source.type !== undefined) throw new TypeError('Byte/BYOB streams are not supported');
                 __pi_stream_methods(source, ['start', 'pull', 'cancel']);
@@ -52302,6 +52352,71 @@ const defer = () => { let resolve, reject; const promise = new Promise((a,b) => 
                 "{result}",
             );
         });
+    }
+
+    #[test]
+    fn pijs_readable_stream_from_preserves_iterator_demand_and_cleanup() {
+        assert_web_stream_fixture(
+            r"
+const first = defer(), cleanup = defer();
+let calls = 0, returns = 0, received;
+const iterable = {
+    [Symbol.iterator]() { throw new Error('async iterator should win'); },
+    [Symbol.asyncIterator]() { return this; },
+    next() { calls++; return first.promise; },
+    return(reason) { returns++; received = reason; return cleanup.promise; },
+};
+const stream = ReadableStream.from(iterable), reader = stream.getReader();
+await tick();
+check(calls === 0, 'construction and reader acquisition are lazy');
+const read = reader.read(), queued = reader.read();
+await tick();
+check(calls === 1, 'concurrent demand starts one iterator operation');
+const reason = new Error('extension stopped');
+let acknowledged = false;
+const cancellation = reader.cancel(reason).then(() => { acknowledged = true; });
+check((await success(read, 'cancel pending read')).done && (await success(queued, 'cancel queued read')).done, 'cancellation ends both pending reads');
+check(returns === 1 && received === reason && !acknowledged, 'cancel forwards reason and waits for producer');
+first.resolve({ value: 99, done: false });
+cleanup.resolve({ done: true });
+await success(cancellation, 'cleanup receipt');
+check(calls === 1 && returns === 1, 'late data does not restart the iterator');
+
+const chunks = [];
+for await (const chunk of ReadableStream.from([Promise.resolve(1), 2, 3])) chunks.push(chunk);
+check(chunks.join(',') === '1,2,3', 'synchronous iterable unwraps promised chunks and drains in order');
+
+const promisedChunk = Promise.resolve(7);
+let started = 0;
+const asyncSource = { [Symbol.asyncIterator]() { return this; }, next() {
+    return ++started === 1 ? { value: promisedChunk } : { done: true, get value() { throw 0; } };
+} };
+const ordered = ReadableStream.from(asyncSource).getReader();
+asyncSource.next = () => { throw new Error('next must be captured when opened'); };
+check((await success(ordered.read(), 'async chunk')).value === promisedChunk, 'async iterator chunk identity survives');
+check((await success(ordered.read(), 'async EOF')).done, 'EOF does not read an async terminal value');
+
+let closed = 0;
+function* records() {
+    try { yield Promise.reject(reason); }
+    finally { closed++; }
+}
+const failed = ReadableStream.from(records()).getReader();
+await rejectsWith(failed.read(), reason, 'sync producer rejection reaches its reader');
+check(closed === 1, 'a rejected promised chunk closes the sync generator');
+await rejectsWith(failed.closed, reason, 'stream retains iterator failure');
+
+const malformed = { [Symbol.asyncIterator]() { return this; }, next() { return 7; }, return() { return null; } };
+const badRead = await settle(ReadableStream.from(malformed).getReader().read(), 'malformed next');
+const badCancel = await settle(ReadableStream.from(malformed).cancel(reason), 'malformed return');
+check(!badRead.ok && badRead.error instanceof TypeError, 'malformed next result errors the reader');
+check(!badCancel.ok && badCancel.error instanceof TypeError, 'malformed return result rejects cancellation');
+const refusing = { [Symbol.asyncIterator]() { return this; }, return() { throw reason; } };
+await rejectsWith(ReadableStream.from(refusing).cancel(), reason, 'producer cleanup failure reaches caller');
+return checks;
+",
+            14,
+        );
     }
 
     #[test]
