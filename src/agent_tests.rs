@@ -12715,28 +12715,35 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                         },
                     );
                     let owner = agent.job_session_scope.session_id().await.expect("owner");
+                    let hub = agent
+                        .job_session_scope
+                        .agent_hub_for_session(&owner)
+                        .expect("owner hub");
                     let (release, ready) = futures::channel::oneshot::channel::<()>();
-                    let task = crate::jobs::spawn_owned_task(
-                        crate::jobs::admit_owned_task(&owner).expect("task admission"),
-                        "planning background result",
-                        AgentCx::for_request(),
-                        Duration::from_secs(30),
-                        Some(root.path()),
-                        crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(
-                            crate::text_completion::AuxiliaryPrivacy::default(),
-                        ),
-                        async move {
-                            ready.await.expect("release retained work");
-                            Ok(ToolOutput {
-                                content: vec![ContentBlock::Text(TextContent::new(
-                                    "retained analysis result",
-                                ))],
-                                details: Some(json!({"analysis": "complete"})),
-                                is_error: false,
-                            })
-                        },
-                    )
-                    .expect("publish owned task");
+                    let task = {
+                        let _hub_scope = crate::agent_hub::enter_registry(Arc::clone(&hub));
+                        crate::jobs::spawn_owned_task(
+                            crate::jobs::admit_owned_task(&owner).expect("task admission"),
+                            "planning background result",
+                            AgentCx::for_request(),
+                            Duration::from_secs(30),
+                            Some(root.path()),
+                            crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(
+                                crate::text_completion::AuxiliaryPrivacy::default(),
+                            ),
+                            async move {
+                                ready.await.expect("release retained work");
+                                Ok(ToolOutput {
+                                    content: vec![ContentBlock::Text(TextContent::new(
+                                        "retained analysis result",
+                                    ))],
+                                    details: Some(json!({"analysis": "complete"})),
+                                    is_error: false,
+                                })
+                            },
+                        )
+                        .expect("publish owned task")
+                    };
                     agent.plan_state().enter_planning();
                     if pending_review {
                         agent.plan_state().submit_plan("Review this proposal".to_string());
@@ -12783,6 +12790,11 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                         ToolRegistry::new(&["jobs"], root.path(), Some(&config)),
                         AgentConfig::default(),
                     );
+                    let shared_session_id = owner.clone();
+                    foreign.job_session_scope.bind(Arc::new(move || {
+                        let id = shared_session_id.clone();
+                        Box::pin(async move { Some(id) })
+                    }));
                     foreign.plan_state().enter_planning();
                     let (hidden, failed) = execute_xdev_policy_call(
                         &foreign,
@@ -12809,9 +12821,12 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     let details = settled.details.as_ref().expect("settled descriptor");
                     assert_eq!(details["status"], "exited");
                     assert_eq!(details["result"]["details"]["analysis"], "complete");
-                    assert_eq!(crate::jobs::take_completion_notices(&owner).len(), 1);
-                    assert!(crate::jobs::take_completion_notices(&owner).is_empty());
-                    assert_eq!(crate::jobs::list(&owner).expect("retained job")[0].id, task.id);
+                    {
+                        let _hub_scope = crate::agent_hub::enter_registry(Arc::clone(&hub));
+                        assert_eq!(crate::jobs::take_completion_notices(&owner).len(), 1);
+                        assert!(crate::jobs::take_completion_notices(&owner).is_empty());
+                        assert_eq!(crate::jobs::list(&owner).expect("retained job")[0].id, task.id);
+                    }
                     assert_eq!(
                         agent.plan_state().mode(),
                         if pending_review {

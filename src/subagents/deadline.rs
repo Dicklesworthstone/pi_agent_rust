@@ -51,6 +51,10 @@ fn seconds(value: u64) -> Result<Duration> {
 }
 
 impl Deadline {
+    pub(super) fn earlier(self, other: Self) -> Self {
+        if self.at <= other.at { self } else { other }
+    }
+
     /// Explicit SDK policy beats the environment policy. A model request may
     /// shorten that host policy, never lengthen it; inheritance is always a cap.
     pub(super) fn for_request(

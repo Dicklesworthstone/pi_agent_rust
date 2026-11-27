@@ -193,6 +193,7 @@ impl EvalTool {
     /// ordinary session switches rebind the shared resolver, not this hook.
     pub(super) fn bind_eval_session_scope(&mut self, scope: JobSessionScope) {
         self.session_scope = scope;
+        self.hub_session_bound = true;
         let retired = std::mem::take(
             self.retained_sessions
                 .get_mut()
@@ -216,7 +217,19 @@ impl EvalTool {
     /// Capture an exact identity before queueing. An unavailable live session
     /// must not fall back to the preceding session or a process-global kernel.
     pub(super) async fn eval_session_id(&self) -> Result<String> {
-        let id = self.session_scope.session_id().await.map_err(|_| {
+        Self::checked_session_id(self.session_scope.session_id().await)
+    }
+
+    pub(super) async fn eval_invocation_session_id(&self) -> Result<String> {
+        if self.hub_session_bound {
+            Self::checked_session_id(self.session_scope.invocation_session_id().await)
+        } else {
+            self.eval_session_id().await
+        }
+    }
+
+    fn checked_session_id(id: Result<String>) -> Result<String> {
+        let id = id.map_err(|_| {
             Error::tool(
                 "eval",
                 "EVAL_SESSION_UNAVAILABLE: current session identity is unavailable",

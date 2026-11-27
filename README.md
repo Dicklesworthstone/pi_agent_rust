@@ -764,6 +764,8 @@ files. Queued children and corrective retries use that same baseline. Accepted
 patches apply after execution in task order; conflicts and cancelled work remain
 in their worktrees for inspection. `isoApply: "keep"` retains a result without
 applying it, and `isoApply: "drop"` discards its worktree after reporting the patch.
+Fresh `git init` repositories are supported before their first commit: a private
+root snapshot preserves the parent's branch and staging state during delegation.
 
 In interactive mode, `/tan <work>` starts the same task-role child machinery
 without interrupting the main conversation. The child runs in the current
@@ -774,7 +776,7 @@ the opt-in `subagent` tool is enabled. It captures the same model precedence whe
 the command is submitted, so a later parent model switch does not retarget it.
 
 Native children include `hub` in their default tool set and can exchange messages
-with other children of the same parent Pi process. Agent definitions with an
+with other children of the same live parent session. Agent definitions with an
 explicit tool allowlist must include `hub` to enable this capability. A child's
 `hub` call with `{"op":"agent","action":"roster"}` returns its authenticated
 `selfId` and the parent's child roster. Use those run IDs as recipients:
@@ -784,6 +786,13 @@ explicit tool allowlist must include `hub` to enable this capability. A child's
 {"op":"agent","action":"inbox"}
 {"op":"agent","action":"send","name":"parent","text":"I found a blocking dependency."}
 ```
+
+Child controls, parent inboxes, accepted `agent://` results, and native background
+job delivery retain their originating live session. Separately loaded handles
+of the same saved session have independent child authority; cloned SDK scopes
+share it. `/hub`, `/tan`, retained workers, and pooled delegation use that same
+ownership, including during cancellation and cleanup. The low-level SDK's
+explicit durable-owner job observation and teardown APIs remain owner-wide.
 
 Sibling messages enter the recipient's steering queue between turns and remain
 available in its inbox. The parent reads child reports with

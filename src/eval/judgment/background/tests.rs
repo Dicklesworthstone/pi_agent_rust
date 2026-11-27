@@ -1531,6 +1531,96 @@ fn helper_role_cannot_replace_a_host_binding_or_read_images_before_rejection() -
 }
 
 #[test]
+fn direct_bound_eval_jobs_belong_to_the_same_live_scope_in_both_kernel_modes() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    for mode in ["session", "per_call"] {
+        let harness = Harness::new(&["owned completion"], false)?;
+        let mut foreign_jobs = JobsTool::new();
+        foreign_jobs.bind_job_session_scope(crate::jobs::JobSessionScope::fixed(
+            &harness.host.owner,
+        ));
+        runtime().block_on(async {
+            let privacy = privacy();
+            let protect = |parts: &[&str]| privacy.project_inputs(parts);
+            let snapshot = || privacy.clone();
+            let launched = harness
+                .tool
+                .execute_with_invocation(
+                    "direct-sdk-launch",
+                    json!({
+                        "kernel":"js", "kernel_mode":mode,
+                        "code":"await tool.call('__pi_model_complete_start', {prompt:'answer'})"
+                    }),
+                    None,
+                    ToolInvocationContext {
+                        protect: &protect,
+                        host: Some(&harness.host),
+                        snapshot_privacy: &snapshot,
+                    },
+                )
+                .await?;
+            assert!(!launched.is_error);
+            let id = launched
+                .details
+                .as_ref()
+                .and_then(|details| details.pointer("/judgments/attempts/0/jobId"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::tool("fixture", "missing direct SDK job receipt"))?
+                .to_owned();
+            started(&harness, 1).await?;
+            let running = harness
+                .host
+                .jobs
+                .execute(
+                    "owned-wait",
+                    json!({"action":"wait", "jobId":id, "timeoutMs":0}),
+                    None,
+                )
+                .await?;
+            assert_eq!(running.details.as_ref().unwrap()["status"], "running");
+            let foreign = foreign_jobs
+                .execute("foreign-list", json!({"action":"list"}), None)
+                .await?;
+            assert_eq!(foreign.details.as_ref().unwrap()["jobs"], json!([]));
+            for action in ["wait", "cancel"] {
+                assert!(
+                    foreign_jobs
+                        .execute(
+                            "foreign-control",
+                            json!({"action":action, "jobId":id, "timeoutMs":0}),
+                            None,
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(harness.provider.gate.dropped.load(Ordering::Acquire), 0);
+            harness.provider.gate.release();
+            let done = harness
+                .host
+                .jobs
+                .execute(
+                    "owned-result",
+                    json!({"action":"wait", "jobId":id, "timeoutMs":5000}),
+                    None,
+                )
+                .await?;
+            assert_eq!(done.details.as_ref().unwrap()["status"], "exited");
+            assert_eq!(
+                done.details
+                    .as_ref()
+                    .unwrap()
+                    .pointer("/result/details/result/text"),
+                Some(&json!("owned completion"))
+            );
+            assert_eq!(harness.provider.calls.load(Ordering::Acquire), 1);
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
 fn javascript_and_python_launches_survive_cell_return_and_kernel_reset() -> Result<()> {
     let _serial = crate::jobs::process_test_guard();
     for kernel in ["js", "python"] {

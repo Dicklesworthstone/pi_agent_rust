@@ -12,8 +12,8 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    Document, MAX_COMPLETE_BYTES, MAX_DOCUMENT_BYTES, WireResponse, current_identity,
-    enforce_document_limit, ipc_error,
+    Document, MAX_COMPLETE_BYTES, MAX_DOCUMENT_BYTES, WireResponse, enforce_document_limit,
+    identity_in_registry, ipc_error,
 };
 use crate::error::Result;
 
@@ -155,6 +155,7 @@ impl Pages {
 pub struct Transfer {
     pages: Pages,
     sender: String,
+    hub: crate::agent_hub::SharedHub,
     identity: (PathBuf, u32),
 }
 
@@ -171,12 +172,13 @@ impl Transfer {
         Ok(Self {
             pages: Pages::new(document)?,
             sender: sender.to_string(),
+            hub: crate::agent_hub::current_registry(),
             identity,
         })
     }
 
     pub(crate) fn check_reader(&self) -> Result<()> {
-        self.check_identity(&current_identity(&self.sender)?)
+        self.check_identity(&identity_in_registry(&self.hub, &self.sender)?)
     }
 
     fn check_identity(&self, observed: &(PathBuf, u32)) -> Result<()> {
@@ -193,7 +195,7 @@ impl Transfer {
         if self.pages.document.is_none() {
             return Ok(None);
         }
-        self.next_with_identity(current_identity(&self.sender))
+        self.next_with_identity(identity_in_registry(&self.hub, &self.sender))
     }
 
     fn next_with_identity(

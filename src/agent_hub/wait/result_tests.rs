@@ -11,6 +11,7 @@ struct Fixture {
     root: tempfile::TempDir,
     tool: Arc<SubagentTool>,
     owner: String,
+    hub: crate::agent_hub::SharedHub,
 }
 
 impl Fixture {
@@ -50,11 +51,15 @@ done
         let owner = format!("result-wait-{}", uuid::Uuid::new_v4());
         let mut tool = SubagentTool::with_paths(root.path().to_path_buf(), global, binary)
             .with_timeout(Duration::from_secs(20));
-        tool.bind_job_session_scope(crate::jobs::JobSessionScope::fixed(&owner));
+        let scope = crate::jobs::JobSessionScope::fixed(&owner);
+        let hub = scope.agent_hub_for_session(&owner).unwrap();
+        hub.lock().unwrap().set_dir_for_tests(root.path().to_path_buf());
+        tool.bind_job_session_scope(scope);
         Self {
             root,
             tool: Arc::new(tool),
             owner,
+            hub,
         }
     }
 
@@ -79,7 +84,7 @@ done
             .unwrap()
             .parse()
             .unwrap();
-        crate::agent_hub::registry()
+        self.hub
             .lock()
             .unwrap()
             .roster()
@@ -110,7 +115,7 @@ async fn until(mut ready: impl FnMut() -> bool) {
 }
 
 fn parent_status(child: &str) -> InboxWaitStatus {
-    crate::agent_hub::registry()
+    crate::agent_hub::current_registry()
         .lock()
         .unwrap()
         .wait_snapshot(child, Some("parent"), 0)
@@ -129,7 +134,7 @@ fn real_worker_and_job_waits_release_on_drop_cancel_and_turn_acceptance() {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .unwrap();
-    runtime.block_on(async {
+    runtime.block_on(crate::agent_hub::with_registry(Arc::clone(&fixture.hub), async {
         let started = fixture
             .call(json!({"operation":"worker_start", "agent":"worker", "task":"wait"}))
             .await;
@@ -184,7 +189,7 @@ fn real_worker_and_job_waits_release_on_drop_cancel_and_turn_acceptance() {
         until(|| parent_status(&child) == InboxWaitStatus::Pending).await;
         assert!(!waiting.await.unwrap().is_error);
         assert!(
-            crate::agent_hub::registry()
+            fixture.hub
                 .lock()
                 .unwrap()
                 .control_pid(&child)
@@ -195,13 +200,13 @@ fn real_worker_and_job_waits_release_on_drop_cancel_and_turn_acceptance() {
             .call(json!({"operation":"worker_close", "workerId":worker}))
             .await;
         assert!(
-            !crate::agent_hub::registry()
+            !fixture.hub
                 .lock()
                 .unwrap()
                 .native_jobs
                 .contains_key(&child)
         );
-    });
+    }));
 }
 
 #[test]
@@ -211,7 +216,7 @@ fn internal_background_worker_wait_does_not_block_the_available_parent() {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .unwrap();
-    runtime.block_on(async {
+    runtime.block_on(crate::agent_hub::with_registry(Arc::clone(&fixture.hub), async {
         let started = fixture
             .call(json!({"operation":"worker_start", "agent":"worker", "task":"wait"}))
             .await;
@@ -262,7 +267,7 @@ fn internal_background_worker_wait_does_not_block_the_available_parent() {
             .await
             .unwrap();
         assert_eq!(completed.status, "exited");
-    });
+    }));
 }
 
 #[test]
@@ -272,7 +277,7 @@ fn native_pool_item_all_and_drain_waits_hold_only_their_observer_lifetimes() {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .unwrap();
-    runtime.block_on(async {
+    runtime.block_on(crate::agent_hub::with_registry(Arc::clone(&fixture.hub), async {
         let started = fixture
             .call(json!({
                 "operation":"pool_start", "agent":"worker", "concurrency":1, "tasks":["wait"]
@@ -300,25 +305,26 @@ fn native_pool_item_all_and_drain_waits_hold_only_their_observer_lifetimes() {
             .call(json!({"operation":"pool_wait", "poolId":pool, "timeoutMs":5000}))
             .await;
         assert_eq!(done["status"], "completed");
-    });
+    }));
 }
 
-struct NativeRegistration(String);
+struct NativeRegistration(String, crate::agent_hub::SharedHub);
 
 impl NativeRegistration {
     fn new() -> Self {
-        let entry = crate::agent_hub::registry()
+        let hub = crate::agent_hub::current_registry();
+        let entry = hub
             .lock()
             .unwrap()
             .register_worker("later-wave", crate::agent_hub::ChildKind::Subagent)
             .unwrap();
-        Self(entry.id)
+        Self(entry.id, hub)
     }
 }
 
 impl Drop for NativeRegistration {
     fn drop(&mut self) {
-        let mut hub = crate::agent_hub::registry().lock().unwrap();
+        let mut hub = self.1.lock().unwrap();
         hub.settle(&self.0, ChildStatus::Done);
         hub.finish_native_execution(&self.0);
     }
@@ -331,7 +337,7 @@ fn owned_job_identity_survives_yields_and_binds_children_after_wait_admission() 
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .unwrap();
-    runtime.block_on(async {
+    runtime.block_on(crate::agent_hub::with_registry(Arc::clone(&fixture.hub), async {
         let (begin, admitted) = futures::channel::oneshot::channel();
         let (first_send, first_receive) = futures::channel::oneshot::channel();
         let (advance, next_wave) = futures::channel::oneshot::channel();
@@ -380,7 +386,7 @@ fn owned_job_identity_survives_yields_and_binds_children_after_wait_admission() 
         let second = second_receive.await.unwrap();
         assert_eq!(parent_status(&second), InboxWaitStatus::PeerBlocked);
         assert!(
-            !crate::agent_hub::registry()
+            !fixture.hub
                 .lock()
                 .unwrap()
                 .native_jobs
@@ -394,5 +400,5 @@ fn owned_job_identity_survives_yields_and_binds_children_after_wait_admission() 
             .unwrap();
         assert_eq!(completed.status, "exited");
         assert!(crate::jobs::current_native_task().is_none());
-    });
+    }));
 }

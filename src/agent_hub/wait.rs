@@ -714,6 +714,7 @@ impl WaitBudget {
 
 async fn probe_inbox(
     owner: &AgentCx,
+    hub: &super::SharedHub,
     inherited: bool,
     peer: Option<&str>,
     cursor: u64,
@@ -748,7 +749,7 @@ async fn probe_inbox(
         }
         Ok(result)
     } else {
-        match super::registry().try_lock() {
+        match hub.try_lock() {
             Ok(hub) => hub.wait_snapshot("parent", peer, cursor),
             Err(std::sync::TryLockError::WouldBlock) => {
                 Err(wait_error("BUSY", "the parent agent registry is busy"))
@@ -788,6 +789,7 @@ pub async fn wait_for_replies(
         ));
     }
     let budget = WaitBudget::new(&owner, wait_ms)?;
+    let hub = super::current_registry();
     let inherited = ipc::inherited_channel_present();
     if !inherited && claimed_from.is_some_and(|from| from != "parent") {
         return Err(wait_error(
@@ -813,7 +815,7 @@ pub async fn wait_for_replies(
                 "reply wait expired before a complete inbox probe",
             ));
         }
-        let probe = probe_inbox(&owner, inherited, peer, cursor, claimed_from, remaining).await;
+        let probe = probe_inbox(&owner, &hub, inherited, peer, cursor, claimed_from, remaining).await;
         let mut result = match probe {
             Ok(result) => result,
             Err(error) => {
@@ -859,7 +861,7 @@ pub async fn wait_for_replies(
                     Err(error) => Err(error),
                 }
             } else {
-                match super::registry().try_lock() {
+                match hub.try_lock() {
                     Ok(mut hub) => hub
                         .begin_reply_wait("parent", peer, cursor, remaining, None)
                         .map(|hold| local_hold = Some(hold)),

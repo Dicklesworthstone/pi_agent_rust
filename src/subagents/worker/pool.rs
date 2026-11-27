@@ -42,6 +42,7 @@ struct Item {
 #[allow(clippy::struct_excessive_bools)] // Independent lifecycle flags read under one lock.
 struct PoolState {
     owner: String,
+    hub: crate::agent_hub::SharedHub,
     id: String,
     job_id: String,
     agent: String,
@@ -120,13 +121,15 @@ fn register(pool: Pool) -> Result<Registration> {
 }
 
 fn lookup(owner: &str, id: &str) -> Result<Pool> {
+    let hub = crate::agent_hub::current_registry();
     registry()
         .lock()
         .map_err(|_| stopped())?
         .iter()
         .find_map(|pool| {
             let state = pool.lock().ok()?;
-            (state.owner == owner && state.id == id).then(|| Arc::clone(pool))
+            (state.owner == owner && state.id == id && Arc::ptr_eq(&state.hub, &hub))
+                .then(|| Arc::clone(pool))
         })
         .ok_or_else(|| {
             Error::tool(
@@ -174,6 +177,7 @@ fn worker(
 ) -> Shared {
     Arc::new(Mutex::new(WorkerState {
         owner: owner.to_string(),
+        hub: crate::agent_hub::current_registry(),
         id: format!("pool-member-{}", uuid::Uuid::new_v4().simple()),
         job_id: String::new(),
         hub_id: None,
@@ -278,9 +282,10 @@ async fn start(
     if current_subagent_depth() >= MAX_SUBAGENT_DEPTH {
         return Err(invalid("maximum nested subagent depth reached"));
     }
-    let deadline = Deadline::for_request(tool.timeout, timeout)?;
+    let deadline = tool.request_deadline(timeout)?;
     let job_deadline = Instant::now() + deadline.remaining();
-    let owner_id = background::resolve_session(&tool.job_session_scope, &owner, deadline).await?;
+    let owner_id =
+        background::resolve_invocation_session(&tool.job_session_scope, &owner, deadline).await?;
     let admission = crate::jobs::admit_owned_task(&owner_id)?.with_deadline(job_deadline);
     let parent_model = tool.capture_parent_model();
     let cost_budget = tool.cost_scope.current();
@@ -329,6 +334,7 @@ async fn start(
     let id = format!("pool-{}", uuid::Uuid::new_v4().simple());
     let pool = Arc::new(Mutex::new(PoolState {
         owner: owner_id.clone(),
+        hub: crate::agent_hub::current_registry(),
         id: id.clone(),
         job_id: String::new(),
         agent: name,
@@ -705,8 +711,12 @@ pub(super) async fn execute(
         .unwrap_or_else(|| if drain.is_some() { 0 } else { 30_000 });
     let owner = AgentCx::for_current_or_request();
     check_owner(&owner)?;
-    let budget = Deadline::for_request(Some(Duration::from_millis(timeout_ms + 30_000)), None)?;
-    let owner_id = background::resolve_session(&tool.job_session_scope, &owner, budget).await?;
+    let budget = tool.cap_deadline(Deadline::for_request(
+        Some(Duration::from_millis(timeout_ms + 30_000)),
+        None,
+    )?);
+    let owner_id =
+        background::resolve_invocation_session(&tool.job_session_scope, &owner, budget).await?;
     let pool = lookup(&owner_id, id)?;
     if let Some(assignments) = assignments {
         return admit(
@@ -1116,6 +1126,11 @@ async fn seal(
 }
 
 async fn close(pool: &Pool) -> Result<()> {
+    let hub = Arc::clone(&pool.lock().map_err(|_| stopped())?.hub);
+    crate::agent_hub::with_registry(hub, close_in_registry(pool)).await
+}
+
+async fn close_in_registry(pool: &Pool) -> Result<()> {
     let (owner, job_id) = {
         let mut state = pool.lock().map_err(|_| stopped())?;
         if state.closed {
@@ -1375,12 +1390,20 @@ fn run(
     children: Vec<(ChildRunner, AgentDefinition)>,
     privacy: AuxiliaryPrivacySnapshot,
 ) -> impl Future<Output = Result<ToolOutput>> + Send {
+    let hub = Arc::clone(
+        &pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .hub,
+    );
     let mut controller = PoolRun {
         pool,
         actors: Some(FuturesUnordered::new()),
         settled: false,
     };
-    async move { controller.execute(children, &privacy).await }
+    crate::agent_hub::with_registry(hub, async move {
+        controller.execute(children, &privacy).await
+    })
 }
 
 impl PoolRun {
@@ -1494,6 +1517,13 @@ impl Drop for PoolRun {
         if self.settled {
             return;
         }
+        let hub = Arc::clone(
+            &self.pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .hub,
+        );
+        let _hub_scope = crate::agent_hub::enter_registry(hub);
         let workers = {
             let mut state = self
                 .pool
@@ -1561,6 +1591,15 @@ mod tests {
                 .expect("native pool operation") // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Each observed handle must come from the public tool path.
                 .details
                 .expect("pool details") // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Structured native identity and result metadata are the tested contract.
+        }
+
+        fn lookup_pool(&self, id: &str) -> Result<Pool> {
+            let hub = self
+                .tool
+                .job_session_scope
+                .agent_hub_for_session(&self.owner)?;
+            let _hub_scope = crate::agent_hub::enter_registry(hub);
+            lookup(&self.owner, id)
         }
 
         pub(super) async fn await_file(&self, name: &str) {
@@ -2156,7 +2195,7 @@ done
             let pool = field(&started, "poolId");
             assert_eq!(started["maxBatchSize"], 8);
             assert_eq!(started["yieldResults"], false);
-            let shared = lookup(&fixture.owner, &pool).expect("owned native pool");
+            let shared = fixture.lookup_pool(&pool).expect("owned native pool");
             {
                 let state = shared.lock().expect("pool state");
                 assert_eq!(state.max_batch_size, 8);
@@ -2253,7 +2292,7 @@ done
                 .await;
             let pool = field(&started, "poolId");
             assert_eq!(started["yieldResults"], true);
-            let shared = lookup(&fixture.owner, &pool).expect("owned native pool");
+            let shared = fixture.lookup_pool(&pool).expect("owned native pool");
             {
                 let state = shared.lock().expect("pool state");
                 assert!(state.yield_results);
@@ -2306,6 +2345,50 @@ done
     }
 
     #[test]
+    fn pool_handle_control_requires_the_same_live_hub_even_with_a_matching_session_id() {
+        let own = Arc::new(Mutex::new(crate::agent_hub::AgentHubRegistry::default()));
+        let foreign = Arc::new(Mutex::new(crate::agent_hub::AgentHubRegistry::default()));
+        let owner_id = format!("same-saved-session-{}", uuid::Uuid::new_v4().simple());
+        let pool_id = format!("pool-{}", uuid::Uuid::new_v4().simple());
+        let (pool, _registration) = {
+            let _scope = crate::agent_hub::enter_registry(Arc::clone(&own));
+            let deadline = Deadline::for_request(Some(Duration::from_secs(60)), None).unwrap();
+            let pool = Arc::new(Mutex::new(PoolState {
+                owner: owner_id.clone(),
+                hub: Arc::clone(&own),
+                id: pool_id.clone(),
+                job_id: "unpublished-owner-fixture".to_string(),
+                agent: "reviewer".to_string(),
+                deadline,
+                max_batch_size: 1,
+                yield_results: false,
+                acknowledged: false,
+                sealed: false,
+                closing: false,
+                closed: false,
+                failed: false,
+                workers: vec![worker(&owner_id, "reviewer", deadline, 1, false)],
+                items: Vec::new(),
+                dependencies: crate::agent_hub::ResultDependencies::new(Vec::new()),
+                privacy: Vec::new(),
+            }));
+            let registration = register(Arc::clone(&pool)).unwrap();
+            assert!(Arc::ptr_eq(&lookup(&owner_id, &pool_id).unwrap(), &pool));
+            (pool, registration)
+        };
+        {
+            let _scope = crate::agent_hub::enter_registry(Arc::clone(&foreign));
+            let error = lookup(&owner_id, &pool_id)
+                .err()
+                .expect("another live session must not borrow the saved-session identity");
+            assert!(error.to_string().contains("PI_SUBAGENT_POOL_UNKNOWN"));
+            assert!(!pool.lock().unwrap().closing);
+        }
+        let _scope = crate::agent_hub::enter_registry(own);
+        assert!(Arc::ptr_eq(&lookup(&owner_id, &pool_id).unwrap(), &pool));
+    }
+
+    #[test]
     fn all_yielded_worker_remains_busy_for_placement_and_sealed_retirement() {
         let privacy = AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::from_settings(None));
         let deadline = Deadline::for_request(Some(Duration::from_secs(60)), None)
@@ -2341,6 +2424,7 @@ done
         }
         let pool = Arc::new(Mutex::new(PoolState {
             owner: "yield-owner".to_string(),
+            hub: crate::agent_hub::current_registry(),
             id: "yield-pool".to_string(),
             job_id: "yield-job".to_string(),
             agent: "reviewer".to_string(),
@@ -2689,7 +2773,7 @@ done
             let started = fixture.call(json!({"operation":"pool_start","agent":"worker","concurrency":1,"tasks":["remember silver"]})).await;
             let pool_id = field(&started, "poolId");
             fixture.call(json!({"operation":"pool_wait","poolId":pool_id,"itemId":1,"timeoutMs":5000})).await;
-            let pool = lookup(&fixture.owner, &pool_id).expect("native pool"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Use the same admitted native state for the controlled seal race.
+            let pool = fixture.lookup_pool(&pool_id).expect("native pool"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Use the same admitted native state for the controlled seal race.
             let (release, pending) = futures::channel::oneshot::channel::<()>();
             let pending = Arc::new(Mutex::new(Some(pending)));
             let owner_id = fixture.owner.clone();

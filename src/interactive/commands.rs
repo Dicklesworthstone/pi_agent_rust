@@ -4341,12 +4341,17 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     fn completed_tan_event(
         owner_session_id: String,
         completion: &pi::subagents::TanCompletion,
+        hub: &pi::agent_hub::SharedHub,
     ) -> PiMsg {
-        let card = pi::jobs::push_completion_notice(&owner_session_id, completion.follow_up_text())
-            .map_or_else(
-                |err| format!("(/tan failed to queue follow-up)\n{err}"),
-                |()| completion.card_text(),
-            );
+        let card = pi::jobs::push_completion_notice_in_hub(
+            &owner_session_id,
+            completion.follow_up_text(),
+            hub,
+        )
+        .map_or_else(
+            |err| format!("(/tan failed to queue follow-up)\n{err}"),
+            |()| completion.card_text(),
+        );
         PiMsg::SessionSystemNote {
             owner_session_id,
             message: card,
@@ -4363,6 +4368,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             Enabled(
                 Option<pi::tools::ToolModelSelection>,
                 Option<pi::cost::CostBudget>,
+                pi::jobs::JobSessionScope,
             ),
             Disabled,
             Busy,
@@ -4378,12 +4384,16 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let gate = self.agent.try_lock().map_or(TanGate::Busy, |agent| {
             if agent.has_tool("subagent") {
                 let tools = agent.shared_tools().snapshot();
-                TanGate::Enabled(tools.model_scope().current(), tools.cost_scope().current())
+                TanGate::Enabled(
+                    tools.model_scope().current(),
+                    tools.cost_scope().current(),
+                    tools.job_session_scope(),
+                )
             } else {
                 TanGate::Disabled
             }
         });
-        let (parent_model, cost_budget) = match gate {
+        let (parent_model, cost_budget, job_session_scope) = match gate {
             TanGate::Busy => {
                 self.status_message = Some("/tan unavailable: agent session is busy".to_string());
                 self.scroll_to_bottom();
@@ -4397,7 +4407,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.scroll_to_bottom();
                 return None;
             }
-            TanGate::Enabled(model, cost) => (model, cost),
+            TanGate::Enabled(model, cost, scope) => (model, cost, scope),
         };
 
         // Same TryLockError-guard temporary pattern as /btw (bd-9x70g).
@@ -4411,6 +4421,15 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             return None;
         }
 
+        let hub = match job_session_scope.agent_hub_for_session(&owner_session_id) {
+            Ok(hub) => hub,
+            Err(error) => {
+                self.status_message = Some(format!("/tan unavailable: {error}"));
+                self.scroll_to_bottom();
+                return None;
+            }
+        };
+
         let tool = pi::subagents::SubagentTool::new(&self.cwd)
             .with_workspace(self.workspace.clone())
             .with_secrets_settings(self.config.secrets.as_ref())
@@ -4422,16 +4441,16 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let event_tx = self.event_tx.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         let display_work = work.clone();
-        runtime.spawn(async move {
+        runtime.spawn(pi::agent_hub::with_registry(Arc::clone(&hub), async move {
             let event = match tool.run_background_tan(&work).await {
-                Ok(completion) => Self::completed_tan_event(owner_session_id, &completion),
+                Ok(completion) => Self::completed_tan_event(owner_session_id, &completion, &hub),
                 Err(err) => PiMsg::SessionSystemNote {
                     owner_session_id,
                     message: format!("(/tan failed)\n{err}"),
                 },
             };
             let _ = crate::interactive::enqueue_pi_event(&event_tx, &task_cx, event).await;
-        });
+        }));
 
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
@@ -6423,7 +6442,17 @@ mod tests {
         };
         let expected_card = completion.card_text();
         let expected_follow_up = completion.follow_up_text();
-        let event = PiApp::completed_tan_event(origin_session_id.clone(), &completion);
+        let origin_hub = app
+            .agent
+            .try_lock()
+            .expect("test agent lock")
+            .shared_tools()
+            .snapshot()
+            .job_session_scope()
+            .agent_hub_for_session(&origin_session_id)
+            .expect("origin hub");
+        let event =
+            PiApp::completed_tan_event(origin_session_id.clone(), &completion, &origin_hub);
         assert!(matches!(
             &event,
             PiMsg::SessionSystemNote {
@@ -6464,7 +6493,21 @@ mod tests {
             !message.content.contains(task_marker) && !message.content.contains(output_marker)
         }));
 
-        let origin_notices = pi::jobs::take_completion_notices(&origin_session_id);
+        let foreign_hub = pi::jobs::JobSessionScope::fixed(origin_session_id.clone())
+            .agent_hub_for_session(&origin_session_id)
+            .expect("separate live hub");
+        assert!(
+            runtime()
+                .block_on(pi::agent_hub::with_registry(foreign_hub, async {
+                    pi::jobs::take_completion_notices(&origin_session_id)
+                }))
+                .is_empty(),
+            "another live handle of the saved session must not consume this follow-up"
+        );
+        let origin_notices =
+            runtime().block_on(pi::agent_hub::with_registry(origin_hub, async {
+                pi::jobs::take_completion_notices(&origin_session_id)
+            }));
         assert_eq!(
             origin_notices.len(),
             1,

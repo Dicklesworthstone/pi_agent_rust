@@ -34,6 +34,73 @@ fn text(output: &ToolOutput) -> String {
 }
 
 #[test]
+fn direct_bound_eval_cancels_while_resolving_its_live_hub_before_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tool = EvalTool::new(dir.path());
+    let scope = crate::jobs::JobSessionScope::fixed("pending-hub-owner");
+    scope.bind(Arc::new(|| Box::pin(futures::future::pending())));
+    tool.bind_job_session_scope(scope);
+    let owner = AgentCx::for_testing();
+    run(async {
+        let mut pending = Box::pin(owner.with_current(tool.execute(
+            "pending-hub",
+            json!({"kernel":"js", "code":"throw new Error('must not execute')"}),
+            None,
+        )));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        owner.set_cancel_requested(true);
+        let error = pending.await.unwrap_err();
+        assert!(error.to_string().contains("EVAL_CANCELLED"), "{error}");
+        assert!(tool.js.lock().unwrap().is_none());
+        assert!(tool.kernel.lock().unwrap().is_none());
+    });
+}
+
+#[test]
+fn direct_bound_eval_validates_before_resolving_its_live_hub() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tool = EvalTool::new(dir.path());
+    let scope = crate::jobs::JobSessionScope::fixed("pending-hub-owner");
+    scope.bind(Arc::new(|| Box::pin(futures::future::pending())));
+    tool.bind_job_session_scope(scope);
+    run(async {
+        for mode in ["session", "per_call"] {
+            for (mut input, code) in [
+                (
+                    json!({"kernel":"unknown", "code":"", "reset":true}),
+                    "EVAL_INPUT",
+                ),
+                (
+                    json!({"kernel":"js", "code":"", "reset":"true"}),
+                    "EVAL_INPUT",
+                ),
+                (
+                    json!({"kernel":"js", "code":"", "soft_timeout_secs":1}),
+                    "EVAL_INPUT",
+                ),
+                (
+                    json!({"kernel":"js", "code":"%load", "reset":true}),
+                    "EVAL_LOAD_USAGE",
+                ),
+            ] {
+                input["kernel_mode"] = json!(mode);
+                let mut pending = tool.execute("invalid-before-owner", input, None);
+                let std::task::Poll::Ready(Err(error)) = futures::poll!(pending.as_mut()) else {
+                    panic!("invalid input waited for the live owner");
+                };
+                assert!(error.to_string().contains(code), "{error}");
+                assert_eq!(
+                    error.to_string().contains("EVAL_PER_CALL"),
+                    mode == "per_call"
+                );
+            }
+        }
+        assert!(tool.js.lock().unwrap().is_none());
+        assert!(tool.kernel.lock().unwrap().is_none());
+    });
+}
+
+#[test]
 fn per_call_never_reads_or_replaces_retained_javascript_bindings() {
     let dir = tempfile::tempdir().unwrap();
     let tool = EvalTool::new(dir.path());

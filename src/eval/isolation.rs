@@ -30,6 +30,16 @@ impl KernelMode {
             )),
         }
     }
+
+    fn annotate_error(self, error: Error) -> Error {
+        if self == Self::Session {
+            error
+        } else {
+            Error::tool("eval", format!(
+                "{error}; EVAL_PER_CALL: private interpreter state is not retained; session kernels untouched"
+            ))
+        }
+    }
 }
 
 impl EvalTool {
@@ -44,6 +54,7 @@ impl EvalTool {
             kernel: Mutex::new(None),
             js: Mutex::new(None),
             session_scope: self.session_scope.clone(),
+            hub_session_bound: self.hub_session_bound,
             cost_scope: self.cost_scope.clone(),
             retained_sessions: Mutex::new(super::session::RetainedSessions::default()),
             execution: Arc::clone(&self.execution),
@@ -60,10 +71,29 @@ impl EvalTool {
         host: Option<&dyn crate::tools::ToolInvocationHost>,
         snapshot_privacy: Option<&super::judgment::SnapshotPrivacy<'_>>,
     ) -> Result<ToolOutput> {
-        if KernelMode::parse(&input)? == KernelMode::Session {
-            return self
-                .execute_cell(input, on_update, protect, host, snapshot_privacy)
-                .await;
+        let mode = KernelMode::parse(&input)?;
+        let prepared = self
+            .prepare_cell(input, protect, host, snapshot_privacy)
+            .map_err(|error| mode.annotate_error(error))?;
+        let hub = self
+            .invocation_hub()
+            .await
+            .map_err(|error| mode.annotate_error(error))?;
+        crate::agent_hub::with_registry(
+            hub,
+            self.execute_mode_in_registry(mode, prepared, on_update),
+        )
+        .await
+    }
+
+    async fn execute_mode_in_registry(
+        &self,
+        mode: KernelMode,
+        prepared: super::lifecycle::PreparedCell<'_>,
+        on_update: Option<Update>,
+    ) -> Result<ToolOutput> {
+        if mode == KernelMode::Session {
+            return self.execute_cell(prepared, on_update).await;
         }
         let owner = AgentCx::for_current_or_request();
         let private = self.isolated_executor();
@@ -73,9 +103,7 @@ impl EvalTool {
                 callback(update);
             }) as Update
         });
-        let outcome = private
-            .execute_cell(input, on_update, protect, host, snapshot_privacy)
-            .await;
+        let outcome = private.execute_cell(prepared, on_update).await;
         // Retire even a successful or ordinary-error kernel before handing
         // out the result. Abandonment drops the private executor and checked-
         // out runner too; neither has access to the parent's kernel slots.
@@ -83,9 +111,7 @@ impl EvalTool {
             let _current = owner.cx().clone().set_current_restricted();
             drop(private);
         }
-        let mut output = outcome.map_err(|error| Error::tool("eval", format!(
-            "{error}; EVAL_PER_CALL: private interpreter state is not retained; session kernels untouched"
-        )))?;
+        let mut output = outcome.map_err(|error| mode.annotate_error(error))?;
         annotate(&mut output.details);
         // A clean soft stop normally keeps Python's state. This private
         // executor was deliberately retired instead; do not claim reuse.

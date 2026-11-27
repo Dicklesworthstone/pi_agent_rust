@@ -71,7 +71,11 @@ impl Drop for NativeTaskScope {
 /// Retain the owner's shutdown generation across asynchronous preflight. A
 /// caller must resolve its live session again after taking this token; if it
 /// changed, dropping the token abandons admission without starting any work.
-pub struct TaskAdmission(super::SessionSpawnAttempt, Option<Instant>);
+pub struct TaskAdmission(
+    super::SessionSpawnAttempt,
+    Option<Instant>,
+    crate::agent_hub::SharedHub,
+);
 
 impl TaskAdmission {
     /// Freeze the original admission deadline before asynchronous preparation.
@@ -90,7 +94,21 @@ pub fn admit_owned_task(owner_session_id: &str) -> Result<TaskAdmission> {
             "PI_JOBS_SESSION_UNAVAILABLE: missing task owner",
         ));
     }
-    let admission = TaskAdmission(capture_session_spawn_generation(owner_session_id)?, None);
+    // Check the retained parent before acquiring the jobs/lifecycle locks.
+    // A live resolver switch must not admit a new-session job into an older
+    // invocation's hub, even if it happened before the first identity read.
+    let hub = crate::agent_hub::current_registry();
+    let admitted = hub
+        .lock()
+        .map_err(|_| Error::tool("jobs", "PI_HUB_SESSION_UNAVAILABLE: parent hub is poisoned"))?
+        .admits_native_owner(owner_session_id);
+    if !admitted {
+        return Err(Error::tool(
+            "jobs",
+            "PI_HUB_SESSION_CHANGED: native task owner differs from the captured parent session",
+        ));
+    }
+    let admission = TaskAdmission(capture_session_spawn_generation(owner_session_id)?, None, hub);
     #[cfg(test)]
     super::invoke_after_initial_owner_check_hook(owner_session_id);
     Ok(admission)
@@ -131,7 +149,8 @@ pub fn with_owned_task_progress<T>(
     }
     let (value, notice) = commit()?;
     if let Some(notice) = notice {
-        super::enqueue_completion_notice(&mut reg, owner_session_id, &notice);
+        let hub = reg.jobs.get(id).and_then(|job| job.hub_registry.clone());
+        super::enqueue_owned_completion_notice(&mut reg, owner_session_id, &notice, hub);
     }
     Ok(value)
 }
@@ -267,6 +286,7 @@ where
 {
     let work = OwnedWork {
         owner,
+        hub: Arc::clone(&admission.2),
         future: Some(future),
     };
     let prepared = prepare_native_task(
@@ -303,6 +323,7 @@ where
     // is dropped without one poll must retire its payload under this owner.
     let work = OwnedWork {
         owner,
+        hub: Arc::clone(&admission.2),
         future: Some(future),
     };
     let started = Instant::now();
@@ -329,6 +350,7 @@ where
             .name(format!("pi-task-{}-admission", prepared.reservation.0))
             .spawn(move || {
                 let _current = prepared.work.owner.cx().clone().set_current_restricted();
+                let _hub = crate::agent_hub::enter_registry(Arc::clone(&prepared.work.hub));
                 let result = spawn_prepared_native_task(prepared);
                 // A disconnected receiver drops the armed launch whether it
                 // disappeared before send or while the result was queued.
@@ -565,6 +587,7 @@ where
             result: None,
             result_bytes: 0,
             owner_session_id: owner_session_id.to_string(),
+            hub_registry: Some(Arc::clone(&work.hub)),
             delivery: JobDelivery::Foreground,
             id: id.clone(),
             command: label,
@@ -588,6 +611,7 @@ where
         };
         let handle = JobWaitHandle {
             owner_session_id: owner_session_id.to_string(),
+            hub_registry: entry.hub_registry.clone(),
             id: id.clone(),
             settled_snapshot: Arc::clone(&entry.settled_snapshot),
             settled_notify: Arc::clone(&entry.settled_notify),
@@ -617,6 +641,7 @@ where
             // All native registrations, including later workflow waves,
             // inherit this immutable owner without async task migration.
             let _native_scope = NativeTaskScope::enter(native_owner);
+            let _hub_scope = crate::agent_hub::enter_registry(Arc::clone(&work.hub));
             let Some(mut resources) = worker_resources.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner).take()
             else { return; };
@@ -725,12 +750,14 @@ fn task_artifact(
 
 struct OwnedWork<F> {
     owner: AgentCx,
+    hub: crate::agent_hub::SharedHub,
     future: Option<F>,
 }
 
 impl<F> Drop for OwnedWork<F> {
     fn drop(&mut self) {
         let _guard = self.owner.cx().clone().set_current_restricted();
+        let _hub = crate::agent_hub::enter_registry(Arc::clone(&self.hub));
         drop(self.future.take());
     }
 }
@@ -749,7 +776,10 @@ impl<F: Future<Output = Result<ToolOutput>>> OwnedWork<F> {
                 "PI_JOBS_TASK_STATE: missing task future",
             )));
         };
-        let mut future = Box::pin(self.owner.with_current(future));
+        let mut future = Box::pin(crate::agent_hub::with_registry(
+            Arc::clone(&self.hub),
+            self.owner.with_current(future),
+        ));
         loop {
             if task_cancelled(id) || self.owner.checkpoint().is_err() {
                 return TaskOutcome::Cancelled;
@@ -1092,6 +1122,65 @@ mod tests {
             }
             self.dropped.store(true, Ordering::Release);
         }
+    }
+
+    #[test]
+    fn unpolled_native_admission_drops_payload_under_its_original_parent_hub() {
+        struct HubDrop {
+            expected: crate::agent_hub::SharedHub,
+            observed: Arc<AtomicBool>,
+        }
+
+        impl Future for HubDrop {
+            type Output = Result<ToolOutput>;
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                panic!("unpublished work must never be polled")
+            }
+        }
+
+        impl Drop for HubDrop {
+            fn drop(&mut self) {
+                self.observed.store(
+                    Arc::ptr_eq(&self.expected, &crate::agent_hub::current_registry()),
+                    Ordering::Release,
+                );
+            }
+        }
+
+        let _guard = super::super::process_test_guard();
+        let session = owner_id();
+        let first_scope = super::super::JobSessionScope::fixed(session.clone());
+        let second_scope = super::super::JobSessionScope::fixed(session.clone());
+        let first = first_scope.agent_hub_for_session(&session).unwrap();
+        let second = second_scope.agent_hub_for_session(&session).unwrap();
+        let admission = {
+            let _owner = crate::agent_hub::enter_registry(Arc::clone(&first));
+            admit_owned_task(&session).unwrap()
+        };
+        let observed = Arc::new(AtomicBool::new(false));
+        {
+            let _foreign = crate::agent_hub::enter_registry(Arc::clone(&second));
+            let launch = spawn_owned_task_async(
+                admission,
+                "never polled",
+                AgentCx::for_request(),
+                Duration::from_secs(5),
+                None,
+                AuxiliaryPrivacySnapshot::from_privacy(
+                    crate::text_completion::AuxiliaryPrivacy::default(),
+                ),
+                HubDrop {
+                    expected: first,
+                    observed: Arc::clone(&observed),
+                },
+            );
+            drop(launch);
+            assert!(Arc::ptr_eq(&second, &crate::agent_hub::current_registry()));
+        }
+        assert!(observed.load(Ordering::Acquire));
+        assert!(super::super::list(&session).unwrap().is_empty());
+        assert!(!super::super::has_pending_work(&session).unwrap());
     }
 
     #[derive(Default)]

@@ -15,10 +15,10 @@ use serde_json::Value;
 
 use super::{
     EXCHANGE_TIMEOUT, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, VERSION, inherited_endpoint,
-    ipc_error, matches_token, registry,
+    ipc_error, matches_token,
 };
 use crate::agent_cx::AgentCx;
-use crate::agent_hub::{AgentHubRegistry, ChildStatus};
+use crate::agent_hub::{AgentHubRegistry, ChildStatus, SharedHub, current_registry};
 use crate::error::Result;
 use crate::url_router::{ResolvedDoc, URL_ROUTER_SCHEMA};
 
@@ -96,10 +96,10 @@ fn live_identity(hub: &AgentHubRegistry, sender: &str) -> Result<(PathBuf, u32)>
     Ok((entry.transcript_path, pid))
 }
 
-fn current_identity(sender: &str) -> Result<(PathBuf, u32)> {
+fn identity_in_registry(registry: &SharedHub, sender: &str) -> Result<(PathBuf, u32)> {
     let deadline = Instant::now() + Duration::from_millis(50);
     loop {
-        match registry().try_lock() {
+        match registry.try_lock() {
             Ok(hub) => return live_identity(&hub, sender),
             Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(1));
@@ -140,10 +140,11 @@ pub(super) fn dispatch_authenticated(
     }
     reference_valid(&request.result.reference)?;
     check_owner(owner)?;
-    let identity = current_identity(sender)?;
+    let hub = current_registry();
+    let identity = identity_in_registry(&hub, sender)?;
     let resolved = crate::url_router::resolve_local_agent(&request.result.reference)?;
     check_owner(owner)?;
-    if current_identity(sender)? != identity {
+    if identity_in_registry(&hub, sender)? != identity {
         return Err(ipc_error(
             "REVOKED",
             "result reader identity changed during resolution",

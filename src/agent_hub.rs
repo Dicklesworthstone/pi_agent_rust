@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,8 @@ use crate::error::{Error, Result};
 
 pub mod ipc;
 mod wait;
+#[cfg(test)]
+mod session_tests;
 
 pub(crate) use wait::{DependencyHold, ResultDependencies, ResultDependency};
 pub use wait::{InboxWaitResult, InboxWaitStatus, PendingReply, wait_for_replies};
@@ -140,9 +142,12 @@ pub struct BusMessage {
     pub sent_ms: u64,
 }
 
-/// Session-scoped registry: one per parent process.
+/// Child authority for one live parent and its selected durable session.
 #[derive(Default)]
 pub struct AgentHubRegistry {
+    /// Immutable for scoped registries. The explicit standalone hub has no
+    /// durable owner and retains its original host-selected owner contract.
+    owner_session_id: Option<String>,
     entries: BTreeMap<String, ChildEntry>,
     /// Process-control authority ends at reap, even when an accepted result
     /// still awaits ordered worktree application. Entry PIDs remain history.
@@ -210,11 +215,100 @@ impl std::fmt::Debug for AgentHubRegistry {
     }
 }
 
-static REGISTRY: OnceLock<Mutex<AgentHubRegistry>> = OnceLock::new();
+/// Retained authority for one live parent's child roster, control and inboxes.
+pub type SharedHub = Arc<Mutex<AgentHubRegistry>>;
 
-/// The process-wide registry (session-scoped: one hub per parent run).
+static REGISTRY: OnceLock<SharedHub> = OnceLock::new();
+
+std::thread_local! {
+    static CURRENT_HUB: std::cell::RefCell<Option<SharedHub>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Explicit standalone registry. Native Agent sessions use their own retained
+/// registry; this surface never aggregates or exposes those session hubs.
 pub fn registry() -> &'static Mutex<AgentHubRegistry> {
-    REGISTRY.get_or_init(|| Mutex::new(AgentHubRegistry::default()))
+    REGISTRY
+        .get_or_init(|| Arc::new(Mutex::new(AgentHubRegistry::default())))
+        .as_ref()
+}
+
+/// Capture the invocation's hub before crossing a task, thread or drop boundary.
+/// Calls outside an installed session context use only the standalone hub.
+pub(crate) fn current_registry() -> SharedHub {
+    invocation_registry().unwrap_or_else(|| {
+        Arc::clone(REGISTRY.get_or_init(|| Arc::new(Mutex::new(AgentHubRegistry::default()))))
+    })
+}
+
+/// Distinguish a model/tool invocation from an explicit low-level host call.
+/// The latter keeps the jobs API's durable-owner lifecycle contract.
+pub(crate) fn invocation_registry() -> Option<SharedHub> {
+    CURRENT_HUB.with(|current| current.borrow().clone())
+}
+
+pub(crate) struct RegistryContext {
+    previous: Option<SharedHub>,
+    // A thread-local restoration token must not migrate or cross an await.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub(crate) fn enter_registry(hub: SharedHub) -> RegistryContext {
+    let previous = CURRENT_HUB.with(|current| current.replace(Some(hub)));
+    RegistryContext {
+        previous,
+        _thread: std::marker::PhantomData,
+    }
+}
+
+impl Drop for RegistryContext {
+    fn drop(&mut self) {
+        CURRENT_HUB.with(|current| {
+            current.replace(self.previous.take());
+        });
+    }
+}
+
+/// Install ownership for each poll and for destruction of the inner future.
+/// A suspended or never-polled invocation cannot leak its hub to another task.
+pub fn with_registry<F: std::future::Future>(
+    hub: SharedHub,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    RegistryFuture {
+        hub,
+        future: Some(Box::pin(future)),
+    }
+}
+
+struct RegistryFuture<F> {
+    hub: SharedHub,
+    future: Option<std::pin::Pin<Box<F>>>,
+}
+
+impl<F: std::future::Future> std::future::Future for RegistryFuture<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let _context = enter_registry(Arc::clone(&this.hub));
+        this.future
+            .as_mut()
+            .expect("registry future is present")
+            .as_mut()
+            .poll(cx)
+    }
+}
+
+impl<F> Drop for RegistryFuture<F> {
+    fn drop(&mut self) {
+        let _context = enter_registry(Arc::clone(&self.hub));
+        drop(self.future.take());
+    }
 }
 
 fn now_ms() -> u64 {
@@ -224,6 +318,19 @@ fn now_ms() -> u64 {
 }
 
 impl AgentHubRegistry {
+    pub(crate) fn for_session(session_id: &str) -> Self {
+        Self {
+            owner_session_id: Some(session_id.to_string()),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn admits_native_owner(&self, session_id: &str) -> bool {
+        self.owner_session_id
+            .as_deref()
+            .is_none_or(|owner| owner == session_id)
+    }
+
     /// Point the registry's artifacts dir at `dir` (integration-test hook:
     /// keeps hub files out of the real `<global_dir>/agent-hub/` tree).
     #[doc(hidden)]
@@ -392,6 +499,15 @@ impl AgentHubRegistry {
 
     fn native_job_admission(&self) -> Result<Option<crate::jobs::NativeTaskOwner>> {
         let owner = crate::jobs::current_native_task();
+        if owner
+            .as_ref()
+            .is_some_and(|owner| !self.admits_native_owner(&owner.session))
+        {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_SESSION_CHANGED: native child no longer belongs to this parent hub",
+            ));
+        }
         if owner.is_some() && self.native_jobs.len() >= MAX_NATIVE_JOB_CHILDREN {
             return Err(Error::tool(
                 "hub",

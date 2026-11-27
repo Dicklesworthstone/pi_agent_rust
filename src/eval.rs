@@ -219,6 +219,7 @@ pub struct EvalTool {
     // Registry snapshots share this resolver. The active slots above belong
     // only to the selected session; other retained namespaces are bounded.
     session_scope: crate::jobs::JobSessionScope,
+    hub_session_bound: bool,
     cost_scope: crate::cost::CostScope,
     retained_sessions: Mutex<session::RetainedSessions>,
     // Slot mutexes protect storage, not execution: each runner takes its
@@ -240,6 +241,7 @@ impl EvalTool {
             kernel: Mutex::new(None),
             js: Mutex::new(None),
             session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
             cost_scope: crate::cost::CostScope::default(),
             retained_sessions: Mutex::new(session::RetainedSessions::default()),
             execution: Arc::new(futures::lock::Mutex::new(())),

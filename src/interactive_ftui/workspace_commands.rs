@@ -98,7 +98,21 @@ pub async fn run(
                 }
             }
         }
-        WorkspaceCommand::Hub => render(workspace_reports::hub(args)),
+        WorkspaceCommand::Hub => {
+            let scope = handle
+                .session()
+                .agent
+                .shared_tools()
+                .snapshot()
+                .job_session_scope();
+            match handle
+                .with_session(|session| scope.agent_hub_for_session(&session.header.id))
+                .await
+            {
+                Ok(Ok(hub)) => render(workspace_reports::hub(args, &hub)),
+                Ok(Err(error)) | Err(error) => PiMsg::AgentError(format!("hub: {error}")),
+            }
+        }
         WorkspaceCommand::Security => render(workspace_reports::security(cwd, args)),
         WorkspaceCommand::Plugins => packages.map_or_else(
             || PiMsg::System(String::from("The package manager is not available here.")),

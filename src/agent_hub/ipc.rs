@@ -10,7 +10,10 @@
 pub mod cost;
 pub(crate) mod results;
 
-use super::{AgentHubRegistry, BusMessage, ChildEntry, ChildStatus, registry};
+use super::{
+    AgentHubRegistry, BusMessage, ChildEntry, ChildStatus, SharedHub, current_registry,
+    enter_registry,
+};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use asupersync::io::ext::AsyncWriteExt as _;
@@ -22,6 +25,7 @@ use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -430,6 +434,7 @@ pub(crate) struct ChildChannel {
     token: String,
     sender: String,
     owner: AgentCx,
+    hub: SharedHub,
     deadline: Instant,
     connections: Vec<Connection>,
     messaging: bool,
@@ -473,6 +478,7 @@ impl ChildChannel {
             token,
             sender: sender.to_string(),
             owner: owner.clone(),
+            hub: current_registry(),
             deadline,
             connections: Vec::new(),
             messaging: true,
@@ -506,6 +512,7 @@ impl ChildChannel {
     }
 
     pub(crate) fn deactivate(&mut self) {
+        let _hub_scope = enter_registry(Arc::clone(&self.hub));
         self.connections.clear();
         self.listener = None;
         self.token.clear();
@@ -513,6 +520,9 @@ impl ChildChannel {
     }
 
     pub(crate) fn poll(&mut self) {
+        // Polling and cancellation may run on another thread or under another
+        // live session. The socket credential belongs to its captured hub.
+        let _hub_scope = enter_registry(Arc::clone(&self.hub));
         if self.owner.checkpoint().is_err() || Instant::now() >= self.deadline {
             self.deactivate();
             return;
@@ -813,7 +823,8 @@ fn acquire_wait_hold(
     let channel = socket
         .try_clone()
         .map_err(|_| ipc_error("UNAVAILABLE", "could not retain wait channel"))?;
-    let mut hub = registry().try_lock().map_err(|error| match error {
+    let registry = current_registry();
+    let mut hub = registry.try_lock().map_err(|error| match error {
         std::sync::TryLockError::WouldBlock => ipc_error("BUSY", "parent agent registry is busy"),
         std::sync::TryLockError::Poisoned(_) => {
             ipc_error("UNAVAILABLE", "parent agent registry is unavailable")
@@ -891,7 +902,8 @@ fn dispatch_authenticated(
     owner
         .checkpoint()
         .map_err(|_| ipc_error("CANCELLED", "parent messaging owner is cancelled"))?;
-    let mut hub = registry().try_lock().map_err(|error| match error {
+    let registry = current_registry();
+    let mut hub = registry.try_lock().map_err(|error| match error {
         std::sync::TryLockError::WouldBlock => ipc_error(
             "BUSY",
             "parent agent registry is busy; request was not accepted",
@@ -1109,6 +1121,60 @@ mod tests {
             .find(|(name, _)| *name == std::ffi::OsStr::new(TOKEN_ENV))
             .expect("new credential");
         assert!(token.is_some_and(|value| value == std::ffi::OsStr::new(&channel.token)));
+    }
+
+    #[test]
+    fn native_channel_keeps_its_live_hub_when_polled_under_another_session() {
+        let own_dir = tempfile::tempdir().unwrap();
+        let foreign_dir = tempfile::tempdir().unwrap();
+        let mut own = AgentHubRegistry::default();
+        own.set_dir_for_tests(own_dir.path().to_path_buf());
+        let sender = own.register("shared-child", "owned task").unwrap();
+        own.mark_running(&sender.id, 42);
+        let own = Arc::new(std::sync::Mutex::new(own));
+        let mut foreign = AgentHubRegistry::default();
+        foreign.set_dir_for_tests(foreign_dir.path().to_path_buf());
+        let foreign_sender = foreign.register("shared-child", "foreign task").unwrap();
+        foreign.mark_running(&foreign_sender.id, 42);
+        let foreign = Arc::new(std::sync::Mutex::new(foreign));
+        assert_eq!(sender.id, foreign_sender.id);
+
+        let owner = AgentCx::for_testing_with_io();
+        let mut channel = {
+            let _scope = enter_registry(Arc::clone(&own));
+            ChildChannel::bind(&sender.id, &owner, Duration::from_secs(30)).unwrap()
+        };
+        let token = channel.token.clone();
+        let _foreign_scope = enter_registry(Arc::clone(&foreign));
+        let reply = round_trip(&mut channel, &wire(&token, request(Action::Roster)));
+        let WireResponse::Ok(Reply::Roster { children, .. }) =
+            serde_json::from_slice(&reply).unwrap()
+        else {
+            panic!("bound channel did not return its roster");
+        };
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].task, "owned task");
+        assert!(Arc::ptr_eq(&current_registry(), &foreign));
+
+        let mut message = request(Action::Send);
+        message.name = Some("parent".to_string());
+        message.text = Some("only my parent".to_string());
+        let reply = round_trip(&mut channel, &wire(&token, message));
+        assert!(matches!(
+            serde_json::from_slice::<WireResponse>(&reply).unwrap(),
+            WireResponse::Ok(Reply::Sent { .. })
+        ));
+        assert_eq!(own.lock().unwrap().inbox("parent").len(), 1);
+        assert!(foreign.lock().unwrap().inbox("parent").is_empty());
+
+        own.lock().unwrap().mark_process_reaped(&sender.id);
+        let error = refusal(&round_trip(
+            &mut channel,
+            &wire(&token, request(Action::Roster)),
+        ));
+        assert!(error.contains("PI_HUB_IPC_REVOKED"), "{error}");
+        assert!(foreign.lock().unwrap().control_pid(&sender.id).is_some());
+        assert!(Arc::ptr_eq(&current_registry(), &foreign));
     }
 
     #[test]

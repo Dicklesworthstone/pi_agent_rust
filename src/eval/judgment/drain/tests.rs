@@ -335,25 +335,29 @@ fn fixture() -> Fixture {
     let mut tool = EvalTool::new(root.path());
     tool.bind_job_session_scope(scope.clone());
     let mut jobs = JobsTool::new();
-    jobs.bind_job_session_scope(scope);
+    jobs.bind_job_session_scope(scope.clone());
     let owner = AgentCx::for_request();
     let (tx, rx) = oneshot::channel();
-    let job = crate::jobs::spawn_owned_task(
-        crate::jobs::admit_owned_task(&session).unwrap(),
-        "eval judgment_batch",
-        owner.clone(),
-        Duration::from_secs(20),
-        Some(root.path()),
-        privacy(),
-        async move {
-            rx.await
-                .map_err(|_| Error::tool("jobs", "fixture dropped"))?;
-            Ok(final_result(vec![
-                json!({"key":0,"ok":true,"verdict":verdict("finished")}),
-            ]))
-        },
-    )
-    .unwrap();
+    let job = {
+        let hub = scope.agent_hub_for_session(&session).unwrap();
+        let _hub_scope = crate::agent_hub::enter_registry(hub);
+        crate::jobs::spawn_owned_task(
+            crate::jobs::admit_owned_task(&session).unwrap(),
+            "eval judgment_batch",
+            owner.clone(),
+            Duration::from_secs(20),
+            Some(root.path()),
+            privacy(),
+            async move {
+                rx.await
+                    .map_err(|_| Error::tool("jobs", "fixture dropped"))?;
+                Ok(final_result(vec![
+                    json!({"key":0,"ok":true,"verdict":verdict("finished")}),
+                ]))
+            },
+        )
+        .unwrap()
+    };
     Fixture {
         _root: root,
         tool,

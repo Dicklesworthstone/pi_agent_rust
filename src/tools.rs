@@ -10993,6 +10993,7 @@ struct JobsInput {
 /// registry (bd-cv653.5.4).
 pub struct JobsTool {
     job_session_scope: crate::jobs::JobSessionScope,
+    hub_session_bound: bool,
 }
 
 impl JobsTool {
@@ -11000,6 +11001,7 @@ impl JobsTool {
     pub fn new() -> Self {
         Self {
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
         }
     }
 }
@@ -11073,6 +11075,7 @@ impl Tool for JobsTool {
 
     fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
         self.job_session_scope = scope;
+        self.hub_session_bound = true;
     }
 
     async fn execute(
@@ -11083,41 +11086,47 @@ impl Tool for JobsTool {
     ) -> Result<ToolOutput> {
         let input: JobsInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
-        let owner_session_id = self.job_session_scope.session_id().await?;
-        let action = input.action.trim().to_ascii_lowercase();
-        let payload = match action.as_str() {
-            "list" => {
-                let jobs = crate::jobs::list(&owner_session_id)?;
-                serde_json::json!({ "schema": crate::jobs::JOB_SCHEMA, "jobs": jobs })
-            }
-            "wait" => {
-                let job_id = input
-                    .job_id
-                    .as_deref()
-                    .ok_or_else(|| Error::validation("jobs wait requires jobId".to_string()))?;
-                let budget_ms = input.timeout_ms.unwrap_or(30_000).min(600_000);
-                let snapshot = crate::jobs::wait_async(
-                    &owner_session_id,
-                    job_id,
-                    std::time::Duration::from_millis(budget_ms),
-                )
-                .await?;
-                serde_json::to_value(&snapshot)?
-            }
-            "cancel" => {
-                let job_id = input
-                    .job_id
-                    .as_deref()
-                    .ok_or_else(|| Error::validation("jobs cancel requires jobId".to_string()))?;
-                let snapshot = crate::jobs::cancel_async(&owner_session_id, job_id).await?;
-                serde_json::to_value(&snapshot)?
-            }
-            other => {
-                return Err(Error::validation(format!(
-                    "Unknown jobs action '{other}'; expected list, wait, or cancel"
-                )));
-            }
+        let hub = if self.hub_session_bound {
+            self.job_session_scope.invocation_agent_hub().await?
+        } else {
+            crate::agent_hub::current_registry()
         };
+        let action = input.action.trim().to_ascii_lowercase();
+        let payload = crate::agent_hub::with_registry(hub, async {
+            let owner_session_id = self.job_session_scope.invocation_session_id().await?;
+            match action.as_str() {
+                "list" => {
+                    let jobs = crate::jobs::list(&owner_session_id)?;
+                    Ok(serde_json::json!({ "schema": crate::jobs::JOB_SCHEMA, "jobs": jobs }))
+                }
+                "wait" => {
+                    let job_id = input
+                        .job_id
+                        .as_deref()
+                        .ok_or_else(|| Error::validation("jobs wait requires jobId".to_string()))?;
+                    let budget_ms = input.timeout_ms.unwrap_or(30_000).min(600_000);
+                    let snapshot = crate::jobs::wait_async(
+                        &owner_session_id,
+                        job_id,
+                        std::time::Duration::from_millis(budget_ms),
+                    )
+                    .await?;
+                    Ok(serde_json::to_value(&snapshot)?)
+                }
+                "cancel" => {
+                    let job_id = input
+                        .job_id
+                        .as_deref()
+                        .ok_or_else(|| Error::validation("jobs cancel requires jobId".to_string()))?;
+                    let snapshot = crate::jobs::cancel_async(&owner_session_id, job_id).await?;
+                    Ok(serde_json::to_value(&snapshot)?)
+                }
+                other => Err(Error::validation(format!(
+                    "Unknown jobs action '{other}'; expected list, wait, or cancel"
+                ))),
+            }
+        })
+        .await?;
         let text = match action.as_str() {
             "list" => {
                 let count = payload["jobs"].as_array().map_or(0, Vec::len);
@@ -11570,6 +11579,7 @@ struct HubReadyInput {
 pub struct HubTool {
     cwd: PathBuf,
     job_session_scope: crate::jobs::JobSessionScope,
+    hub_session_bound: bool,
 }
 
 impl HubTool {
@@ -11577,6 +11587,7 @@ impl HubTool {
         Self {
             cwd: cwd.to_path_buf(),
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
         }
     }
 }
@@ -11668,6 +11679,7 @@ impl Tool for HubTool {
 
     fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
         self.job_session_scope = scope;
+        self.hub_session_bound = true;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -11680,36 +11692,44 @@ impl Tool for HubTool {
         let input: HubInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let op = input.op.trim().to_ascii_lowercase();
-        let dispatched = if op == "agent"
-            && input
-                .action
-                .as_deref()
-                .is_some_and(|action| action.trim().eq_ignore_ascii_case("wait"))
-        {
-            Self::dispatch_agent_wait(&input).await
-        } else if op == "agent" && crate::agent_hub::ipc::inherited_channel_present() {
-            Self::dispatch_inherited_agent(&input).await
-        } else if op == "agent"
-            && input
-                .action
-                .as_deref()
-                .is_some_and(|action| action.eq_ignore_ascii_case("revive"))
-        {
-            match input.name.as_deref().filter(|id| !id.trim().is_empty()) {
-                Some(id) => crate::subagents::revive_child(id, on_update).await,
-                None => Err(Error::validation(
-                    "hub agent revive requires name (child run id)",
-                )),
-            }
+        let hub = if self.hub_session_bound {
+            self.job_session_scope.invocation_agent_hub().await?
         } else {
-            self.dispatch(&op, &input)
-                .await
-                .map(|(text, details)| ToolOutput {
-                    content: vec![ContentBlock::Text(TextContent::new(text))],
-                    details: Some(details),
-                    is_error: false,
-                })
+            crate::agent_hub::current_registry()
         };
+        let dispatched = crate::agent_hub::with_registry(hub, async {
+            if op == "agent"
+                && input
+                    .action
+                    .as_deref()
+                    .is_some_and(|action| action.trim().eq_ignore_ascii_case("wait"))
+            {
+                Self::dispatch_agent_wait(&input).await
+            } else if op == "agent" && crate::agent_hub::ipc::inherited_channel_present() {
+                Self::dispatch_inherited_agent(&input).await
+            } else if op == "agent"
+                && input
+                    .action
+                    .as_deref()
+                    .is_some_and(|action| action.eq_ignore_ascii_case("revive"))
+            {
+                match input.name.as_deref().filter(|id| !id.trim().is_empty()) {
+                    Some(id) => crate::subagents::revive_child(id, on_update).await,
+                    None => Err(Error::validation(
+                        "hub agent revive requires name (child run id)",
+                    )),
+                }
+            } else {
+                self.dispatch(&op, &input)
+                    .await
+                    .map(|(text, details)| ToolOutput {
+                        content: vec![ContentBlock::Text(TextContent::new(text))],
+                        details: Some(details),
+                        is_error: false,
+                    })
+            }
+        })
+        .await;
         Ok(match dispatched {
             Ok(output) => output,
             Err(err) => {
@@ -12153,7 +12173,7 @@ impl HubTool {
                 .await?
             }
             "jobs" => {
-                let owner_session_id = self.job_session_scope.session_id().await?;
+                let owner_session_id = self.job_session_scope.invocation_session_id().await?;
                 let action = input
                     .action
                     .clone()
@@ -12249,6 +12269,7 @@ impl HubTool {
     /// kill / revive / send / inbox over this session's subagent children.
     #[allow(clippy::too_many_lines)] // Cohesive action dispatcher: one arm per hub op.
     fn dispatch_agent(action: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
+        let hub = crate::agent_hub::current_registry();
         let id_required = |action: &str| -> Result<String> {
             input
                 .name
@@ -12261,7 +12282,7 @@ impl HubTool {
         let from = input.from.clone().unwrap_or_else(|| "parent".to_string());
         let (text, details) = match action {
             "roster" => {
-                let entries = crate::agent_hub::registry()
+                let entries = hub
                     .lock()
                     .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
                     .roster();
@@ -12293,7 +12314,7 @@ impl HubTool {
             }
             "transcript" => {
                 let id = id_required("transcript")?;
-                let page = crate::agent_hub::registry()
+                let page = hub
                     .lock()
                     .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
                     .transcript_page(&id)?;
@@ -12319,7 +12340,7 @@ impl HubTool {
                         Error::validation(format!("hub agent {action} requires text"))
                     })?;
                 let message = {
-                    let mut registry = crate::agent_hub::registry()
+                    let mut registry = hub
                         .lock()
                         .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
                     if action == "send" {
@@ -12341,7 +12362,7 @@ impl HubTool {
             "kill" => {
                 let id = id_required("kill")?;
                 {
-                    let mut reg = crate::agent_hub::registry()
+                    let mut reg = hub
                         .lock()
                         .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
                     let entry = reg
@@ -12371,7 +12392,7 @@ impl HubTool {
             }
             "inbox" => {
                 let id = id_required("inbox")?;
-                let page = crate::agent_hub::registry()
+                let page = hub
                     .lock()
                     .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
                     .inbox_page(&id, input.cursor)?;
@@ -14750,7 +14771,9 @@ impl GrepTool {
         }
         let path_owned = path.to_string();
         let cwd = self.cwd.clone();
+        let hub = crate::agent_hub::current_registry();
         let resolved = asupersync::runtime::spawn_blocking(move || {
+            let _hub_scope = crate::agent_hub::enter_registry(hub);
             let _guard = owner.cx().clone().set_current_restricted();
             owner
                 .checkpoint()

@@ -432,7 +432,7 @@ impl Plan {
     }
 
     pub(super) fn deadline(&self, tool: &SubagentTool) -> Result<Deadline> {
-        Deadline::for_request(tool.timeout, self.timeout_seconds)
+        tool.request_deadline(self.timeout_seconds)
     }
 
     /// Preflight the entire graph before any job handle or child is published.

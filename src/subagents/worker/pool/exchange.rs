@@ -43,10 +43,14 @@ pub(super) async fn execute(
     // Admission, owner resolution and every subsequent wait share this one
     // clock. Neither a slow admission nor a page poll renews the read window.
     let started = Instant::now();
-    let budget = Deadline::for_request(Some(Duration::from_millis(timeout_ms + 30_000)), None)?;
+    let budget = tool.cap_deadline(Deadline::for_request(
+        Some(Duration::from_millis(timeout_ms + 30_000)),
+        None,
+    )?);
     let owner = AgentCx::for_current_or_request();
     check_owner(&owner)?;
-    let owner_id = background::resolve_session(&tool.job_session_scope, &owner, budget).await?;
+    let owner_id =
+        background::resolve_invocation_session(&tool.job_session_scope, &owner, budget).await?;
     let pool = lookup(&owner_id, id)?;
 
     // Parse-time cursor validation alone is insufficient: a future item ID

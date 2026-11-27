@@ -17,6 +17,9 @@
 //! permanently closes admission before the final process-shutdown cleanup.
 //! Native tasks share the same admission, cancellation and retention fences;
 //! their complete privacy-protected tool results are available in `result`.
+//! Model-facing native controls and notices also require the live parent hub,
+//! separating independently loaded handles of the same saved session. Explicit
+//! unscoped host observation and durable-owner teardown retain owner-wide access.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -63,6 +66,10 @@ pub struct JobSessionScope {
     /// Replacement candidates may load the same persisted session before its
     /// old registry retires. Clones retain this separate live identity.
     instance_id: String,
+    /// Child control, transcripts and parent inboxes belong to this live tool
+    /// registry and the durable session selected within it. Clones share the
+    /// same hubs; another loaded instance of the same session does not.
+    agent_hubs: Arc<Mutex<HashMap<String, crate::agent_hub::SharedHub>>>,
 }
 
 impl JobSessionScope {
@@ -78,11 +85,93 @@ impl JobSessionScope {
         Self {
             resolver: Arc::new(Mutex::new(resolver)),
             instance_id: uuid::Uuid::new_v4().to_string(),
+            agent_hubs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Retain child authority for a durable session already captured by the
+    /// host at admission. Cloned scopes share authority; another live scope
+    /// loading the same saved session receives an independent child hub.
+    pub fn agent_hub_for_session(&self, session_id: &str) -> Result<crate::agent_hub::SharedHub> {
+        if session_id.trim().is_empty() {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_SESSION_UNAVAILABLE: current session identity is unavailable",
+            ));
+        }
+        let mut hubs = self.agent_hubs.lock().map_err(|_| {
+            Error::tool(
+                "hub",
+                "PI_HUB_SESSION_UNAVAILABLE: session hub registry is poisoned",
+            )
+        })?;
+        Ok(Arc::clone(
+            hubs.entry(session_id.to_string()).or_insert_with(|| {
+                Arc::new(Mutex::new(crate::agent_hub::AgentHubRegistry::for_session(
+                    session_id,
+                )))
+            }),
+        ))
+    }
+
+    /// Resolve and retain child authority for this host's selected session.
+    pub async fn agent_hub(&self) -> Result<crate::agent_hub::SharedHub> {
+        let session_id = self.session_id().await?;
+        self.agent_hub_for_session(&session_id)
+    }
+
+    /// Preserve the durable owner selected when an invocation entered its
+    /// retained hub. Admission rechecks still use `session_id` to observe a
+    /// live session switch; initial native-task ownership uses this capture.
+    pub(crate) async fn invocation_session_id(&self) -> Result<String> {
+        let current = crate::agent_hub::current_registry();
+        let captured = self
+            .agent_hubs
+            .lock()
+            .map_err(|_| {
+                Error::tool(
+                    "hub",
+                    "PI_HUB_SESSION_UNAVAILABLE: session hub registry is poisoned",
+                )
+            })?
+            .iter()
+            .find(|(_, hub)| Arc::ptr_eq(hub, &current))
+            .map(|(session_id, _)| session_id.clone());
+        match captured {
+            Some(session_id) => Ok(session_id),
+            None => self.session_id().await,
+        }
+    }
+
+    /// An Agent has already captured its selected durable session. Reuse that
+    /// authority without resolving a replacement session while its tool runs.
+    /// Direct SDK calls with a bound scope resolve their own session instead.
+    pub(crate) async fn invocation_agent_hub(&self) -> Result<crate::agent_hub::SharedHub> {
+        if let Some(hub) = self.captured_agent_hub()? {
+            Ok(hub)
+        } else {
+            self.agent_hub().await
+        }
+    }
+
+    pub(crate) fn captured_agent_hub(&self) -> Result<Option<crate::agent_hub::SharedHub>> {
+        let current = crate::agent_hub::current_registry();
+        let owns_current = self
+            .agent_hubs
+            .lock()
+            .map_err(|_| {
+                Error::tool(
+                    "hub",
+                    "PI_HUB_SESSION_UNAVAILABLE: session hub registry is poisoned",
+                )
+            })?
+            .values()
+            .any(|hub| Arc::ptr_eq(hub, &current));
+        Ok(owns_current.then_some(current))
+    }
+
     /// Bind services to this live registry and its selected durable session.
-    /// Background-job ownership retains its existing session-ID semantics.
+    /// Shell jobs and explicit host teardown retain durable-session semantics.
     #[must_use]
     pub fn service_owner(&self, session_id: impl Into<String>) -> crate::hub::ServiceOwner {
         crate::hub::ServiceOwner::new(session_id.into(), self.instance_id.clone())
@@ -252,6 +341,7 @@ struct JobEntry {
     result: Option<crate::tools::ToolOutput>,
     result_bytes: usize,
     owner_session_id: String,
+    hub_registry: Option<crate::agent_hub::SharedHub>,
     delivery: JobDelivery,
     id: String,
     command: String,
@@ -457,6 +547,7 @@ impl JobSnapshotSource {
 #[derive(Clone)]
 struct JobWaitHandle {
     owner_session_id: String,
+    hub_registry: Option<crate::agent_hub::SharedHub>,
     id: String,
     settled_snapshot: Arc<Mutex<Option<JobSnapshot>>>,
     settled_notify: Arc<Notify>,
@@ -681,8 +772,11 @@ struct OwnerShutdownState {
     active_attempts: usize,
 }
 
+pub(crate) type OwnedJobNotice<T> = (String, Option<crate::agent_hub::SharedHub>, T);
+
 struct CompletionNotice {
     owner_session_id: String,
+    hub_registry: Option<crate::agent_hub::SharedHub>,
     text: String,
 }
 
@@ -1762,7 +1856,17 @@ impl ForegroundJob {
         if let Some(snapshot) = settled_snapshot(&self.handle) {
             return Ok(snapshot);
         }
-        if let Err(error) = request_cancel(&self.handle.owner_session_id, &self.handle.id) {
+        let cancelled = {
+            // An admitted foreground owner retains cleanup authority even if
+            // its caller switched sessions or dropped the invocation context.
+            let _hub = self
+                .handle
+                .hub_registry
+                .as_ref()
+                .map(|hub| crate::agent_hub::enter_registry(Arc::clone(hub)));
+            request_cancel(&self.handle.owner_session_id, &self.handle.id)
+        };
+        if let Err(error) = cancelled {
             if let Some(snapshot) = settled_snapshot(&self.handle) {
                 return Ok(snapshot);
             }
@@ -1888,10 +1992,11 @@ impl ForegroundJob {
             *job.settled_snapshot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone());
-            enqueue_completion_notice(
+            enqueue_owned_completion_notice(
                 &mut reg,
                 &self.handle.owner_session_id,
                 &job_completion_notice(&snapshot),
+                self.handle.hub_registry.clone(),
             );
         }
         self.armed = false;
@@ -2369,6 +2474,7 @@ fn spawn_managed(
             result: None,
             result_bytes: 0,
             owner_session_id: owner_session_id.to_string(),
+            hub_registry: None,
             delivery,
             id: id.clone(),
             command: retained_command,
@@ -2392,6 +2498,7 @@ fn spawn_managed(
         let snapshot_source = JobSnapshotSource::from_entry(&entry);
         let handle = JobWaitHandle {
             owner_session_id: owner_session_id.to_string(),
+            hub_registry: entry.hub_registry.clone(),
             id: id.clone(),
             settled_snapshot: Arc::clone(&entry.settled_snapshot),
             settled_notify: Arc::clone(&entry.settled_notify),
@@ -3394,12 +3501,13 @@ fn settle_job(
         );
         let notify = Arc::clone(&job.settled_notify);
         let owner_session_id = job.owner_session_id.clone();
+        let hub_registry = job.hub_registry.clone();
         let delivery = job.delivery;
         job.cancel_deadline.finish();
         if delivery == JobDelivery::Background
             && let Some(notice) = notice
         {
-            enqueue_completion_notice(&mut reg, &owner_session_id, &notice);
+            enqueue_owned_completion_notice(&mut reg, &owner_session_id, &notice, hub_registry);
         }
         if delivery == JobDelivery::Abandoned {
             reg.jobs.remove(id);
@@ -3542,11 +3650,22 @@ fn prune_settled_jobs(reg: &mut JobRegistry) {
     }
 }
 
-/// List snapshots owned by one session, newest last.
+fn native_job_visible(job: &JobEntry, hub: Option<&crate::agent_hub::SharedHub>) -> bool {
+    hub.is_none_or(|hub| {
+        job.hub_registry
+            .as_ref()
+            .is_none_or(|owner| Arc::ptr_eq(owner, hub))
+    })
+}
+
+/// List snapshots owned by one session, newest last. Inside a tool invocation,
+/// native tasks also require the live parent hub captured at launch. Unscoped
+/// host calls and shell jobs retain the explicit durable-owner contract.
 ///
 /// # Errors
 /// Tool error when the registry is poisoned.
 pub fn list(owner_session_id: &str) -> Result<Vec<JobSnapshot>> {
+    let hub = crate::agent_hub::invocation_registry();
     let reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
@@ -3554,7 +3673,9 @@ pub fn list(owner_session_id: &str) -> Result<Vec<JobSnapshot>> {
         .jobs
         .values()
         .filter(|job| {
-            job.owner_session_id == owner_session_id && job.delivery == JobDelivery::Background
+            job.owner_session_id == owner_session_id
+                && job.delivery == JobDelivery::Background
+                && native_job_visible(job, hub.as_ref())
         })
         .map(|job| {
             let settled = job
@@ -3624,16 +3745,20 @@ fn unknown_job_error(id: &str) -> Error {
 // Guard scope is deliberate; tightening drops would change lock-hold semantics.
 #[allow(clippy::significant_drop_tightening)]
 fn wait_handle(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
+    let hub = crate::agent_hub::invocation_registry();
     let reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
     let job = reg
         .jobs
         .get(id)
-        .filter(|job| job.owner_session_id == owner_session_id)
+        .filter(|job| {
+            job.owner_session_id == owner_session_id && native_job_visible(job, hub.as_ref())
+        })
         .ok_or_else(|| unknown_job_error(id))?;
     Ok(JobWaitHandle {
         owner_session_id: owner_session_id.to_string(),
+        hub_registry: job.hub_registry.clone(),
         id: id.to_string(),
         settled_snapshot: Arc::clone(&job.settled_snapshot),
         settled_notify: Arc::clone(&job.settled_notify),
@@ -3706,8 +3831,13 @@ fn hold_native_job_wait(
     if !native {
         return Ok(None);
     }
-    crate::agent_hub::registry()
-        .lock()
+    let hub = handle.hub_registry.as_ref().ok_or_else(|| {
+        Error::tool(
+            "hub",
+            "PI_HUB_WAIT_REGISTRY: native job lost its owning session hub",
+        )
+    })?;
+    hub.lock()
         .map_err(|_| Error::tool("hub", "PI_HUB_WAIT_REGISTRY: registry is poisoned"))?
         .hold_job_results(
             NativeTaskOwner {
@@ -3887,13 +4017,16 @@ async fn wait_for_settlement_wall(
 // Guard scope is deliberate; tightening drops would change lock-hold semantics.
 #[allow(clippy::significant_drop_tightening)]
 fn request_cancel(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
+    let hub = crate::agent_hub::invocation_registry();
     let mut reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
     let Some(job) = reg
         .jobs
         .get_mut(id)
-        .filter(|job| job.owner_session_id == owner_session_id)
+        .filter(|job| {
+            job.owner_session_id == owner_session_id && native_job_visible(job, hub.as_ref())
+        })
     else {
         return Err(unknown_job_error(id));
     };
@@ -3909,6 +4042,7 @@ fn request_cancel(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
     job.cancel_requested = true;
     Ok(JobWaitHandle {
         owner_session_id: owner_session_id.to_string(),
+        hub_registry: job.hub_registry.clone(),
         id: id.to_string(),
         settled_snapshot: Arc::clone(&job.settled_snapshot),
         settled_notify: Arc::clone(&job.settled_notify),
@@ -3960,14 +4094,34 @@ pub async fn cancel_async(owner_session_id: &str, id: &str) -> Result<JobSnapsho
 /// The Agent's owner-aware job handoff calls this on every poll.
 #[must_use]
 pub fn take_completion_notices(owner_session_id: &str) -> Vec<Message> {
+    let hub = crate::agent_hub::invocation_registry();
+    take_owned_completion_notices(owner_session_id, hub.as_ref())
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect()
+}
+
+/// Keep native authority attached while an Agent stages a notice. Returning a
+/// staged notice must preserve that authority even after its job is evicted.
+pub(crate) fn take_owned_completion_notices(
+    owner_session_id: &str,
+    hub: Option<&crate::agent_hub::SharedHub>,
+) -> Vec<(Option<crate::agent_hub::SharedHub>, Message)> {
     let mut reg = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut matched = Vec::new();
     let mut retained = VecDeque::with_capacity(reg.notices.len());
     while let Some(notice) = reg.notices.pop_front() {
-        if notice.owner_session_id == owner_session_id {
-            matched.push(completion_notice_message(notice.text));
+        if notice.owner_session_id == owner_session_id
+            && hub.is_none_or(|hub| {
+                notice
+                    .hub_registry
+                    .as_ref()
+                    .is_none_or(|owner| Arc::ptr_eq(owner, hub))
+            })
+        {
+            matched.push((notice.hub_registry, completion_notice_message(notice.text)));
         } else {
             retained.push_back(notice);
         }
@@ -3982,10 +4136,10 @@ pub fn take_completion_notices(owner_session_id: &str) -> Vec<Message> {
 /// retention then discards the oldest entries if either bound is exceeded.
 // Guard scope is deliberate; tightening drops would change lock-hold semantics.
 #[allow(clippy::significant_drop_tightening)]
-pub(crate) fn restore_completion_notices(notices: Vec<(String, Message)>) {
+pub(crate) fn restore_completion_notices(notices: Vec<OwnedJobNotice<Message>>) {
     let restored = notices
         .into_iter()
-        .filter_map(|(owner_session_id, message)| {
+        .filter_map(|(owner_session_id, hub_registry, message)| {
             if owner_session_id.trim().is_empty() {
                 return None;
             }
@@ -3998,6 +4152,7 @@ pub(crate) fn restore_completion_notices(notices: Vec<(String, Message)>) {
             };
             Some(CompletionNotice {
                 owner_session_id,
+                hub_registry,
                 text: truncate_utf8_bytes(&text, MAX_COMPLETION_NOTICE_BYTES),
             })
         })
@@ -4063,9 +4218,8 @@ fn completion_notice_message(text: String) -> Message {
 
 /// Enqueue a host-produced background completion for the existing follow-up delivery path.
 ///
-/// `/tan` shares this seam with background bash jobs so queue
-/// modes, persistence, RPC behavior, and turn-boundary semantics stay
-/// identical.
+/// Native host commands such as `/tan` use [`push_completion_notice_in_hub`]
+/// to retain their live parent authority through the same delivery path.
 ///
 /// # Errors
 /// Returns `PI_JOBS_SESSION_UNAVAILABLE` when the owner identity is empty or
@@ -4086,7 +4240,52 @@ pub fn push_completion_notice(owner_session_id: &str, text: impl Into<String>) -
     Ok(())
 }
 
+/// Publish a native host command's completion to its captured live parent.
+/// This is the explicit owner boundary for commands such as `/tan`.
+///
+/// # Errors
+/// Returns `PI_JOBS_SESSION_UNAVAILABLE` when the durable owner is empty,
+/// `PI_HUB_SESSION_UNAVAILABLE` for a poisoned hub, or `PI_HUB_SESSION_CHANGED`
+/// when a scoped hub belongs to a different durable session.
+pub fn push_completion_notice_in_hub(
+    owner_session_id: &str,
+    text: impl Into<String>,
+    hub: &crate::agent_hub::SharedHub,
+) -> Result<()> {
+    if owner_session_id.trim().is_empty() {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_UNAVAILABLE: completion notice owner is empty",
+        ));
+    }
+    let admitted = hub
+        .lock()
+        .map_err(|_| Error::tool("jobs", "PI_HUB_SESSION_UNAVAILABLE: parent hub is poisoned"))?
+        .admits_native_owner(owner_session_id);
+    if !admitted {
+        return Err(Error::tool(
+            "jobs",
+            "PI_HUB_SESSION_CHANGED: completion owner differs from the captured parent session",
+        ));
+    }
+    let text = text.into();
+    let mut reg = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enqueue_owned_completion_notice(&mut reg, owner_session_id, &text, Some(Arc::clone(hub)));
+    Ok(())
+}
+
 fn enqueue_completion_notice(reg: &mut JobRegistry, owner_session_id: &str, text: &str) {
+    enqueue_owned_completion_notice(reg, owner_session_id, text, None);
+}
+
+fn enqueue_owned_completion_notice(
+    reg: &mut JobRegistry,
+    owner_session_id: &str,
+    text: &str,
+    hub_registry: Option<crate::agent_hub::SharedHub>,
+) {
     let owner_notice_count = reg
         .notices
         .iter()
@@ -4102,6 +4301,7 @@ fn enqueue_completion_notice(reg: &mut JobRegistry, owner_session_id: &str, text
     }
     reg.notices.push_back(CompletionNotice {
         owner_session_id: owner_session_id.to_string(),
+        hub_registry,
         text: truncate_utf8_bytes(text, MAX_COMPLETION_NOTICE_BYTES),
     });
     while reg.notices.len() > MAX_TOTAL_COMPLETION_NOTICES {
@@ -4385,6 +4585,7 @@ fn session_shutdown_handles(owner_session_id: &str) -> Result<Vec<JobWaitHandle>
         }
         handles.push(JobWaitHandle {
             owner_session_id: owner_session_id.to_string(),
+            hub_registry: job.hub_registry.clone(),
             id: job.id.clone(),
             settled_snapshot: Arc::clone(&job.settled_snapshot),
             settled_notify: Arc::clone(&job.settled_notify),
@@ -4396,9 +4597,10 @@ fn session_shutdown_handles(owner_session_id: &str) -> Result<Vec<JobWaitHandle>
 
 /// Kill every running background job owned by one agent session.
 ///
-/// Session-handle replacement uses this owner-scoped seam so an old session
-/// cannot leave inaccessible children behind and cannot terminate jobs owned
-/// by another live handle in the same process.
+/// This explicit host teardown applies to the durable session owner, including
+/// jobs launched by independently loaded handles of that same saved session.
+/// Model-facing job controls instead require the current live parent hub.
+/// Jobs belonging to other durable session owners remain untouched.
 ///
 /// # Errors
 /// Named `PI_JOBS_SESSION_UNAVAILABLE` for a blank owner, registry/lifecycle
@@ -4806,6 +5008,7 @@ mod tests {
             result: None,
             result_bytes: 0,
             owner_session_id: TEST_SESSION_ID.to_string(),
+            hub_registry: None,
             delivery: JobDelivery::Background,
             id: id.to_string(),
             command: "true".to_string(),
@@ -7643,6 +7846,7 @@ mod tests {
         let artifact = Arc::clone(&entry.artifact);
         let handle = JobWaitHandle {
             owner_session_id: TEST_SESSION_ID.to_string(),
+            hub_registry: entry.hub_registry.clone(),
             id: id.clone(),
             settled_snapshot: Arc::clone(&entry.settled_snapshot),
             settled_notify: Arc::clone(&entry.settled_notify),
@@ -7772,6 +7976,7 @@ mod tests {
                     result: None,
                     result_bytes: 0,
                     owner_session_id: TEST_SESSION_ID.to_string(),
+                    hub_registry: None,
                     delivery: JobDelivery::Background,
                     id,
                     command: "true".to_string(),
@@ -7989,6 +8194,7 @@ mod tests {
             .into_iter()
             .map(|text| CompletionNotice {
                 owner_session_id: "owner-a".to_string(),
+                hub_registry: None,
                 text: text.to_string(),
             })
             .collect();
@@ -8014,6 +8220,7 @@ mod tests {
         let restored = (0..MAX_COMPLETION_NOTICES_PER_SESSION)
             .map(|index| CompletionNotice {
                 owner_session_id: "owner-a".to_string(),
+                hub_registry: None,
                 text: format!("notice-{index}"),
             })
             .collect();
@@ -8069,6 +8276,114 @@ mod tests {
         let retained = reg.notices.pop_front().expect("bounded notice");
         assert!(retained.text.len() <= MAX_COMPLETION_NOTICE_BYTES);
         assert!(retained.text.ends_with("\n...[truncated]"));
+    }
+
+    #[test]
+    fn same_durable_session_cannot_observe_or_cancel_another_live_parents_native_job() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("native-owner-{}", uuid::Uuid::new_v4().simple());
+        let id = format!("job-native-private-{}", uuid::Uuid::new_v4().simple());
+        let first_scope = JobSessionScope::fixed(owner.clone());
+        let second_scope = JobSessionScope::fixed(owner.clone());
+        let first = first_scope.agent_hub_for_session(&owner).unwrap();
+        let second = second_scope.agent_hub_for_session(&owner).unwrap();
+        let artifact_path = root.join("native-private.log");
+        let mut entry = synthetic_entry(&id, artifact_path.clone(), 0, true);
+        entry.owner_session_id.clone_from(&owner);
+        entry.schema = host_task::TASK_SCHEMA;
+        entry.hub_registry = Some(Arc::clone(&first));
+        entry.pid = None;
+        entry.command = "private native assignment".to_string();
+        registry().lock().unwrap().jobs.insert(id.clone(), entry);
+
+        assert_eq!(
+            list(&owner).unwrap().len(),
+            1,
+            "an explicit unscoped host observer retains its durable-owner contract",
+        );
+        {
+            let _foreign = crate::agent_hub::enter_registry(Arc::clone(&second));
+            assert!(list(&owner).unwrap().is_empty());
+            for error in [
+                wait(&owner, &id, Duration::ZERO).expect_err("foreign wait"),
+                request_cancel(&owner, &id).err().expect("foreign cancel"),
+            ] {
+                let rendered = error.to_string();
+                assert!(rendered.contains("PI_JOBS_UNKNOWN_ID"));
+                assert!(!rendered.contains("private native assignment"));
+                assert!(!rendered.contains(&artifact_path.display().to_string()));
+            }
+        }
+        assert!(!registry().lock().unwrap().jobs[&id].cancel_requested);
+        let handle = {
+            let _owner = crate::agent_hub::enter_registry(Arc::clone(&first));
+            assert_eq!(list(&owner).unwrap().len(), 1);
+            wait_handle(&owner, &id).unwrap()
+        };
+        assert!(Arc::ptr_eq(handle.hub_registry.as_ref().unwrap(), &first));
+        {
+            let _foreign = crate::agent_hub::enter_registry(second);
+            assert_eq!(snapshot_now_best_effort(&handle).unwrap().id, id);
+        }
+        {
+            let _owner = crate::agent_hub::enter_registry(first);
+            request_cancel(&owner, &id).unwrap();
+        }
+        assert!(registry().lock().unwrap().jobs[&id].cancel_requested);
+        registry().lock().unwrap().jobs.remove(&id);
+    }
+
+    #[test]
+    fn native_completion_restoration_preserves_its_parent_without_a_retained_job_descriptor() {
+        let _guard = process_test_guard();
+        let owner = format!("native-notice-{}", uuid::Uuid::new_v4().simple());
+        let first_scope = JobSessionScope::fixed(owner.clone());
+        let second_scope = JobSessionScope::fixed(owner.clone());
+        let first = first_scope.agent_hub_for_session(&owner).unwrap();
+        let second = second_scope.agent_hub_for_session(&owner).unwrap();
+        let error = push_completion_notice_in_hub("replacement-owner", "misrouted result", &first)
+            .expect_err("the captured hub belongs to the original durable owner");
+        assert!(error.to_string().contains("PI_HUB_SESSION_CHANGED"));
+        assert!(take_completion_notices("replacement-owner").is_empty());
+        push_completion_notice_in_hub(&owner, "first private result", &first).unwrap();
+        assert!(take_owned_completion_notices(&owner, Some(&second)).is_empty());
+        let notices = take_owned_completion_notices(&owner, Some(&first));
+        assert_eq!(notices.len(), 1);
+        {
+            let _foreign = crate::agent_hub::enter_registry(Arc::clone(&second));
+            restore_completion_notices(
+                notices
+                    .into_iter()
+                    .map(|(hub, message)| (owner.clone(), hub, message))
+                    .collect(),
+            );
+            assert!(take_completion_notices(&owner).is_empty());
+        }
+        let restored = take_owned_completion_notices(&owner, Some(&first));
+        assert_eq!(restored.len(), 1);
+        assert!(Arc::ptr_eq(restored[0].0.as_ref().unwrap(), &first));
+        assert!(matches!(
+            &restored[0].1,
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "first private result"
+        ));
+    }
+
+    #[test]
+    fn native_admission_rejects_a_resolver_switch_before_registering_work() {
+        let _guard = process_test_guard();
+        let original = format!("native-admission-{}", uuid::Uuid::new_v4().simple());
+        let scope = JobSessionScope::fixed(original.clone());
+        let hub = scope.agent_hub_for_session(&original).unwrap();
+        let _owner = crate::agent_hub::enter_registry(hub);
+        let error = admit_owned_task("replacement-session")
+            .err()
+            .expect("owner mismatch");
+        assert!(error.to_string().contains("PI_HUB_SESSION_CHANGED"));
+        drop(admit_owned_task(&original).expect("original owner remains valid"));
     }
 
     #[test]

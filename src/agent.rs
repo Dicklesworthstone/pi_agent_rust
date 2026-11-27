@@ -1216,6 +1216,9 @@ struct SequencedQueuedMessage {
     /// remain unscoped so only generated job notices are filtered when the
     /// owning surface switches sessions between staging and delivery.
     job_owner_session_id: Option<String>,
+    /// Native completions also retain the originating live parent. A queue
+    /// drop or session switch must not strip that authority during restoration.
+    job_hub_registry: Option<crate::agent_hub::SharedHub>,
     delivery: QueuedAgentMessage,
 }
 
@@ -1259,6 +1262,7 @@ impl MessageQueue {
             seq,
             enqueued_at: Utc::now().timestamp_millis(),
             job_owner_session_id,
+            job_hub_registry: None,
             delivery,
         }
     }
@@ -1336,9 +1340,11 @@ impl MessageQueue {
     fn push_job_follow_up_lossless(
         &mut self,
         owner_session_id: String,
+        hub_registry: Option<crate::agent_hub::SharedHub>,
         delivery: QueuedAgentMessage,
     ) -> u64 {
-        let entry = self.next_entry(delivery, Some(owner_session_id));
+        let mut entry = self.next_entry(delivery, Some(owner_session_id));
+        entry.job_hub_registry = hub_registry;
         let seq = entry.seq;
         self.follow_up.push_back(entry);
         seq
@@ -1356,7 +1362,7 @@ impl MessageQueue {
     fn take_job_follow_ups_except(
         &mut self,
         owner_session_id: Option<&str>,
-    ) -> Vec<(String, QueuedAgentMessage)> {
+    ) -> Vec<crate::jobs::OwnedJobNotice<QueuedAgentMessage>> {
         let mut retained = VecDeque::with_capacity(self.follow_up.len());
         let mut released = Vec::new();
         while let Some(entry) = self.follow_up.pop_front() {
@@ -1366,7 +1372,7 @@ impl MessageQueue {
                 .is_some_and(|owner| Some(owner) != owner_session_id);
             if should_release {
                 if let Some(owner) = entry.job_owner_session_id {
-                    released.push((owner, entry.delivery));
+                    released.push((owner, entry.job_hub_registry, entry.delivery));
                 }
             } else {
                 retained.push_back(entry);
@@ -1451,7 +1457,7 @@ impl Drop for MessageQueue {
             crate::jobs::restore_completion_notices(
                 self.take_job_follow_ups_except(None)
                     .into_iter()
-                    .map(|(owner, delivery)| (owner, delivery.into_message()))
+                    .map(|(owner, hub, delivery)| (owner, hub, delivery.into_message()))
                     .collect(),
             );
         }
@@ -5341,9 +5347,15 @@ impl Agent {
         if self.message_queue.has_job_follow_up() {
             return;
         }
-        for notice in crate::jobs::take_completion_notices(&owner_session_id) {
+        let Ok(hub) = self.job_session_scope.agent_hub_for_session(&owner_session_id) else {
+            return;
+        };
+        for (hub_registry, notice) in
+            crate::jobs::take_owned_completion_notices(&owner_session_id, Some(&hub))
+        {
             self.message_queue.push_job_follow_up_lossless(
                 owner_session_id.clone(),
+                hub_registry,
                 QueuedAgentMessage::generated(notice),
             );
         }
@@ -5369,7 +5381,7 @@ impl Agent {
         crate::jobs::restore_completion_notices(
             stale
                 .into_iter()
-                .map(|(owner, delivery)| (owner, delivery.into_message()))
+                .map(|(owner, hub, delivery)| (owner, hub, delivery.into_message()))
                 .collect(),
         );
     }
@@ -6997,6 +7009,7 @@ impl Agent {
                     expected_session,
                     parallel_only,
                     native_dispatcher,
+                    cancellation,
                 )
                 .await;
             record_local_tool_latency(&latency, tool_started_at.elapsed());
@@ -7516,6 +7529,7 @@ impl Agent {
             expected_session,
             false,
             native_dispatcher,
+            None,
         )
         .await
     }
@@ -7527,11 +7541,59 @@ impl Agent {
         expected_session: Option<&str>,
         parallel_only: bool,
         expected_native_dispatcher: bool,
+        cancellation: Option<TurnCancellation<'_>>,
     ) -> (ToolOutput, bool) {
         if let Err(error) = self.check_invocation_session(expected_session).await {
             return (Self::xdev_text_output(&error.to_string(), true), true);
         }
+        // Capture the live session's child authority before the execution
+        // snapshot. Every native tool and nested dispatcher target shares
+        // this handle, including future cancellation and destruction.
+        let session_id = match self.job_session_scope.session_id().await {
+            Ok(session_id) => session_id,
+            Err(error) => return (Self::xdev_text_output(&error.to_string(), true), true),
+        };
+        // The batch polls completed output before cancellation so real finished
+        // work is retained. A resolver can cancel and return Ready in that same
+        // poll; it must not admit a new native effect after that cancellation.
+        let cancelled = cancellation.map_or_else(
+            || {
+                crate::agent_cx::AgentCx::for_current_or_request()
+                    .checkpoint()
+                    .is_err()
+                    .then_some("owner_cancellation")
+            },
+            TurnCancellation::reason,
+        );
+        if let Some(reason) = cancelled {
+            return (
+                Self::tool_cancellation_output(&tool_call.name, reason),
+                true,
+            );
+        }
+        if expected_session.is_some_and(|expected| expected != session_id) {
+            return (
+                Self::xdev_text_output(
+                    "EVAL_SESSION_CHANGED: nested tool no longer owns the current session",
+                    true,
+                ),
+                true,
+            );
+        }
+        let hub = match self.job_session_scope.agent_hub_for_session(&session_id) {
+            Ok(hub) => hub,
+            Err(error) => return (Self::xdev_text_output(&error.to_string(), true), true),
+        };
         let registry = self.tools.snapshot();
+        if registry.job_session_scope().instance_id() != self.job_session_scope.instance_id() {
+            return (
+                Self::xdev_text_output(
+                    "TOOL_SESSION_CHANGED: tool registry no longer belongs to this agent session",
+                    true,
+                ),
+                true,
+            );
+        }
         // Approval was for one route. Switching between a native dispatcher
         // and a host tool while policy awaited must not acquire an unapproved
         // target or execute an unrelated handler under the same name.
@@ -7563,15 +7625,17 @@ impl Agent {
         }
 
         if tool_call.name == "xdev"
-            && let Some(output) = self
-                .dispatch_xdev(
+            && let Some(output) = crate::agent_hub::with_registry(
+                Arc::clone(&hub),
+                self.dispatch_xdev(
                     &registry,
                     tool_call,
                     Arc::clone(&on_event),
                     expected_session,
                     parallel_only,
-                )
-                .await
+                ),
+            )
+            .await
         {
             let is_error = output.is_error;
             return (output, is_error);
@@ -7580,13 +7644,16 @@ impl Agent {
         let Some(tool) = registry.get(&tool_call.name) else {
             return (Self::tool_not_found_output(&tool_call.name), true);
         };
-        self.execute_resolved_tool(
-            tool,
-            tool_call,
-            tool_call,
-            on_event,
-            expected_session,
-            parallel_only,
+        crate::agent_hub::with_registry(
+            hub,
+            self.execute_resolved_tool(
+                tool,
+                tool_call,
+                tool_call,
+                on_event,
+                expected_session,
+                parallel_only,
+            ),
         )
         .await
     }
@@ -10456,10 +10523,42 @@ mod message_queue_tests {
     }
 
     #[test]
+    fn dropping_staged_native_completion_retains_its_original_live_parent() {
+        let _guard = crate::jobs::process_test_guard();
+        let owner = format!("staged-native-{}", uuid::Uuid::new_v4().simple());
+        let first_scope = crate::jobs::JobSessionScope::fixed(owner.clone());
+        let second_scope = crate::jobs::JobSessionScope::fixed(owner.clone());
+        let first = first_scope.agent_hub_for_session(&owner).unwrap();
+        let second = second_scope.agent_hub_for_session(&owner).unwrap();
+        let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::All);
+        queue.push_job_follow_up_lossless(
+            owner.clone(),
+            Some(Arc::clone(&first)),
+            QueuedAgentMessage::generated(user_message("private native result")),
+        );
+        {
+            let _foreign = crate::agent_hub::enter_registry(Arc::clone(&second));
+            drop(queue);
+            assert!(crate::jobs::take_completion_notices(&owner).is_empty());
+        }
+        let restored = crate::jobs::take_owned_completion_notices(&owner, Some(&first));
+        assert_eq!(restored.len(), 1);
+        assert!(Arc::ptr_eq(restored[0].0.as_ref().unwrap(), &first));
+        assert!(matches!(
+            &restored[0].1,
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "private native result"
+        ));
+    }
+
+    #[test]
     fn ordinary_overflow_does_not_evict_an_older_job_notice() {
         let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::All);
         queue.push_job_follow_up_lossless(
             "owner-a".to_string(),
+            None,
             QueuedAgentMessage::generated(user_message("job-notice")),
         );
         for index in 0..=MAX_FOLLOW_UP_QUEUE_SIZE {
@@ -11507,6 +11606,87 @@ mod extensions_integration_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn ready_session_resolver_cancellation_fences_direct_and_discovered_native_writes() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for via_dispatcher in [false, true] {
+                for cancel_owner in [false, true] {
+                    let root = tempfile::tempdir().expect("workspace");
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let config: crate::config::Config = serde_json::from_value(json!({
+                        "tools": { "loadMode": { "read": "discoverable" } },
+                    }))
+                    .expect("discovery config");
+                    let mut tools = ToolRegistry::new(&["read"], root.path(), Some(&config));
+                    tools.push(Box::new(ReclassifiedNativeTool {
+                        cwd: root.path().to_path_buf(),
+                        writes: true,
+                        calls: Arc::clone(&calls),
+                    }));
+                    assert!(tools.is_discoverable("read"));
+                    assert!(tools.has_generated_dispatcher());
+                    let agent = Agent::new(Arc::new(NoopProvider), tools, AgentConfig::default());
+                    let owner = crate::agent_cx::AgentCx::for_testing();
+                    let (abort, signal) = AbortHandle::new();
+                    let resolver_calls = Arc::new(AtomicUsize::new(0));
+                    let observed = Arc::clone(&resolver_calls);
+                    let resolver_owner = owner.clone();
+                    agent.job_session_scope.bind(Arc::new(move || {
+                        let owner = resolver_owner.clone();
+                        let abort = abort.clone();
+                        let observed = Arc::clone(&observed);
+                        Box::pin(async move {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            if cancel_owner {
+                                owner.set_cancel_requested(true);
+                            } else {
+                                abort.abort();
+                            }
+                            Some("ready-resolver-owner".to_string())
+                        })
+                    }));
+                    let arguments = json!({"path":"result.txt", "content":"must not run"});
+                    let call = ToolCall {
+                        id: "cancelled-at-owner-resolution".to_string(),
+                        name: if via_dispatcher { "xdev" } else { "read" }.to_string(),
+                        arguments: if via_dispatcher {
+                            json!({"action":"run", "name":"read", "args":arguments})
+                        } else {
+                            arguments
+                        },
+                        thought_signature: None,
+                    };
+                    assert!(!agent.effects_for_call(&call).parallel_safe());
+                    let completed = owner
+                        .with_current(agent.execute_tool_batch(
+                            vec![(0, call)],
+                            Arc::new(|_| {}),
+                            TurnCancellation {
+                                owner: &owner,
+                                abort: (!cancel_owner).then_some(&signal),
+                            },
+                            test_turn_latency(),
+                            1,
+                        ))
+                        .await;
+                    assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    assert!(!root.path().join("result.txt").exists());
+                    assert_eq!(completed.len(), 1);
+                    let (_, (output, is_error)) = &completed[0];
+                    assert!(*is_error && output.is_error);
+                    let details = output.details.as_ref().expect("cancelled admission");
+                    assert_eq!(details["schema"], TOOL_CANCELLATION_SCHEMA_V1);
+                    assert_eq!(
+                        details["reason"],
+                        if cancel_owner { "owner_cancellation" } else { "abort_signal" }
+                    );
+                }
+            }
+        });
     }
 
     #[test]

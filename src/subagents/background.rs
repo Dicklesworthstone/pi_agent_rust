@@ -88,9 +88,7 @@ impl Request {
 
     fn deadline(&self, tool: &SubagentTool) -> Result<Deadline> {
         match self {
-            Self::Delegation(request) => {
-                Deadline::for_request(tool.timeout, request.timeout_seconds)
-            }
+            Self::Delegation(request) => tool.request_deadline(request.timeout_seconds),
             Self::Workflow(plan) => plan.deadline(tool),
         }
     }
@@ -164,7 +162,23 @@ pub(super) async fn resolve_session(
     owner: &AgentCx,
     deadline: Deadline,
 ) -> Result<String> {
-    let mut pending = Box::pin(owner.with_current(scope.session_id()));
+    resolve_session_future(scope.session_id(), owner, deadline).await
+}
+
+pub(super) async fn resolve_invocation_session(
+    scope: &crate::jobs::JobSessionScope,
+    owner: &AgentCx,
+    deadline: Deadline,
+) -> Result<String> {
+    resolve_session_future(scope.invocation_session_id(), owner, deadline).await
+}
+
+async fn resolve_session_future(
+    lookup: impl std::future::Future<Output = Result<String>>,
+    owner: &AgentCx,
+    deadline: Deadline,
+) -> Result<String> {
+    let mut pending = Box::pin(owner.with_current(lookup));
     loop {
         owner.checkpoint().map_err(|_| {
             Error::tool(
@@ -243,7 +257,7 @@ pub(super) async fn start(
     // Sample now BEFORE remaining(): this bound may shorten by the sampling
     // interval, never extend the delegation's monotonic deadline.
     let job_deadline = std::time::Instant::now() + deadline.remaining();
-    let session_id = resolve_session(&tool.job_session_scope, &owner, deadline).await?;
+    let session_id = resolve_invocation_session(&tool.job_session_scope, &owner, deadline).await?;
     let admission = crate::jobs::admit_owned_task(&session_id)?.with_deadline(job_deadline);
     let mut invocation_tool = tool.clone();
     invocation_tool.workspace_privacy = Some(privacy.clone());
@@ -655,6 +669,27 @@ mod tests {
                     .is_empty()
             );
             assert!(crate::jobs::take_completion_notices(&owner).is_empty());
+            assert!(!root.path().join("launched").exists());
+        }
+
+        #[test]
+        fn a_pending_hub_owner_lookup_uses_the_original_delegation_deadline() {
+            let _guard = crate::jobs::process_test_guard();
+            let (root, mut tool, session_id) = fixture("touch launched");
+            tool = tool.with_timeout(Duration::from_millis(50));
+            let scope = crate::jobs::JobSessionScope::fixed(&session_id);
+            scope.bind(std::sync::Arc::new(|| {
+                Box::pin(futures::future::pending::<Option<String>>())
+            }));
+            tool.bind_job_session_scope(scope);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("bounded scope runtime");
+            let error = runtime
+                .block_on(tool.execute("bounded-lookup", request(), None))
+                .expect_err("a pending scope cannot renew the delegation budget");
+            assert!(error.to_string().contains("PI_SUBAGENT_TIMEOUT"));
+            assert!(crate::jobs::list(&session_id).unwrap().is_empty());
             assert!(!root.path().join("launched").exists());
         }
 

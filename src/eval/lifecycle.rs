@@ -13,6 +13,7 @@ use crate::tools::{ToolOutput, ToolUpdate};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub(super) mod source;
@@ -50,6 +51,14 @@ struct Cell {
     soft_timeout_secs: Option<u64>,
     #[serde(default)]
     reset: bool,
+}
+
+pub(super) struct PreparedCell<'p> {
+    cell: Cell,
+    judgments: super::judgment::Invocation<'p>,
+    archive_path: Option<String>,
+    load_path: Option<PathBuf>,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,20 +164,35 @@ fn before_execution_stop(stop: CellStop) -> Error {
 }
 
 impl EvalTool {
-    // The execution guard serializes the whole cell, not just its activation.
-    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    pub(super) async fn execute_cell(
+    pub(super) async fn invocation_hub(&self) -> Result<crate::agent_hub::SharedHub> {
+        if !self.hub_session_bound {
+            return Ok(crate::agent_hub::current_registry());
+        }
+        let owner = AgentCx::for_current_or_request();
+        let session_id = wait_owned(&owner, None, self.eval_invocation_session_id())
+            .await
+            .map_err(before_execution_stop)??;
+        self.session_scope
+            .agent_hub_for_session(&session_id)
+            .map_err(|_| {
+                Error::tool(
+                    "eval",
+                    "EVAL_SESSION_UNAVAILABLE: live session hub is unavailable",
+                )
+            })
+    }
+
+    pub(super) fn prepare_cell<'p>(
         &self,
         input: Value,
-        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-        protect: Option<&crate::judgment::Protect<'_>>,
-        host: Option<&dyn crate::tools::ToolInvocationHost>,
-        snapshot_privacy: Option<&super::judgment::SnapshotPrivacy<'_>>,
-    ) -> Result<ToolOutput> {
+        protect: Option<&'p crate::judgment::Protect<'p>>,
+        host: Option<&'p dyn crate::tools::ToolInvocationHost>,
+        snapshot_privacy: Option<&'p super::judgment::SnapshotPrivacy<'p>>,
+    ) -> Result<PreparedCell<'p>> {
         // Validate before waiting, spawning, or destroying any retained state.
         // A misspelled language or a string-valued reset cannot silently reset
         // Python. Unknown extension fields remain ignored as before.
-        let mut judgments = super::judgment::Invocation::new(self.judge.clone(), &input, protect)?
+        let judgments = super::judgment::Invocation::new(self.judge.clone(), &input, protect)?
             .with_cost_budget(self.cost_scope.current())
             .with_host(host)
             .with_snapshot_privacy(snapshot_privacy);
@@ -198,10 +222,33 @@ impl EvalTool {
                 ));
             }
         }
+        Ok(PreparedCell {
+            cell,
+            judgments,
+            archive_path,
+            load_path,
+            timeout,
+        })
+    }
+
+    // The execution guard serializes the whole cell, not just its activation.
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+    pub(super) async fn execute_cell(
+        &self,
+        request: PreparedCell<'_>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let PreparedCell {
+            cell,
+            mut judgments,
+            archive_path,
+            load_path,
+            timeout,
+        } = request;
         let owner = AgentCx::for_current_or_request();
         // Bind on first poll, before queueing. Never redirect an old request
         // or reset into whichever session happens to be current on admission.
-        let requested_session = wait_owned(&owner, None, self.eval_session_id())
+        let requested_session = wait_owned(&owner, None, self.eval_invocation_session_id())
             .await
             .map_err(before_execution_stop)??;
         judgments.bind_host_session(&requested_session);

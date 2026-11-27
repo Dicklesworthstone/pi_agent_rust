@@ -320,7 +320,7 @@ pub(super) async fn execute(
         return Err(invalid("outputSchema must be a JSON Schema object"));
     }
     let owner = AgentCx::for_current_or_request();
-    let deadline = Deadline::for_request(tool.timeout, request.timeout_seconds)?;
+    let deadline = tool.request_deadline(request.timeout_seconds)?;
     owner.with_current(async {
         check_owner(&owner, deadline)?;
         // Admission canonicalizes for scope checks, but recovery receives the

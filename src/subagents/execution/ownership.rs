@@ -7,9 +7,11 @@
 //! not clear the poison or authorize new work from potentially damaged state.
 
 use super::{SubagentResult, SubagentStatus, cancel};
-use crate::agent_hub::{AgentHubRegistry, ChildEntry, ChildKind, ChildStatus, registry};
+use crate::agent_hub::{AgentHubRegistry, ChildEntry, ChildKind, ChildStatus, SharedHub};
+#[cfg(test)]
+use crate::agent_hub::registry;
 use crate::error::{Error, Result};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const OPERATOR_KILLED: &str = "Child was killed by the operator.";
 const HUB_CANCELLED: &str = "Child was cancelled through the agent hub.";
@@ -87,7 +89,8 @@ fn apply_admission(result: &mut SubagentResult, admission: Admission) -> bool {
 /// setup errors). The runner assigns it before any process may be spawned.
 pub(super) fn checkpoint(result: &mut SubagentResult) -> bool {
     if let Some(id) = &result.hub_id {
-        let admission = admission(registry(), id);
+        let hub = crate::agent_hub::current_registry();
+        let admission = admission(&hub, id);
         return apply_admission(result, admission);
     }
     !result.is_error
@@ -145,11 +148,16 @@ fn settle_result_in(hub: &Mutex<AgentHubRegistry>, id: &str, result: &SubagentRe
 /// spawn or after process exit but before result acceptance and writeback.
 pub(super) struct HubLease {
     id: Option<String>,
+    registry: SharedHub,
 }
 
 impl HubLease {
-    pub(super) const fn empty() -> Self {
-        Self { id: None }
+    pub(super) fn empty() -> Self {
+        Self::in_registry(crate::agent_hub::current_registry())
+    }
+
+    pub(super) const fn in_registry(registry: SharedHub) -> Self {
+        Self { id: None, registry }
     }
 
     /// A persistent RPC worker owns process control but has no one-shot
@@ -163,7 +171,7 @@ impl HubLease {
                 "PI_SUBAGENT_HUB: child lease already registered",
             ));
         }
-        let entry = registry()
+        let entry = self.registry
             .lock()
             .map_err(|_| Error::tool("subagent", HUB_POISONED))?
             .register_worker(name, kind)?;
@@ -185,7 +193,7 @@ impl HubLease {
                 "PI_SUBAGENT_HUB: child lease already registered",
             ));
         }
-        let entry = registry()
+        let entry = self.registry
             .lock()
             .map_err(|_| Error::tool("subagent", HUB_POISONED))?
             .register_native(name, task, kind, launch, revived_from)
@@ -209,7 +217,7 @@ impl HubLease {
             .id
             .as_deref()
             .map_or(Admission::Refused(HUB_MISSING), |id| {
-                activate_in(registry(), id, pid)
+                activate_in(&self.registry, id, pid)
             });
         if !apply_admission(result, admission) {
             return false;
@@ -225,7 +233,7 @@ impl HubLease {
             apply_admission(result, Admission::Refused(HUB_MISSING));
             return None;
         };
-        let Ok(hub) = registry().lock() else {
+        let Ok(hub) = self.registry.lock() else {
             apply_admission(result, Admission::Refused(HUB_POISONED));
             return None;
         };
@@ -249,7 +257,7 @@ impl HubLease {
         let Some(id) = self.id.as_deref() else {
             return apply_admission(result, Admission::Refused(HUB_MISSING));
         };
-        let Ok(mut hub) = registry().lock() else {
+        let Ok(mut hub) = self.registry.lock() else {
             return apply_admission(result, Admission::Refused(HUB_POISONED));
         };
         if hub.resume_schema_correction(id, pid) {
@@ -269,18 +277,20 @@ impl HubLease {
     pub(super) fn process_lifetime(&self) -> ProcessLease {
         ProcessLease {
             id: self.id.clone(),
+            registry: Arc::clone(&self.registry),
         }
     }
 
     pub(super) fn settle(&mut self, result: &SubagentResult) {
         if let Some(id) = self.id.take() {
-            settle_result_in(registry(), &id, result);
+            settle_result_in(&self.registry, &id, result);
         }
     }
 }
 
 pub(super) struct ProcessLease {
     id: Option<String>,
+    registry: SharedHub,
 }
 
 impl ProcessLease {
@@ -291,7 +301,7 @@ impl ProcessLease {
         &self,
         child: &mut std::process::Child,
     ) -> std::io::Result<Option<std::process::ExitStatus>> {
-        let mut hub = registry()
+        let mut hub = self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let status = child.try_wait();
@@ -304,7 +314,7 @@ impl ProcessLease {
     }
 
     pub(super) fn terminate(&self, child: &mut super::ChildProcessGuard) {
-        let mut hub = registry()
+        let mut hub = self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         child.terminate_untracked();
@@ -317,7 +327,7 @@ impl ProcessLease {
 impl Drop for ProcessLease {
     fn drop(&mut self) {
         if let Some(id) = &self.id {
-            registry()
+            self.registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .mark_process_reaped(id);
@@ -328,7 +338,7 @@ impl Drop for ProcessLease {
 impl Drop for HubLease {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
-            settle_in(registry(), &id, ChildStatus::Cancelled);
+            settle_in(&self.registry, &id, ChildStatus::Cancelled);
         }
     }
 }
@@ -341,6 +351,39 @@ mod tests {
         let mut hub = AgentHubRegistry::default();
         hub.set_dir_for_tests(dir.to_path_buf());
         Mutex::new(hub)
+    }
+
+    #[test]
+    fn cancellation_and_process_retirement_use_the_original_registry_after_context_switch() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = Arc::new(local_hub(first_dir.path()));
+        let second = Arc::new(local_hub(second_dir.path()));
+        let first_child = register_in(&first, "worker", "first", ChildKind::Subagent).unwrap();
+        let second_child = register_in(&second, "worker", "second", ChildKind::Subagent).unwrap();
+        assert_eq!(first_child.id, second_child.id);
+        first.lock().unwrap().mark_running(&first_child.id, 41);
+        second.lock().unwrap().mark_running(&second_child.id, 42);
+        let lease = HubLease {
+            id: Some(first_child.id.clone()),
+            registry: Arc::clone(&first),
+        };
+        let process = lease.process_lifetime();
+        {
+            let _other = crate::agent_hub::enter_registry(Arc::clone(&second));
+            drop(process);
+            assert_eq!(first.lock().unwrap().control_pid(&first_child.id), None);
+            assert_eq!(second.lock().unwrap().control_pid(&second_child.id), Some(42));
+            drop(lease);
+        }
+        assert_eq!(
+            first.lock().unwrap().get(&first_child.id).unwrap().status,
+            ChildStatus::Cancelled,
+        );
+        assert_eq!(
+            second.lock().unwrap().get(&second_child.id).unwrap().status,
+            ChildStatus::Running,
+        );
     }
 
     #[test]
@@ -619,6 +662,7 @@ mod tests {
                 hub.mark_running(&entry.id, pid);
                 let child = child.with_process_lifetime(ProcessLease {
                     id: Some(entry.id.clone()),
+                    registry: crate::agent_hub::current_registry(),
                 });
                 let (starting, started) = std::sync::mpsc::channel();
                 let (finishing, finished) = std::sync::mpsc::channel();

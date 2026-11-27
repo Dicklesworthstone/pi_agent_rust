@@ -56,6 +56,7 @@ struct Turn {
 #[allow(clippy::struct_excessive_bools)] // Independent lifecycle flags read under one lock.
 pub(super) struct WorkerState {
     owner: String,
+    hub: crate::agent_hub::SharedHub,
     id: String,
     job_id: String,
     hub_id: Option<String>,
@@ -238,12 +239,14 @@ fn register(state: Shared) -> Result<Registration> {
 }
 
 fn lookup(owner: &str, id: &str) -> Result<Shared> {
+    let hub = crate::agent_hub::current_registry();
     let workers = registry().lock().map_err(|_| stopped())?;
     workers
         .iter()
         .find_map(|worker| {
             let state = worker.lock().ok()?;
-            (state.id == id && state.owner == owner).then(|| Arc::clone(worker))
+            (state.id == id && state.owner == owner && Arc::ptr_eq(&state.hub, &hub))
+                .then(|| Arc::clone(worker))
         })
         .ok_or_else(|| {
             Error::tool(
@@ -261,8 +264,9 @@ fn identity(state: &Shared) -> Result<(String, String)> {
 /// Called after native hub admission and before the actor launches its process.
 /// Already-admitted waits observe this binding through their own turn tokens.
 pub(super) fn bind_hub(state: &Shared, id: &str) -> Result<()> {
+    let hub = crate::agent_hub::current_registry();
     let mut state = state.lock().map_err(|_| stopped())?;
-    if state.hub_id.is_some() {
+    if !Arc::ptr_eq(&state.hub, &hub) || state.hub_id.is_some() {
         return Err(stopped());
     }
     for turn in state.turns.values() {
@@ -303,10 +307,11 @@ fn hold_results(
         // answering. Do not invent a foreground dependency for that caller.
         return Ok(None);
     }
-    crate::agent_hub::registry()
+    let registry = crate::agent_hub::current_registry();
+    let mut hub = registry
         .lock()
-        .map_err(|_| Error::tool("subagent", "PI_SUBAGENT_HUB: registry is poisoned"))?
-        .hold_turn_results(results, acknowledged, all, remaining)
+        .map_err(|_| Error::tool("subagent", "PI_SUBAGENT_HUB: registry is poisoned"))?;
+    hub.hold_turn_results(results, acknowledged, all, remaining)
         .map(Some)
 }
 
@@ -316,6 +321,13 @@ struct FinishGuard(Shared);
 
 impl Drop for FinishGuard {
     fn drop(&mut self) {
+        let hub = Arc::clone(
+            &self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .hub,
+        );
+        let _hub_scope = crate::agent_hub::enter_registry(hub);
         finish(&self.0, None);
     }
 }
@@ -370,9 +382,10 @@ async fn start(
     if current_subagent_depth() >= MAX_SUBAGENT_DEPTH {
         return Err(invalid("maximum nested subagent depth reached"));
     }
-    let deadline = Deadline::for_request(tool.timeout, timeout)?;
+    let deadline = tool.request_deadline(timeout)?;
     let job_deadline = Instant::now() + deadline.remaining();
-    let owner_id = background::resolve_session(&tool.job_session_scope, &owner, deadline).await?;
+    let owner_id =
+        background::resolve_invocation_session(&tool.job_session_scope, &owner, deadline).await?;
     let admission = crate::jobs::admit_owned_task(&owner_id)?.with_deadline(job_deadline);
     let parent_model = tool.capture_parent_model();
     let cost_budget = tool.cost_scope.current();
@@ -424,6 +437,7 @@ async fn start(
     let id = format!("worker-{}", uuid::Uuid::new_v4().simple());
     let state = Arc::new(Mutex::new(WorkerState {
         owner: owner_id.clone(),
+        hub: crate::agent_hub::current_registry(),
         id: id.clone(),
         job_id: String::new(),
         hub_id: None,
@@ -548,8 +562,12 @@ pub(super) async fn execute(
     };
     let owner = AgentCx::for_current_or_request();
     check_owner(&owner)?;
-    let budget = Deadline::for_request(Some(Duration::from_millis(timeout_ms + 30_000)), None)?;
-    let owner_id = background::resolve_session(&tool.job_session_scope, &owner, budget).await?;
+    let budget = tool.cap_deadline(Deadline::for_request(
+        Some(Duration::from_millis(timeout_ms + 30_000)),
+        None,
+    )?);
+    let owner_id =
+        background::resolve_invocation_session(&tool.job_session_scope, &owner, budget).await?;
     let state = lookup(&owner_id, id)?;
     let (_, job_id) = identity(&state)?;
     if let Some(task) = prompt {
@@ -682,6 +700,11 @@ pub(super) async fn execute(
 }
 
 async fn close(state: &Shared) -> Result<()> {
+    let hub = Arc::clone(&state.lock().map_err(|_| stopped())?.hub);
+    crate::agent_hub::with_registry(hub, close_in_registry(state)).await
+}
+
+async fn close_in_registry(state: &Shared) -> Result<()> {
     let (owner_id, job_id) = {
         let mut state = state.lock().map_err(|_| stopped())?;
         state.closing = true;
@@ -1072,6 +1095,7 @@ mod tests {
         }
         Arc::new(Mutex::new(WorkerState {
             owner: "batch-owner".to_string(),
+            hub: crate::agent_hub::current_registry(),
             id: "batch-worker".to_string(),
             job_id: "batch-job".to_string(),
             hub_id: None,
@@ -1106,6 +1130,38 @@ mod tests {
             }
         }
         finish_batch(shared).expect("simulated post-turn idle barrier");
+    }
+
+    #[test]
+    fn worker_handle_control_requires_the_same_live_hub_even_with_a_matching_session_id() {
+        let own = Arc::new(Mutex::new(crate::agent_hub::AgentHubRegistry::default()));
+        let foreign = Arc::new(Mutex::new(crate::agent_hub::AgentHubRegistry::default()));
+        let owner_id = format!("same-saved-session-{}", uuid::Uuid::new_v4().simple());
+        let worker_id = format!("worker-{}", uuid::Uuid::new_v4().simple());
+        let (state, _registration) = {
+            let _scope = crate::agent_hub::enter_registry(Arc::clone(&own));
+            let state = queued_worker(1, &["owned assignment"]);
+            {
+                let mut worker = state.lock().unwrap();
+                worker.owner.clone_from(&owner_id);
+                worker.id.clone_from(&worker_id);
+            }
+            let registration = register(Arc::clone(&state)).unwrap();
+            assert!(Arc::ptr_eq(&lookup(&owner_id, &worker_id).unwrap(), &state));
+            (state, registration)
+        };
+        {
+            let _scope = crate::agent_hub::enter_registry(Arc::clone(&foreign));
+            let error = lookup(&owner_id, &worker_id)
+                .err()
+                .expect("another live session must not borrow the saved-session identity");
+            assert!(error.to_string().contains("PI_SUBAGENT_WORKER_UNKNOWN"));
+            assert!(bind_hub(&state, "foreign-child-1").is_err());
+            assert!(state.lock().unwrap().hub_id.is_none());
+            assert!(!state.lock().unwrap().closing);
+        }
+        let _scope = crate::agent_hub::enter_registry(own);
+        assert!(Arc::ptr_eq(&lookup(&owner_id, &worker_id).unwrap(), &state));
     }
 
     #[test]

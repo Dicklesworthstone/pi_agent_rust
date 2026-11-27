@@ -66,6 +66,7 @@ pub(super) struct ChildRunner {
     worker_fallback_policy: Option<String>,
     worker_isolation: Option<Arc<super::worker::isolation::Capture>>,
     hub_kind: ChildKind,
+    hub: crate::agent_hub::SharedHub,
     deadline: Deadline,
     revival: Option<(String, RevivalSpec)>,
     public_task: Option<String>,
@@ -75,7 +76,7 @@ pub(super) struct ChildRunner {
 }
 
 impl ChildRunner {
-    pub(super) const fn new(
+    pub(super) fn new(
         cwd: PathBuf,
         global_dir: PathBuf,
         child_binary: PathBuf,
@@ -95,6 +96,7 @@ impl ChildRunner {
             worker_fallback_policy: None,
             worker_isolation: None,
             hub_kind,
+            hub: crate::agent_hub::current_registry(),
             deadline,
             revival: None,
             public_task: None,
@@ -196,25 +198,28 @@ impl ChildRunner {
         concurrency: usize,
         on_update: Option<UpdateCallback>,
     ) -> Vec<SubagentResult> {
-        let baselines = self.capture_baselines(agents, &tasks);
-        let update = on_update.as_ref();
-        let mut completed = stream::iter(tasks.into_iter().zip(baselines).enumerate())
-            .map(|(index, (task, baseline))| async move {
-                (
-                    index,
-                    self.run_pending(agents, task, None, update, baseline.as_ref())
-                        .await,
-                )
-            })
-            .buffer_unordered(concurrency)
-            .collect::<Vec<_>>()
-            .await;
-        completed.sort_by_key(|(index, _)| *index);
-        let mut results = Vec::with_capacity(completed.len());
-        for (_, pending) in completed {
-            results.push(self.public_result(pending.finish(update).await));
-        }
-        results
+        crate::agent_hub::with_registry(Arc::clone(&self.hub), async {
+            let baselines = self.capture_baselines(agents, &tasks);
+            let update = on_update.as_ref();
+            let mut completed = stream::iter(tasks.into_iter().zip(baselines).enumerate())
+                .map(|(index, (task, baseline))| async move {
+                    (
+                        index,
+                        self.run_pending(agents, task, None, update, baseline.as_ref())
+                            .await,
+                    )
+                })
+                .buffer_unordered(concurrency)
+                .collect::<Vec<_>>()
+                .await;
+            completed.sort_by_key(|(index, _)| *index);
+            let mut results = Vec::with_capacity(completed.len());
+            for (_, pending) in completed {
+                results.push(self.public_result(pending.finish(update).await));
+            }
+            results
+        })
+        .await
     }
 
     fn task_cwd(&self, task: &SubagentTask) -> PathBuf {
@@ -303,13 +308,16 @@ impl ChildRunner {
         step: Option<usize>,
         on_update: Option<UpdateCallback>,
     ) -> SubagentResult {
-        let update = on_update.as_ref();
-        let result = self
-            .run_pending(agents, task, step, update, None)
-            .await
-            .finish(update)
-            .await;
-        self.public_result(result)
+        crate::agent_hub::with_registry(Arc::clone(&self.hub), async {
+            let update = on_update.as_ref();
+            let result = self
+                .run_pending(agents, task, step, update, None)
+                .await
+                .finish(update)
+                .await;
+            self.public_result(result)
+        })
+        .await
     }
 
     /// At most one tool-free correction of the completed answer. The original
@@ -623,7 +631,7 @@ impl ChildRunner {
         };
         attempt.result.hub_id = Some(hub_entry.id.clone());
         if self.foreground && !correcting {
-            let hold = crate::agent_hub::registry()
+            let hold = self.hub
                 .lock()
                 .map_err(|_| {
                     crate::error::Error::tool("subagent", "PI_SUBAGENT_HUB: registry is poisoned")
@@ -1032,7 +1040,7 @@ struct Attempt {
 }
 
 impl Attempt {
-    const fn new(result: SubagentResult, deadline: Deadline) -> Self {
+    fn new(result: SubagentResult, deadline: Deadline) -> Self {
         Self {
             result,
             isolation: None,
@@ -1366,8 +1374,9 @@ fn apply_child_frame(
         {
             match protocol.ingest(&line, &mut result.output) {
                 Ok(changed) => {
+                    let hub = crate::agent_hub::current_registry();
                     if let Some(id) = &result.hub_id
-                        && let Ok(mut registry) = crate::agent_hub::registry().lock()
+                        && let Ok(mut registry) = hub.lock()
                     {
                         registry.append_transcript(id, &line);
                     }

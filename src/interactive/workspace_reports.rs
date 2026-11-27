@@ -590,8 +590,8 @@ pub fn plugins(manager: &crate::package_manager::PackageManager) -> Report {
 
 /// `/hub [id]`: this session's subagent children (bd-cv653.5.3), or one
 /// child's transcript tail.
-pub fn hub(args: &str) -> Report {
-    let registry = crate::agent_hub::registry()
+pub fn hub(args: &str, hub: &crate::agent_hub::SharedHub) -> Report {
+    let registry = hub
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let id = args.trim();
@@ -952,8 +952,46 @@ mod tests {
 
     #[test]
     fn hub_reports_an_empty_roster_and_unknown_children() {
-        assert!(format_roster(&[]).status.starts_with("No subagents"));
-        assert!(hub("no-such-child-9").status.contains("unknown child"));
+        let registry = crate::jobs::JobSessionScope::fixed("report-owner")
+            .agent_hub_for_session("report-owner")
+            .expect("hub");
+        assert!(hub("", &registry).status.starts_with("No subagents"));
+        assert!(
+            hub("no-such-child-9", &registry)
+                .status
+                .contains("unknown child")
+        );
+    }
+
+    #[test]
+    fn hub_reports_only_the_selected_live_sessions_children() {
+        let first_dir = tempfile::tempdir().expect("first hub dir");
+        let second_dir = tempfile::tempdir().expect("second hub dir");
+        let first = crate::jobs::JobSessionScope::fixed("saved-session")
+            .agent_hub_for_session("saved-session")
+            .expect("first hub");
+        let second = crate::jobs::JobSessionScope::fixed("saved-session")
+            .agent_hub_for_session("saved-session")
+            .expect("second hub");
+        let register = |registry: &crate::agent_hub::SharedHub, dir: &Path, text: &str| {
+            let mut registry = registry.lock().expect("registry");
+            registry.set_dir_for_tests(dir.to_path_buf());
+            let child = registry.register("scout", text).expect("register child");
+            registry.append_transcript(&child.id, text);
+            child.id
+        };
+        let first_id = register(&first, first_dir.path(), "first session assignment");
+        let second_id = register(&second, second_dir.path(), "second session assignment");
+        assert_eq!(first_id, second_id, "display IDs may repeat across sessions");
+        for (registry, own, foreign) in [
+            (&first, "first session assignment", "second session assignment"),
+            (&second, "second session assignment", "first session assignment"),
+        ] {
+            let roster = hub("", registry).card.expect("roster");
+            let transcript = hub(&first_id, registry).card.expect("transcript");
+            assert!(roster.contains(own) && transcript.contains(own));
+            assert!(!roster.contains(foreign) && !transcript.contains(foreign));
+        }
     }
 
     /// Bare `/advisor` reports status without toggling; `toggle` flips state;

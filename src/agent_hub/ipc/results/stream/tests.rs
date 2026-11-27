@@ -242,6 +242,45 @@ fn transfer_revocation_rejects_later_pages_and_debug_never_contains_the_result()
 }
 
 #[test]
+fn transfer_pages_keep_the_reader_hub_after_another_live_session_becomes_current() {
+    use std::sync::{Arc, Mutex};
+
+    let own_dir = tempfile::tempdir().unwrap();
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let mut own = crate::agent_hub::AgentHubRegistry::default();
+    own.set_dir_for_tests(own_dir.path().to_path_buf());
+    let sender = own.register("shared-reader", "owned result").unwrap();
+    own.mark_running(&sender.id, 42);
+    let identity = live_identity(&own, &sender.id).unwrap();
+    let own = Arc::new(Mutex::new(own));
+    let mut foreign = crate::agent_hub::AgentHubRegistry::default();
+    foreign.set_dir_for_tests(foreign_dir.path().to_path_buf());
+    let foreign_sender = foreign.register("shared-reader", "foreign result").unwrap();
+    foreign.mark_running(&foreign_sender.id, 42);
+    let foreign = Arc::new(Mutex::new(foreign));
+    assert_eq!(sender.id, foreign_sender.id);
+
+    let mut transfer = {
+        let _scope = crate::agent_hub::enter_registry(Arc::clone(&own));
+        Transfer::new(document(&source()), &sender.id, identity).unwrap()
+    };
+    let _foreign_scope = crate::agent_hub::enter_registry(Arc::clone(&foreign));
+    transfer.check_reader().unwrap();
+    assert!(transfer.next_response().unwrap().is_some());
+    own.lock().unwrap().mark_process_reaped(&sender.id);
+    let error = transfer
+        .next_response()
+        .err()
+        .expect("the original reader was reaped");
+    assert!(error.to_string().contains("PI_HUB_IPC_REVOKED"), "{error}");
+    assert!(foreign.lock().unwrap().control_pid(&sender.id).is_some());
+    assert!(Arc::ptr_eq(
+        &crate::agent_hub::current_registry(),
+        &foreign
+    ));
+}
+
+#[test]
 fn a_completed_collector_rejects_trailing_frames_and_drops_no_required_data() {
     let mut collector = Collector::new("peer-1/value");
     assert_eq!(

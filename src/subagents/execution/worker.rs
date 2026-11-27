@@ -32,8 +32,9 @@ pub(in crate::subagents) fn run(
     // Construct the guard before returning a future. Even unpolled work has
     // an owner to settle, and its Drop implementation orders actual process
     // retirement before the facade's terminal publication.
+    let hub = std::sync::Arc::clone(&runner.hub);
     let mut actor = Actor::new(runner, agent, state);
-    async move {
+    crate::agent_hub::with_registry(hub, async move {
         let outcome = actor.execute().await;
         actor.failure = outcome.as_ref().err().map(ToString::to_string);
         if let Err(error) = &outcome {
@@ -44,7 +45,7 @@ pub(in crate::subagents) fn run(
         }
         drop(actor);
         outcome
-    }
+    })
 }
 
 #[cfg(any(unix, windows))]
@@ -133,12 +134,13 @@ impl Actor {
             &runner.cwd,
             &[],
         );
+        let hub = HubLease::in_registry(std::sync::Arc::clone(&runner.hub));
         Self {
             runner,
             agent,
             state,
             owner: AgentCx::for_current_or_request(),
-            hub: HubLease::empty(),
+            hub,
             lifecycle,
             child: None,
             prompt_snapshot: None,

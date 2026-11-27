@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{ChildChannel, EXCHANGE_TIMEOUT, VERSION, ipc_error, matches_token};
 use crate::agent_cx::AgentCx;
-use crate::agent_hub::{ChildStatus, registry};
+use crate::agent_hub::{ChildStatus, current_registry};
 use crate::cost::{CostAttempt, CostBudget, CostRemote, CostRemoteAttempt, CostSnapshot};
 use crate::error::{Error, Result};
 
@@ -445,9 +445,10 @@ fn live_child(sender: &str, owner: &AgentCx) -> Result<()> {
     // healthy child's account. Wait only before any mutation, with a bound
     // and cancellation checks; never hold the registry while forwarding.
     let deadline = exchange_deadline(owner)?.min(Instant::now() + CONNECT_LIMIT);
+    let registry = current_registry();
     loop {
         check_remaining(owner, deadline)?;
-        let hub = match registry().try_lock() {
+        let hub = match registry.try_lock() {
             Ok(hub) => hub,
             Err(std::sync::TryLockError::WouldBlock) => {
                 std::thread::sleep(IDLE_POLL.min(check_remaining(owner, deadline)?));
@@ -740,6 +741,7 @@ mod tests {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
         child_id: String,
+        hub: crate::agent_hub::SharedHub,
     }
 
     impl Drop for ChannelServer {
@@ -748,7 +750,7 @@ mod tests {
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
-            registry()
+            self.hub
                 .lock()
                 .unwrap()
                 .settle(&self.child_id, ChildStatus::Done);
@@ -759,8 +761,9 @@ mod tests {
     /// drive the production synchronous client on the calling thread.
     fn serve_budget(budget: &CostBudget) -> (RemoteBudget, ChannelServer) {
         let owner = AgentCx::for_testing_with_io();
+        let registry = current_registry();
         let child_id = {
-            let mut hub = registry().lock().unwrap();
+            let mut hub = registry.lock().unwrap();
             let entry = hub
                 .register("cost-socket-fixture", "share parent spend")
                 .unwrap();
@@ -792,6 +795,7 @@ mod tests {
                 stop,
                 thread: Some(thread),
                 child_id,
+                hub: registry,
             },
         )
     }
@@ -853,6 +857,39 @@ mod tests {
                 "a child cannot borrow its parent's credential"
             );
         }
+    }
+
+    #[test]
+    fn cost_channel_keeps_its_hub_across_thread_polling_and_foreign_scope_cleanup() {
+        let owner = AgentCx::for_testing_with_io();
+        let _current = owner.cx().clone().set_current_restricted();
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = crate::agent_hub::AgentHubRegistry::default();
+        registry.set_dir_for_tests(dir.path().to_path_buf());
+        let own = Arc::new(std::sync::Mutex::new(registry));
+        let foreign = Arc::new(std::sync::Mutex::new(
+            crate::agent_hub::AgentHubRegistry::default(),
+        ));
+        let parent = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        let (remote, server) = {
+            let _scope = crate::agent_hub::enter_registry(Arc::clone(&own));
+            serve_budget(&parent)
+        };
+        let child_id = server.child_id.clone();
+        let _foreign_scope = crate::agent_hub::enter_registry(Arc::clone(&foreign));
+        let child = CostBudget::remote(Arc::new(remote)).unwrap();
+        child.record(0.25).unwrap();
+        assert!((parent.spent() - 0.25).abs() < f64::EPSILON);
+        assert!(foreign.lock().unwrap().roster().is_empty());
+        assert!(Arc::ptr_eq(&current_registry(), &foreign));
+
+        drop(server);
+        assert_eq!(
+            own.lock().unwrap().get(&child_id).unwrap().status,
+            ChildStatus::Done
+        );
+        assert!(foreign.lock().unwrap().roster().is_empty());
+        assert!(Arc::ptr_eq(&current_registry(), &foreign));
     }
 
     #[test]
@@ -1350,7 +1387,8 @@ mod tests {
                 .unwrap()
                 .contains("PI_HUB_IPC_PERMISSION")
         );
-        registry()
+        server
+            .hub
             .lock()
             .unwrap()
             .mark_process_reaped(&server.child_id);

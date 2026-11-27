@@ -343,8 +343,9 @@ fn render(reference: &str, entry: &ChildEntry, encoded: Option<&str>) -> Result<
 }
 
 pub(super) fn resolve(reference: &str) -> Result<ResolvedDoc> {
+    let hub = crate::agent_hub::current_registry();
     if reference.is_empty() {
-        let mut roster = crate::agent_hub::registry()
+        let mut roster = hub
             .lock()
             .map_err(|_| error("PI_URL_AGENT_HUB_UNAVAILABLE", "agent registry is poisoned"))?
             .roster();
@@ -367,7 +368,7 @@ pub(super) fn resolve(reference: &str) -> Result<ResolvedDoc> {
             })
             .collect();
         let truncated = total > MAX_ROSTER_ENTRIES;
-        let metadata = json!({"total": total, "truncated": truncated, "scope": "parentProcess"});
+        let metadata = json!({"total": total, "truncated": truncated, "scope": "parentSession"});
         return Ok(document(
             reference,
             &serde_json::to_string_pretty(&json!({
@@ -378,14 +379,14 @@ pub(super) fn resolve(reference: &str) -> Result<ResolvedDoc> {
         ));
     }
     let parsed = Reference::parse(reference)?;
-    let entry = crate::agent_hub::registry()
+    let entry = hub
         .lock()
         .map_err(|_| error("PI_URL_AGENT_HUB_UNAVAILABLE", "agent registry is poisoned"))?
         .get(parsed.id)
         .ok_or_else(|| {
             error(
                 "PI_URL_AGENT_NOT_FOUND",
-                "unknown child in this parent process; read agent:// for its roster",
+                "unknown child in this session; read agent:// for its roster",
             )
         })?;
     // Never hold the hub mutex during cache access, decoding or redaction.
@@ -431,6 +432,64 @@ mod tests {
             error: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn session_urls_do_not_share_rosters_or_results_for_reused_child_ids() {
+        let first_dir = tempfile::tempdir().expect("first hub directory");
+        let second_dir = tempfile::tempdir().expect("second hub directory");
+        let first = crate::jobs::JobSessionScope::fixed("saved-session")
+            .agent_hub_for_session("saved-session")
+            .expect("first live hub");
+        let second = crate::jobs::JobSessionScope::fixed("saved-session")
+            .agent_hub_for_session("saved-session")
+            .expect("second live hub");
+        let register = |hub: &crate::agent_hub::SharedHub, dir: PathBuf, owner: &str| {
+            let mut hub = hub.lock().expect("hub");
+            hub.set_dir_for_tests(dir);
+            let child = hub.register("worker", owner).expect("register");
+            hub.settle(&child.id, ChildStatus::Done);
+            hub.get(&child.id).expect("settled child")
+        };
+        let first_child = register(&first, first_dir.path().to_path_buf(), "first");
+        let second_child = register(&second, second_dir.path().to_path_buf(), "second");
+        assert_eq!(first_child.id, second_child.id);
+        publish(
+            &first_child,
+            "first result",
+            Some(&json!({"owner": "first"})),
+            Some(true),
+            None,
+        );
+        publish(
+            &second_child,
+            "second result",
+            Some(&json!({"owner": "second"})),
+            Some(true),
+            None,
+        );
+        let private_child = first
+            .lock()
+            .expect("first hub")
+            .register("private", "first session only")
+            .expect("private child");
+
+        for (hub, expected, roster_count) in [
+            (Arc::clone(&first), "first", 2),
+            (Arc::clone(&second), "second", 1),
+        ] {
+            let _scope = crate::agent_hub::enter_registry(hub);
+            let selected = resolve(&format!("{}/owner", first_child.id)).expect("owned result");
+            assert_eq!(selected.content, expected);
+            let roster = resolve("").expect("session roster");
+            assert_eq!(roster.metadata["total"], roster_count);
+            assert_eq!(roster.metadata["scope"], "parentSession");
+        }
+        let _scope = crate::agent_hub::enter_registry(second);
+        let error = resolve(&private_child.id)
+            .err()
+            .expect("foreign child is not visible");
+        assert!(error.to_string().contains("PI_URL_AGENT_NOT_FOUND"));
     }
 
     #[test]
