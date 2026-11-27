@@ -454,7 +454,12 @@ fn ensure_private_sqlite_permissions(path: &Path) -> Result<()> {
 }
 
 fn read_stored_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
-    entry_io::read_entries(conn)
+    let mut entries = entry_io::read_entries(conn)?;
+    if entries.iter().any(|entry| entry.base_id().is_none()) {
+        // Reconcile the persisted prefix using the same IDs that resume exposes.
+        crate::session::normalize_loaded_entry_ids(&mut entries);
+    }
+    Ok(entries)
 }
 
 fn read_all_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
@@ -716,6 +721,7 @@ pub async fn load_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntr
             .ok_or_else(|| Error::session("SQLite session missing header row"))?;
 
         let entries = read_all_entries(&conn)?;
+        crate::session::validate_loaded_session_entry_graph(&entries)?;
         snapshot.finish()?;
 
         Ok((header, entries))
@@ -927,6 +933,97 @@ mod tests {
             name,
             source: None,
         })
+    }
+
+    // Write raw rows so the writer's graph checks cannot repair or reject
+    // the historical/corrupt states the reader needs to handle.
+    fn seed_sqlite_history(path: &Path, entries: &[SessionEntry]) -> Result<SessionHeader> {
+        let header = SessionHeader::default();
+        with_write_connection(path, |conn| {
+            map_sqlite_result(conn.execute_raw(INIT_SQL))?;
+            map_sqlite_result(conn.execute_sync(
+                "INSERT INTO pi_session_header (id,json) VALUES (?1,?2)",
+                &[
+                    SqliteValue::from(header.id.clone()),
+                    SqliteValue::from(serde_json::to_string(&header)?),
+                ],
+            ))?;
+            insert_entry_jsons(conn, entries.iter().map(entry_io::encode_entry), 0)
+        })?;
+        Ok(header)
+    }
+
+    #[test]
+    fn sqlite_resume_rejects_ambiguous_ids_and_cycles_before_replay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = message_entry_with_id("root", "first");
+        let duplicate = message_entry_with_id("root", "second");
+        let mut cyclic = message_entry_with_id("child", "cyclic");
+        cyclic.base_mut().parent_id = Some("child".to_string());
+        for (name, entry, expected) in [
+            ("duplicate", duplicate, "duplicate entry ID"),
+            ("cycle", cyclic, "parent graph contains a cycle"),
+        ] {
+            let path = dir.path().join(format!("{name}.sqlite"));
+            seed_sqlite_history(&path, &[root.clone(), entry]).expect("seed raw rows");
+            let err = futures::executor::block_on(load_session(&path))
+                .expect_err("invalid graph reached replay");
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn sqlite_resume_reports_orphan_and_fences_persistence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("orphan.sqlite");
+        let mut child = message_entry_with_id("child", "recoverable");
+        child.base_mut().parent_id = Some("absent".to_string());
+        seed_sqlite_history(&path, &[child]).expect("seed orphan");
+        futures::executor::block_on(async {
+            let (mut session, diagnostics) = crate::session::Session::open_with_diagnostics(
+                path.to_str().expect("fixture path"),
+            )
+            .await?;
+            assert_eq!(diagnostics.orphaned_parent_links.len(), 1);
+            let orphan = &diagnostics.orphaned_parent_links[0];
+            assert_eq!(orphan.entry_id, "child");
+            assert_eq!(orphan.missing_parent_id, "absent");
+            let err = session.save().await.expect_err("recovery is read-only");
+            assert!(
+                err.to_string()
+                    .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
+            );
+            Ok::<_, Error>(())
+        })
+        .expect("inspect recoverable SQLite session");
+    }
+
+    #[test]
+    fn idless_sqlite_history_survives_incremental_append_and_full_rewrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.sqlite");
+        let mut legacy = message_entry();
+        legacy.base_mut().id = None;
+        let header = seed_sqlite_history(&path, &[legacy]).expect("seed legacy row");
+        futures::executor::block_on(async {
+            let (_, original) = load_session(&path).await?;
+            let parent = original[0].base_id().expect("stable legacy ID").clone();
+            let mut child = message_entry_with_id("child", "new turn");
+            child.base_mut().parent_id = Some(parent.clone());
+            append_entries(&path, &header.id, &[child], 1).await?;
+            let (_, appended) = load_session(&path).await?;
+            assert_eq!(appended.len(), 2);
+            assert_eq!(appended[0].base_id(), Some(&parent));
+            assert_eq!(appended[1].base().parent_id.as_ref(), Some(&parent));
+            save_session(&path, &header, &appended, false).await?;
+            let (_, rewritten) = load_session(&path).await?;
+            assert_eq!(
+                serde_json::to_value(rewritten)?,
+                serde_json::to_value(appended)?
+            );
+            Ok::<_, Error>(())
+        })
+        .expect("append and checkpoint a legacy SQLite session");
     }
 
     #[test]
