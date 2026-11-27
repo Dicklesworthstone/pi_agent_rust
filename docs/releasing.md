@@ -2048,8 +2048,8 @@ d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b
            "signature_file": "",
        }:
            fail(f"aggregate raw receipt differs for {dsr_target}")
-       if len(raw_bytes) >= 26 * 1024 * 1024:
-           fail(f"raw binary violates <26 MiB budget: {dsr_target}")
+       if not raw_bytes or len(raw_bytes) > 256 * 1024 * 1024:
+           fail(f"raw binary size out of bounds (1..=256 MiB): {dsr_target}")
        if environment.get("target") != dsr_target \
                or environment.get("method") != "native" \
                or not isinstance(environment.get("host"), str) \

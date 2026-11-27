@@ -1127,15 +1127,18 @@ fn clip_exe_payload(text: &str) -> Vec<u8> {
 fn copy_via_clip_exe(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("clip.exe")
+    let mut command = Command::new("clip.exe");
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&clip_exe_payload(text))?;
-    }
+        .stderr(Stdio::null());
+    let mut child = crate::tools::guard_process_spawn(|| command.spawn())?;
+    let write_result = child
+        .stdin
+        .take()
+        .map_or(Ok(()), |mut stdin| stdin.write_all(&clip_exe_payload(text)));
     let status = child.wait()?;
+    write_result?;
     if status.success() {
         Ok(())
     } else {
