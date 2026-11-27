@@ -241,6 +241,9 @@ pub(super) async fn load(
             .map_err(|error| {
                 HistoryError::internal(format!("Cannot load ACP extensions: {error}"))
             })?;
+        super::planning::restore(&mut state, cx)
+            .await
+            .map_err(|error| HistoryError::internal(format!("Cannot restore session planning state: {error}")))?;
         super::arm_acp_prewalk(&mut state, options)
             .await
             .map_err(|error| HistoryError::invalid(format!("Cannot arm prewalk: {error}")))?;
@@ -314,7 +317,7 @@ pub(super) async fn fork(
     let servers = super::mcp::parse_servers(params, &cwd, options.launch.no_mcp)
         .map_err(HistoryError::invalid)?
         .unwrap_or_default();
-    if out.prompt_is_active(id)
+    if out.session_is_busy(id)
         || out.shared.files.has_write(id)
         || out.shared.terminals.has_unsettled(id)
     {
@@ -447,6 +450,8 @@ pub(super) async fn fork(
     let (mut candidate, save_enabled) =
         super::new_acp_session(options.session_dir.as_ref(), &options.config, &cwd);
     candidate.init_from_fork_plan(plan);
+    crate::plan::inherit_fork_checkpoint(&mut candidate, &source.header.id)
+        .map_err(|error| HistoryError::invalid(format!("Cannot inherit fork planning state: {error}")))?;
     // A new session receives exactly the request's workspace authority. ACP
     // does not currently offer additional roots, even if a terminal source did.
     candidate.set_additional_roots(&[]);
@@ -494,6 +499,9 @@ pub(super) async fn fork(
         .map_err(|error| {
             HistoryError::internal(format!("Cannot load fork ACP extensions: {error}"))
         })?;
+    super::planning::restore(&mut state, cx)
+        .await
+        .map_err(|error| HistoryError::internal(format!("Cannot restore fork planning state: {error}")))?;
     super::arm_acp_prewalk(&mut state, &options)
         .await
         .map_err(|error| HistoryError::invalid(format!("Cannot arm fork prewalk: {error}")))?;

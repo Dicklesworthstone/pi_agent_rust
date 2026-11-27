@@ -16,6 +16,7 @@
 //!   follow-up queue without starting a second prompt
 //! - `session/list`, `session/load`, `session/resume` — session management
 //! - `session/fork` — create an independent active conversation from a session
+//! - `session/set_mode` — select read-only planning or code mode
 //! - `session/set_model` — switch the live session's provider/model at runtime
 //! - `session/set_config_option` — set a runtime option (e.g. thinking/effort)
 //!
@@ -36,6 +37,7 @@ mod commands;
 mod content;
 mod history;
 mod mcp;
+mod planning;
 #[cfg(test)]
 mod recovery_tests;
 mod steering;
@@ -63,7 +65,7 @@ use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, timeout, wall_now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -194,6 +196,7 @@ struct AcpOutputState {
     failure: Option<&'static str>,
     stopping: bool,
     prompts: HashMap<String, AcpPromptState>,
+    mode_changes: HashSet<String>,
 }
 
 struct AcpPromptState {
@@ -315,8 +318,8 @@ impl AcpOutput {
             abort.abort();
             return Err(Error::session("ACP output is closed to new prompts"));
         }
-        if state.prompts.contains_key(&session_id) {
-            return Err(Error::session("ACP session already has an active prompt"));
+        if state.prompts.contains_key(&session_id) || state.mode_changes.contains(&session_id) {
+            return Err(Error::session("ACP session already has an active prompt or mode change"));
         }
         if self.shared.files.has_write(&session_id) {
             return Err(Error::session(
@@ -526,14 +529,12 @@ impl AcpOutput {
         self.shared.terminals.shutdown(self);
         let drain = async {
             loop {
-                if self
-                    .shared
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .prompts
-                    .is_empty()
-                {
+                let settled = {
+                    let state = self.shared.state.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.prompts.is_empty() && state.mode_changes.is_empty()
+                };
+                if settled {
                     return;
                 }
                 sleep(wall_now(), Duration::from_millis(5)).await;
@@ -1489,7 +1490,7 @@ async fn run_with_input(
 
                         // Per spec, only one prompt turn may be active per session.
                         {
-                            let has_active = out_tx.prompt_is_active(&session_id);
+                            let has_active = out_tx.session_is_busy(&session_id);
                             if has_active {
                                 let _ = out_tx.send(json_rpc_error(
                                     id,
@@ -1692,7 +1693,7 @@ async fn run_with_input(
                         };
                         // Check the reservation as well as agent_session: a spawned
                         // prompt may not yet have taken the agent out of its state.
-                        let busy = out_tx.prompt_is_active(session_id)
+                        let busy = out_tx.session_is_busy(session_id)
                             || out_tx.shared.files.has_write(session_id)
                             || out_tx.shared.terminals.has_unsettled(session_id);
                         if busy {
@@ -1749,6 +1750,13 @@ async fn run_with_input(
                             .map_err(|error| Error::session(error.message))?;
                     }
 
+                    "session/set_mode" => {
+                        planning::dispatch(
+                            &request.params, id, false, initialized.load(Ordering::SeqCst),
+                            &sessions, &cx, &out_tx, &options.runtime_handle,
+                        ).await;
+                    }
+
                     // Dynamic, per-session model switch (#105). Switches the live
                     // session's provider/model so clients can change models at runtime
                     // (e.g. to gpt-5.5) without restarting or editing static config.
@@ -1766,11 +1774,11 @@ async fn run_with_input(
                             ));
                             continue;
                         };
-                        if out_tx.prompt_is_active(&session_id) {
+                        if out_tx.session_is_busy(&session_id) {
                             let _ = out_tx.send(json_rpc_error(
                                 id,
                                 PROMPT_IN_PROGRESS,
-                                "Cannot change model while a prompt is in progress",
+                                "Cannot change model while a prompt or mode change is in progress",
                             ));
                             continue;
                         }
@@ -1822,6 +1830,13 @@ async fn run_with_input(
                     // restart-only options return a structured error (never a silent
                     // success). See the runtime-vs-restart contract above.
                     "session/set_config_option" => {
+                        if config_option_id(&request.params) == Some("mode") {
+                            planning::dispatch(
+                                &request.params, id, true, initialized.load(Ordering::SeqCst),
+                                &sessions, &cx, &out_tx, &options.runtime_handle,
+                            ).await;
+                            continue;
+                        }
                         let session_id = request
                             .params
                             .get("sessionId")
@@ -1835,11 +1850,11 @@ async fn run_with_input(
                             ));
                             continue;
                         };
-                        if out_tx.prompt_is_active(&session_id) {
+                        if out_tx.session_is_busy(&session_id) {
                             let _ = out_tx.send(json_rpc_error(
                                 id,
                                 PROMPT_IN_PROGRESS,
-                                "Cannot change configuration while a prompt is in progress",
+                                "Cannot change configuration while a prompt or mode change is in progress",
                             ));
                             continue;
                         }
@@ -2533,10 +2548,10 @@ fn build_acp_system_prompt(
     Ok(prompt)
 }
 
-/// Apply the host's requested tools or defaults plus trusted settings,
-/// excluding approval tools with no ACP surface. Every call still reaches
-/// the editor's permission hook because ACP sessions carry no terminal approval
-/// state.
+/// Apply the host's requested tools or defaults plus trusted settings.
+/// Ask has no ACP form surface; submit_plan is installed by the native SDK
+/// only after entering plan mode, bound to this session's exact review owner.
+/// Every tool still reaches the editor's ordinary permission hook.
 fn acp_enabled_tools(cli: &crate::cli::Cli, config: &Config) -> Vec<String> {
     const HOST_COUPLED: [&str; 2] = ["ask", "submit_plan"];
     cli.enabled_tools(config)
@@ -3215,7 +3230,7 @@ fn config_options_with_models(models: &AcpModelState, thinking: &str) -> Value {
 }
 
 /// New, loaded and resumed sessions expose identical discovery contracts.
-/// Do not advertise `modes`: this server has no `session/set_mode` handler.
+/// Mode options and the ACP v1 mode surface share the native planning state.
 fn session_setup_response(session_id: &str, state: &AcpSessionState) -> Result<Option<Value>> {
     let Some(handle) = state.agent_session.as_ref() else {
         return Ok(None);
@@ -3223,15 +3238,22 @@ fn session_setup_response(session_id: &str, state: &AcpSessionState) -> Result<O
     let (provider, model) = handle.model();
     let available = live_acp_models(handle, &state.available_models, &state.config, &state.cwd)?;
     let models = session_model_state((&provider, &model), &available);
-    let config_options = config_options_with_models(
+    let mut config_options = config_options_with_models(
         &models,
         &handle.thinking_level().unwrap_or_default().to_string(),
     );
-    Ok(Some(json!({
+    planning::append_option(
+        &mut config_options, &handle.session().agent.plan_state(), planning::enabled(handle),
+    );
+    let mut response = json!({
         "sessionId": session_id,
         "models": models,
         "configOptions": config_options,
-    })))
+    });
+    if let Some(modes) = planning::modes(handle) {
+        response["modes"] = modes;
+    }
+    Ok(Some(response))
 }
 
 /// [`session_config_options`] for a live session, or `None` while a prompt
@@ -3289,11 +3311,15 @@ fn config_options_for_handle(
 ) -> Result<Value> {
     let (provider, model) = handle.model();
     let available = live_acp_models(handle, available_models, config, cwd)?;
-    Ok(session_config_options(
+    let mut options = session_config_options(
         (&provider, &model),
         &handle.thinking_level().unwrap_or_default().to_string(),
         &available,
-    ))
+    );
+    planning::append_option(
+        &mut options, &handle.session().agent.plan_state(), planning::enabled(handle),
+    );
+    Ok(options)
 }
 
 fn config_options_update(session_id: &str, configuration: &Value) -> String {
@@ -3342,9 +3368,12 @@ struct AcpRecoveryUpdates {
     available_models: Vec<ModelEntry>,
     model_catalog: crate::agent::ExtensionModelCatalog,
     live_extensions: bool,
+    plan_state: crate::plan::PlanState,
+    plan_tools_enabled: bool,
     config: Arc<Config>,
     cwd: PathBuf,
     last_configuration: StdMutex<Value>,
+    last_mode: StdMutex<&'static str>,
 }
 
 impl AcpRecoveryUpdates {
@@ -3368,9 +3397,12 @@ impl AcpRecoveryUpdates {
             available_models,
             model_catalog: handle.session().extension_model_catalog(),
             live_extensions: handle.extension_manager().is_some(),
+            plan_state: handle.session().agent.plan_state(),
+            plan_tools_enabled: planning::enabled(handle),
             config,
             cwd,
             last_configuration: StdMutex::new(configuration),
+            last_mode: StdMutex::new(planning::current_mode(&handle.session().agent.plan_state())),
         })
     }
 
@@ -3470,7 +3502,9 @@ impl AcpRecoveryUpdates {
             let thinking = session
                 .effective_thinking_level_for_current_path()
                 .unwrap_or_else(|| "off".to_string());
-            session_config_options((provider, model), &thinking, &available)
+            let mut options = session_config_options((provider, model), &thinking, &available);
+            planning::append_option(&mut options, &self.plan_state, self.plan_tools_enabled);
+            options
         };
         self.configuration(&configuration);
     }
@@ -3492,6 +3526,20 @@ impl AcpRecoveryUpdates {
     }
 
     fn finish(&self, handle: &AgentSessionHandle) {
+        if self.plan_tools_enabled {
+            let state = handle.session().agent.plan_state();
+            let mode = planning::current_mode(&state);
+            let changed = {
+                let mut previous = self.last_mode.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let changed = *previous != mode;
+                *previous = mode;
+                changed
+            };
+            if changed {
+                let _ = self.out.send(planning::mode_update(&self.session_id, state.mode()));
+            }
+        }
         match config_options_for_handle(handle, &self.available_models, &self.config, &self.cwd) {
             Ok(configuration) => self.configuration(&configuration),
             Err(error) => self.notice(&format!("Model catalog unavailable: {error}")),
@@ -3788,10 +3836,10 @@ async fn run_prompt(
     );
     let recovery_callback = Arc::clone(&recovery_updates);
     let event_handler = build_acp_event_handler(out_tx.clone(), session_id.clone());
-    let on_event = move |event| {
+    let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |event| {
         recovery_callback.observe(&event);
         event_handler(event);
-    };
+    });
     let commands_before = commands::available(Some(&agent_session), mcp_state.is_some());
     let (mcp_command, extension_command) = match command {
         Some(commands::PromptCommand::Mcp(command)) => (Some(command), None),
@@ -3812,26 +3860,44 @@ async fn run_prompt(
     let stop_reason = if let Some(reason) = prepared {
         reason
     } else if let Some((name, args)) = extension_command {
-        commands::execute(
+        let command_events = Arc::clone(&on_event);
+        let guidance = planning::PromptGuidance::install(&mut agent_session);
+        let outcome = commands::execute(
             &mut agent_session,
             &name,
             &args,
-            abort_signal,
+            abort_signal.clone(),
             &out_tx,
             &session_id,
-            on_event,
+            move |event| command_events(event),
         )
-        .await
+        .await;
+        if let Some(guidance) = guidance {
+            guidance.remove(&mut agent_session);
+        }
+        if outcome.succeeded && outcome.stop_reason == ACP_STOP_REASON_END_TURN {
+            match planning::finish_command(
+                &mut agent_session, abort_signal, &cx, &out_tx, &session_id,
+                &recovery_updates, on_event,
+            ).await {
+                Some(result) => finish_prompt_result(&out_tx, &session_id, result).await,
+                None => outcome.stop_reason,
+            }
+        } else {
+            outcome.stop_reason
+        }
     } else {
         let AcpPrompt {
             content,
             authored_text,
         } = prompt;
-        match agent_session
+        let initial_events = Arc::clone(&on_event);
+        let guidance = planning::PromptGuidance::install(&mut agent_session);
+        let initial = agent_session
             .run_recoverable_turn_with_handoff(
                 Some(crate::model::UserContent::Blocks(content)),
-                abort_signal,
-                on_event,
+                abort_signal.clone(),
+                move |event| initial_events(event),
                 move |agent| {
                     // Install provenance only when native input is admitted.
                     // Startup rejection/cancellation cannot leave an override
@@ -3839,40 +3905,15 @@ async fn run_prompt(
                     agent.set_magic_keyword_scan_override(Some(authored_text));
                 },
             )
-            .await
-        {
-            Ok(message) if message.stop_reason == crate::model::StopReason::Error => {
-                let error = Error::provider(
-                    message.provider,
-                    message
-                        .error_message
-                        .unwrap_or_else(|| "Request failed".to_string()),
-                );
-                report_prompt_error(&out_tx, &session_id, &error).await
-            }
-            Ok(message) => {
-                // Synthetic boundary messages have no provider stream. Publish
-                // only after the SDK completes this turn's durable persistence.
-                if let Some(marker) = crate::agent::time_cap_marker(&message) {
-                    let _ = history::send_line(
-                        &out_tx,
-                        json_rpc_notification(
-                            "session/update",
-                            json!({
-                                "sessionId": session_id,
-                                "update": {
-                                    "sessionUpdate": "agent_message_chunk",
-                                    "content": { "type": "text", "text": marker },
-                                },
-                            }),
-                        ),
-                    )
-                    .await;
-                }
-                map_stop_reason(message.stop_reason)
-            }
-            Err(error) => report_prompt_error(&out_tx, &session_id, &error).await,
+            .await;
+        if let Some(guidance) = guidance {
+            guidance.remove(&mut agent_session);
         }
+        let result = planning::finish_turn(
+            &mut agent_session, initial, abort_signal, &cx, &out_tx, &session_id,
+            &recovery_updates, on_event,
+        ).await;
+        finish_prompt_result(&out_tx, &session_id, result).await
     };
 
     // Seal native delivery before owner cleanup can yield again. The prompt
@@ -3903,6 +3944,39 @@ async fn run_prompt(
     }
 
     stop_reason
+}
+
+/// Render a completed native turn only after its durable SDK outcome.
+async fn finish_prompt_result(
+    out: &AcpOutput,
+    session_id: &str,
+    result: Result<crate::model::AssistantMessage>,
+) -> &'static str {
+    match result {
+        Ok(message) if message.stop_reason == crate::model::StopReason::Error => {
+            let error = Error::provider(
+                message.provider,
+                message.error_message.unwrap_or_else(|| "Request failed".to_string()),
+            );
+            report_prompt_error(out, session_id, &error).await
+        }
+        Ok(message) => {
+            if let Some(marker) = crate::agent::time_cap_marker(&message) {
+                let _ = history::send_line(
+                    out,
+                    json_rpc_notification("session/update", json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": marker },
+                        },
+                    })),
+                ).await;
+            }
+            map_stop_reason(message.stop_reason)
+        }
+        Err(error) => report_prompt_error(out, session_id, &error).await,
+    }
 }
 
 /// ACP has no error stop reason. Emit one notice after the complete session
@@ -6276,6 +6350,97 @@ mod tests {
                 assert!(!text.contains("PRIVATE-CREDENTIAL"));
                 assert!(!text.contains("PRIVATE-PROMPT"));
             }
+        });
+    }
+
+    #[test]
+    fn acp_plan_guidance_is_temporary_across_success_error_and_cancellation() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for outcome in [PromptTestOutcome::Complete, PromptTestOutcome::OpenError, PromptTestOutcome::Aborted] {
+                let root = tempfile::tempdir().unwrap();
+                let (state, provider, _) = prompt_test_state(root.path(), outcome, false).await;
+                let cx = AgentCx::for_current_or_request();
+                {
+                    let mut state = state.lock(&cx).await.unwrap();
+                    let handle = state.agent_session.as_mut().unwrap();
+                    handle.session_mut().agent.set_system_prompt(Some("Original editor prompt".into()));
+                    let change = handle.enter_plan_mode(&cx).await.unwrap();
+                    assert_eq!(change.persistence, crate::plan::PlanPersistence::Saved);
+                    let guide = planning::PromptGuidance::install(handle).unwrap();
+                    let changed = format!("{}\nExtension-owned addition", handle.session().agent.system_prompt().unwrap());
+                    handle.session_mut().agent.set_system_prompt(Some(changed));
+                    guide.remove(handle);
+                    assert_eq!(handle.session().agent.system_prompt(), Some("Original editor prompt\nExtension-owned addition"));
+                }
+                let (_, signal) = AbortHandle::new();
+                let (reason, _) = drive_test_prompt(Arc::clone(&state), signal).await;
+                assert_eq!(reason, if matches!(outcome, PromptTestOutcome::Aborted) {
+                    ACP_STOP_REASON_CANCELLED
+                } else {
+                    ACP_STOP_REASON_END_TURN
+                });
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                let mut state = state.lock(&cx).await.unwrap();
+                let handle = state.agent_session.as_mut().unwrap();
+                assert_eq!(handle.session().agent.system_prompt(), Some("Original editor prompt\nExtension-owned addition"));
+                let change = handle.exit_plan_mode(&cx).await.unwrap();
+                assert_eq!(change.mode, crate::plan::PlanMode::Off);
+                assert!(planning::PromptGuidance::install(handle).is_none());
+                assert_eq!(handle.session().agent.system_prompt(), Some("Original editor prompt\nExtension-owned addition"));
+            }
+        });
+    }
+
+    #[test]
+    fn acp_plan_mode_save_failure_reports_live_state_and_fences_provider_reentry() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, stored) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            let original = stored.try_lock().unwrap().path.clone();
+            stored.try_lock().unwrap().path = Some(root.path().to_path_buf());
+            let session_id = "planning-save-failure";
+            let sessions = Arc::new(Mutex::new(HashMap::from([(
+                session_id.to_string(), Arc::clone(&state),
+            )])));
+            let (sender, receiver) = std::sync::mpsc::sync_channel(16);
+            let output = AcpOutput::new(sender);
+            let cx = AgentCx::for_current_or_request();
+            planning::dispatch(
+                &json!({"sessionId": session_id, "modeId": "plan"}),
+                json!(81), false, true, &sessions, &cx, &output, &runtime.handle(),
+            ).await;
+            let response = timeout(wall_now(), Duration::from_secs(10), Box::pin(async {
+                loop {
+                    if let Ok(line) = receiver.try_recv() {
+                        let frame: Value = serde_json::from_str(&line).unwrap();
+                        if frame.get("id") == Some(&json!(81)) {
+                            break frame;
+                        }
+                    }
+                    sleep(wall_now(), Duration::from_millis(1)).await;
+                }
+            })).await.expect("mode selection response");
+            assert_eq!(response["error"]["code"], INTERNAL_ERROR);
+            assert_eq!(response["error"]["data"]["applied"], true);
+            assert_eq!(response["error"]["data"]["currentModeId"], "plan");
+            assert_eq!(response["error"]["data"]["planPersistence"], "unconfirmed");
+            assert!(!response.to_string().contains(&root.path().display().to_string()));
+            {
+                let guard = state.try_lock().unwrap();
+                let handle = guard.agent_session.as_ref().unwrap();
+                assert_eq!(handle.session().agent.plan_state().mode(), crate::plan::PlanMode::Planning);
+                assert!(handle.session().ensure_provider_reentry_allowed().unwrap_err().is_session_persistence());
+            }
+            assert!(!output.session_is_busy(session_id), "failure retires the mode reservation");
+            stored.try_lock().unwrap().path = original;
+            let (_, signal) = AbortHandle::new();
+            let (reason, updates) = drive_test_prompt(state, signal).await;
+            assert_eq!(reason, ACP_STOP_REASON_ERROR);
+            assert!(prompt_notice_text(&updates[0]).contains("Session persistence failed"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         });
     }
 

@@ -126,6 +126,17 @@ async fn emit_text(out: &AcpOutput, id: &str, text: &str) {
     .await;
 }
 
+pub(super) struct CommandOutcome {
+    pub(super) stop_reason: &'static str,
+    pub(super) succeeded: bool,
+}
+
+impl CommandOutcome {
+    fn failed(stop_reason: &'static str) -> Self {
+        Self { stop_reason, succeeded: false }
+    }
+}
+
 pub(super) async fn execute(
     handle: &mut AgentSessionHandle,
     name: &str,
@@ -134,10 +145,10 @@ pub(super) async fn execute(
     out: &AcpOutput,
     id: &str,
     on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-) -> &'static str {
+) -> CommandOutcome {
     let prior_entries = match existing_entries(handle).await {
         Ok(entries) => entries,
-        Err(error) => return report_prompt_error(out, id, &error).await,
+        Err(error) => return CommandOutcome::failed(report_prompt_error(out, id, &error).await),
     };
     let terminal = Arc::new(StdMutex::new(None));
     let observed_terminal = Arc::clone(&terminal);
@@ -207,7 +218,7 @@ pub(super) async fn execute(
     if !result.as_ref().is_err_and(Error::is_session_persistence)
         && let Err(error) = handle.session_mut().persist_session().await
     {
-        return report_prompt_error(out, id, &error).await;
+        return CommandOutcome::failed(report_prompt_error(out, id, &error).await);
     }
 
     // Persistence failure must not make an uncommitted message look durable.
@@ -242,34 +253,33 @@ pub(super) async fn execute(
                     emit_text(out, id, &message).await;
                 }
             }
-            Err(error) => return report_prompt_error(out, id, &error).await,
+            Err(error) => return CommandOutcome::failed(report_prompt_error(out, id, &error).await),
         }
     }
 
     let value = match result {
         Ok(value) => value,
-        Err(error) => return report_prompt_error(out, id, &error).await,
+        Err(error) => return CommandOutcome::failed(report_prompt_error(out, id, &error).await),
     };
     if abort.is_aborted() {
-        return ACP_STOP_REASON_CANCELLED;
+        return CommandOutcome::failed(ACP_STOP_REASON_CANCELLED);
     }
     let terminal = terminal
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     if matches!(terminal, Some((StopReason::Aborted, _, _))) {
-        return ACP_STOP_REASON_CANCELLED;
+        return CommandOutcome::failed(ACP_STOP_REASON_CANCELLED);
     }
     if let Some((StopReason::Error, provider, message)) = terminal.as_ref() {
-        return report_prompt_error(
+        return CommandOutcome::failed(report_prompt_error(
             out,
             id,
             &Error::provider(
                 provider.clone(),
                 message.clone().unwrap_or_else(|| "Request failed".into()),
             ),
-        )
-        .await;
+        ).await);
     }
     if !value.is_null() {
         let text = value
@@ -277,7 +287,8 @@ pub(super) async fn execute(
             .map_or_else(|| value.to_string(), str::to_string);
         emit_text(out, id, &format!("/{name} → {text}")).await;
     }
-    terminal.map_or(ACP_STOP_REASON_END_TURN, |(reason, _, _)| {
-        map_stop_reason(reason)
-    })
+    CommandOutcome {
+        stop_reason: terminal.map_or(ACP_STOP_REASON_END_TURN, |(reason, _, _)| map_stop_reason(reason)),
+        succeeded: true,
+    }
 }

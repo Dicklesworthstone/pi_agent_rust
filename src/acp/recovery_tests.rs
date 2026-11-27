@@ -540,10 +540,11 @@ fn assert_discovery_state(result: &Value, current: &str, expected: &[&str]) {
     expected.sort_unstable();
     assert_eq!(ids, expected);
     assert!(ids.contains(&current), "active model must be selectable");
-    assert!(
-        result.get("modes").is_none(),
-        "do not advertise unsupported mode selectors"
-    );
+    assert_eq!(result["modes"]["currentModeId"], "code");
+    assert_eq!(result["modes"]["availableModes"][1]["id"], "plan");
+    let mode = config.iter().find(|option| option["id"] == "mode").unwrap();
+    assert_eq!(mode["category"], "mode");
+    assert_eq!(mode["currentValue"], "code");
 }
 
 fn assert_discovery_update(transcript: &[Value], id: u64, session: &str, current: &str) {
@@ -3420,4 +3421,398 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
     );
 
     provider.finish(2);
+}
+
+
+async fn next_planning_frame(output: &std::sync::mpsc::Receiver<String>) -> Value {
+    loop {
+        match output.try_recv() {
+            Ok(line) => return serde_json::from_str(&line).expect("valid ACP planning frame"),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                sleep(wall_now(), Duration::from_millis(1)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("ACP stopped before completing the planning operation");
+            }
+        }
+    }
+}
+
+fn answer_planning_permission(
+    input: &asupersync::channel::mpsc::Sender<String>,
+    frame: &Value,
+    option: &str,
+) {
+    input.try_send(json!({
+        "jsonrpc": "2.0", "id": frame["id"],
+        "result": {"outcome": {"outcome": "selected", "optionId": option}},
+    }).to_string()).unwrap();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatcher_plan_review_gates_writes_and_continues_without_a_synthetic_user_message() {
+    for extension_command in [false, true] {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let sessions_root = root.path().join("sessions");
+    let global_dir = root.path().join("global");
+    if extension_command {
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let extensions = root.path().join(".pi/extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::write(extensions.join("plan_command.mjs"), r#"
+            export default function(pi) {
+                pi.registerCommand("build-plan", { handler: async () => {
+                    pi.sendUserMessage("PLAN-REVIEW-USER-INPUT");
+                }});
+            }
+        "#).unwrap();
+    }
+    let plan = "Create approved.txt with reviewed content, then read it to verify the implementation.";
+    let mut provider = ProviderFixture::with_replies(
+        vec![200; 5],
+        vec![
+            Some(("write", json!({"path": "blocked.txt", "content": "must not run"}))),
+            Some(("submit_plan", json!({"plan": plan, "files": ["approved.txt"]}))),
+            None,
+            Some(("write", json!({"path": "approved.txt", "content": "reviewed content"}))),
+            None,
+        ],
+    );
+    let runtime = runtime();
+    let (session_id, source_path, fork_path) = runtime.block_on(bounded_launch_controls(async {
+        let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+        options.session_dir = Some(sessions_root.clone());
+        options.launch.tools = Some("read,write".into());
+        options.launch.no_mcp = true;
+        options.launch.no_context_files = true;
+        if extension_command {
+            options.settings_source = Some(AcpSettingsSource {
+                global_dir: global_dir.clone(),
+                config_override: None,
+                workspace_trust_env: Some("1".into()),
+                launch_cwd: cwd.clone(),
+            });
+        }
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let editor = async {
+            let mut transcript = Vec::new();
+            discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({"protocolVersion": 1})).await;
+            let created = discovery_request(&input, &outgoing, &mut transcript, 2, "session/new", json!({"cwd": cwd})).await;
+            let session_id = created["result"]["sessionId"].as_str().unwrap().to_string();
+            assert_eq!(created["result"]["modes"]["currentModeId"], "code");
+            let selected = discovery_request(&input, &outgoing, &mut transcript, 3, "session/set_config_option", json!({
+                "sessionId": session_id, "configId": "mode", "value": "plan",
+            })).await;
+            assert!(selected.get("error").is_none(), "{selected}");
+            assert_eq!(
+                selected["result"]["configOptions"].as_array().unwrap().iter()
+                    .find(|option| option["id"] == "mode").unwrap()["currentValue"],
+                "plan",
+            );
+            assert!(transcript.iter().any(|frame|
+                frame["params"]["update"]["sessionUpdate"] == "current_mode_update"
+                    && frame["params"]["update"]["currentModeId"] == "plan"
+            ));
+            input.try_send(json!({
+                "jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+                "params": {"sessionId": session_id, "prompt": [{
+                    "type": "text",
+                    "text": if extension_command { "/build-plan" } else { "PLAN-REVIEW-USER-INPUT" },
+                }]},
+            }).to_string()).unwrap();
+            let mut submission_permissions = 0;
+            let mut review_permissions = 0;
+            let mut write_permissions = 0;
+            loop {
+                let frame = next_planning_frame(&outgoing).await;
+                if frame["method"] == "session/request_permission" {
+                    assert_eq!(frame["params"]["sessionId"], session_id);
+                    match frame["params"]["toolCall"]["kind"].as_str() {
+                        Some("switch_mode") => {
+                            review_permissions += 1;
+                            assert_eq!(provider.requests.lock().unwrap().len(), 3);
+                            assert!(!cwd.join("blocked.txt").exists());
+                            assert!(!cwd.join("approved.txt").exists());
+                            let shown = frame["params"]["toolCall"]["content"][0]["content"]["text"].as_str().unwrap();
+                            assert!(shown.contains(plan), "the entire canonical plan must be reviewed");
+                            assert!(shown.contains("approved.txt"), "declared file scopes must be visible");
+                            assert_eq!(frame["params"]["options"].as_array().unwrap().len(), 2);
+                        }
+                        Some("edit") => {
+                            write_permissions += 1;
+                            assert_eq!(review_permissions, 1, "implementation permission follows plan approval");
+                            assert_eq!(frame["params"]["toolCall"]["rawInput"]["path"], "approved.txt");
+                            assert!(!cwd.join("approved.txt").exists(), "plan approval is not tool approval");
+                        }
+                        _ => {
+                            submission_permissions += 1;
+                            assert_eq!(frame["params"]["toolCall"]["title"], "submit_plan");
+                        }
+                    }
+                    answer_planning_permission(&input, &frame, ACP_PERMISSION_ALLOW_ONCE);
+                } else if frame.get("id") == Some(&json!(4)) {
+                    assert_eq!(frame["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+                    break;
+                }
+                transcript.push(frame);
+            }
+            assert_eq!((submission_permissions, review_permissions, write_permissions), (1, 1, 1));
+            assert!(!cwd.join("blocked.txt").exists(), "planning writes must fail before permission is requested");
+            assert_eq!(std::fs::read_to_string(cwd.join("approved.txt")).unwrap(), "reviewed content");
+            assert!(transcript.iter().any(|frame|
+                frame["params"]["update"]["sessionUpdate"] == "current_mode_update"
+                    && frame["params"]["update"]["currentModeId"] == "code"
+            ));
+            let forked = discovery_request(&input, &outgoing, &mut transcript, 5, "session/fork", json!({
+                "sessionId": session_id, "cwd": cwd,
+            })).await;
+            assert!(forked.get("error").is_none(), "{forked}");
+            assert_eq!(forked["result"]["modes"]["currentModeId"], "plan", "a fork does not inherit approval");
+            let fork_id = forked["result"]["sessionId"].as_str().unwrap();
+            let index = crate::session_index::SessionIndex::for_sessions_root(&sessions_root);
+            index.reindex_all().unwrap();
+            let rows = index.list_sessions(None).unwrap();
+            let source_path = rows.iter().find(|row| row.id == session_id).unwrap().path.clone();
+            let fork_path = rows.iter().find(|row| row.id == fork_id).unwrap().path.clone();
+            let saved = Session::open(&source_path).await.unwrap();
+            assert_eq!(crate::plan::replayed_plan_mode(&saved), crate::plan::PlanMode::Approved);
+            assert_eq!(saved.to_messages_for_current_path().iter().filter(|message| matches!(message, Message::User(_))).count(), 1);
+            let saved_fork = Session::open(&fork_path).await.unwrap();
+            assert_eq!(crate::plan::replayed_plan_mode(&saved_fork), crate::plan::PlanMode::PendingApproval);
+            input.try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string()).unwrap();
+            (session_id, source_path, fork_path)
+        };
+        let (served, result) = futures::join!(Box::pin(run(options, incoming, AcpOutput::new(output))), editor);
+        served.unwrap();
+        result
+    }));
+    let requests = provider.finish(5);
+    assert!(requests[0].1["messages"].to_string().contains("ACP session mode: Plan."));
+    assert!(requests[3].1["messages"].to_string().contains("Approved Plan (execute this)"));
+    assert!(requests[3].1["messages"].to_string().contains(plan));
+    assert!(!requests[3].1["messages"].to_string().contains("ACP session mode: Plan."), "approved implementation must not inherit transient planning instructions");
+    assert!(requests[0].1["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "submit_plan"));
+
+    runtime.block_on(bounded_launch_controls(async {
+        let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+        options.session_dir = Some(sessions_root.clone());
+        options.launch.no_mcp = true;
+        options.launch.no_context_files = true;
+        let (input, incoming) = asupersync::channel::mpsc::channel(8);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let editor = async {
+            let mut transcript = Vec::new();
+            discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({"protocolVersion": 1})).await;
+            let resumed = discovery_request(&input, &outgoing, &mut transcript, 2, "session/resume", json!({
+                "sessionId": session_id, "cwd": cwd,
+            })).await;
+            assert!(resumed.get("error").is_none(), "{resumed}");
+            assert_eq!(resumed["result"]["modes"]["currentModeId"], "plan");
+            assert_eq!(crate::plan::replayed_plan_mode(&Session::open(&source_path).await.unwrap()), crate::plan::PlanMode::PendingApproval);
+            assert_eq!(crate::plan::replayed_plan_mode(&Session::open(&fork_path).await.unwrap()), crate::plan::PlanMode::PendingApproval);
+            input.try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string()).unwrap();
+        };
+        let (served, ()) = futures::join!(Box::pin(run(options, incoming, AcpOutput::new(output))), editor);
+        served.unwrap();
+    }));
+    }
+}
+
+#[test]
+fn dispatcher_plan_rejection_unknown_option_and_cancel_never_start_implementation() {
+    for choice in [ACP_PERMISSION_REJECT_ONCE, "allow-always", "cancel"] {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let mut provider = ProviderFixture::with_replies(
+            vec![200; 3],
+            vec![
+                Some(("submit_plan", json!({"plan": "Create should-not-exist.txt and verify its exact content."}))),
+                None,
+                Some(("write", json!({"path": "should-not-exist.txt", "content": "forbidden"}))),
+            ],
+        );
+        let runtime = runtime();
+        runtime.block_on(bounded_launch_controls(async {
+            let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+            options.launch.tools = Some("write".into());
+            options.launch.no_mcp = true;
+            options.launch.no_context_files = true;
+            let (input, incoming) = asupersync::channel::mpsc::channel(16);
+            let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+            let editor = async {
+                let mut transcript = Vec::new();
+                discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({"protocolVersion": 1})).await;
+                let created = discovery_request(&input, &outgoing, &mut transcript, 2, "session/new", json!({"cwd": cwd})).await;
+                let session_id = created["result"]["sessionId"].as_str().unwrap().to_string();
+                let selected = discovery_request(&input, &outgoing, &mut transcript, 3, "session/set_mode", json!({
+                    "sessionId": session_id, "modeId": "plan",
+                })).await;
+                assert!(selected.get("error").is_none(), "{selected}");
+                input.try_send(json!({
+                    "jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+                    "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": "Propose the implementation"}]},
+                }).to_string()).unwrap();
+                let mut reviews = 0;
+                loop {
+                    let frame = next_planning_frame(&outgoing).await;
+                    if frame["method"] == "session/request_permission" {
+                        if frame["params"]["toolCall"]["kind"] == "switch_mode" {
+                            reviews += 1;
+                            assert_eq!(provider.requests.lock().unwrap().len(), 2);
+                            if choice == "cancel" {
+                                input.try_send(json!({
+                                    "jsonrpc": "2.0", "method": "session/cancel",
+                                    "params": {"sessionId": session_id},
+                                }).to_string()).unwrap();
+                                // An approval in the input queue after cancellation must be inert.
+                                answer_planning_permission(&input, &frame, ACP_PERMISSION_ALLOW_ONCE);
+                            } else {
+                                answer_planning_permission(&input, &frame, choice);
+                            }
+                        } else {
+                            assert_eq!(frame["params"]["toolCall"]["title"], "submit_plan");
+                            answer_planning_permission(&input, &frame, ACP_PERMISSION_ALLOW_ONCE);
+                        }
+                    } else if frame.get("id") == Some(&json!(4)) {
+                        assert_eq!(frame["result"]["stopReason"], if choice == "cancel" {
+                            ACP_STOP_REASON_CANCELLED
+                        } else {
+                            ACP_STOP_REASON_END_TURN
+                        });
+                        break;
+                    }
+                }
+                assert_eq!(reviews, 1);
+                assert!(!cwd.join("should-not-exist.txt").exists());
+                let resumed = discovery_request(&input, &outgoing, &mut transcript, 5, "session/resume", json!({
+                    "sessionId": session_id, "cwd": cwd,
+                })).await;
+                assert_eq!(resumed["result"]["modes"]["currentModeId"], "plan");
+                let index = crate::session_index::SessionIndex::for_sessions_root(root.path());
+                index.reindex_all().unwrap();
+                let rows = index.list_sessions(None).unwrap();
+                let path = &rows.iter().find(|row| row.id == session_id).unwrap().path;
+                let saved = Session::open(path).await.unwrap();
+                assert_eq!(crate::plan::replayed_plan_mode(&saved), if choice == ACP_PERMISSION_REJECT_ONCE {
+                    crate::plan::PlanMode::Planning
+                } else {
+                    crate::plan::PlanMode::PendingApproval
+                });
+                input.try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string()).unwrap();
+            };
+            let (served, ()) = futures::join!(Box::pin(run(options, incoming, AcpOutput::new(output))), editor);
+            served.unwrap();
+        }));
+        provider.finish(2);
+    }
+}
+
+#[test]
+fn dispatcher_mode_change_cancels_pending_tool_permission_before_acknowledging() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let mut provider = ProviderFixture::with_replies(
+        vec![200],
+        vec![Some(("write", json!({"path": "cancelled-write.txt", "content": "must not run"})))],
+    );
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+        options.launch.tools = Some("write".into());
+        options.launch.no_mcp = true;
+        options.launch.no_context_files = true;
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let editor = async {
+            let mut transcript = Vec::new();
+            discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({"protocolVersion": 1})).await;
+            let created = discovery_request(&input, &outgoing, &mut transcript, 2, "session/new", json!({"cwd": cwd})).await;
+            let session_id = created["result"]["sessionId"].as_str().unwrap().to_string();
+            input.try_send(json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": "Write the file"}]},
+            }).to_string()).unwrap();
+            let permission = loop {
+                let frame = next_planning_frame(&outgoing).await;
+                if frame["method"] == "session/request_permission" {
+                    break frame;
+                }
+            };
+            assert_eq!(permission["params"]["toolCall"]["title"], "write");
+            input.try_send(json!({
+                "jsonrpc": "2.0", "id": 4, "method": "session/set_mode",
+                "params": {"sessionId": session_id, "modeId": "plan"},
+            }).to_string()).unwrap();
+            answer_planning_permission(&input, &permission, ACP_PERMISSION_ALLOW_ONCE);
+            let mut prompt_settled = false;
+            let mut permission_cancelled = false;
+            loop {
+                let frame = next_planning_frame(&outgoing).await;
+                if frame["method"] == "$/cancel_request" && frame["params"]["requestId"] == permission["id"] {
+                    permission_cancelled = true;
+                } else if frame.get("id") == Some(&json!(3)) {
+                    assert_eq!(frame["result"]["stopReason"], ACP_STOP_REASON_CANCELLED);
+                    prompt_settled = true;
+                } else if frame.get("id") == Some(&json!(4)) {
+                    assert!(frame.get("error").is_none(), "{frame}");
+                    assert!(prompt_settled, "old turn must retire before mode ACK");
+                    assert!(permission_cancelled);
+                    break;
+                }
+            }
+            assert!(!cwd.join("cancelled-write.txt").exists());
+            let selected = discovery_request(&input, &outgoing, &mut transcript, 5, "session/set_config_option", json!({
+                "sessionId": session_id, "configId": "mode", "value": "code",
+            })).await;
+            assert!(selected.get("error").is_none(), "reservation must retire before mode ACK: {selected}");
+            assert_eq!(
+                selected["result"]["configOptions"].as_array().unwrap().iter()
+                    .find(|option| option["id"] == "mode").unwrap()["currentValue"],
+                "code",
+            );
+            input.try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string()).unwrap();
+        };
+        let (served, ()) = futures::join!(Box::pin(run(options, incoming, AcpOutput::new(output))), editor);
+        served.unwrap();
+    }));
+    provider.finish(1);
+}
+
+#[test]
+fn dispatcher_disabled_tools_hide_and_reject_both_mode_selection_surfaces() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let mut provider = ProviderFixture::new(Vec::new());
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+        options.launch.no_tools = true;
+        options.launch.no_mcp = true;
+        options.launch.no_context_files = true;
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let editor = async {
+            let mut transcript = Vec::new();
+            discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({"protocolVersion": 1})).await;
+            let created = discovery_request(&input, &outgoing, &mut transcript, 2, "session/new", json!({"cwd": cwd})).await;
+            let session_id = created["result"]["sessionId"].as_str().unwrap().to_string();
+            assert!(created["result"].get("modes").is_none());
+            assert!(!created["result"]["configOptions"].as_array().unwrap().iter().any(|option| option["id"] == "mode"));
+            let plan = discovery_request(&input, &outgoing, &mut transcript, 3, "session/set_mode", json!({
+                "sessionId": session_id, "modeId": "plan",
+            })).await;
+            assert_eq!(plan["error"]["code"], INVALID_PARAMS);
+            let code = discovery_request(&input, &outgoing, &mut transcript, 4, "session/set_config_option", json!({
+                "sessionId": session_id, "configId": "mode", "value": "code",
+            })).await;
+            assert_eq!(code["error"]["code"], INVALID_PARAMS, "even an idempotent hidden mode is unsupported");
+            input.try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string()).unwrap();
+        };
+        let (served, ()) = futures::join!(Box::pin(run(options, incoming, AcpOutput::new(output))), editor);
+        served.unwrap();
+    }));
+    provider.finish(0);
 }

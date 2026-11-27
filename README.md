@@ -908,6 +908,20 @@ other providers still need their own credentials unless they require no key.
 If an editor shows an empty picker, compare its `session/new` response with
 `pi --list-models` using the same configuration and launch environment.
 
+**ACP planning.** The editor's Session Mode selector offers `code` and `plan`
+through the `mode` entry in `configOptions`. Older ACP v1 clients can use
+`modes` and `session/set_mode`. Plan mode allows exploration while blocking
+mutating tools and process execution. When the agent submits a plan, Pi asks
+the editor to review its full text. Approving that exact proposal switches to
+Code and continues the conversation; implementation tools still require their
+ordinary editor permissions. Rejecting keeps the session in Plan mode.
+Cancelled, unknown, or stale permission responses cannot approve a plan.
+
+Changing mode during a prompt cancels that prompt and waits for its session
+cleanup before acknowledging the selection. Saved or forked submitted plans
+restore for fresh review, never with inherited execution approval. Planning
+controls are unavailable when built-in tools are disabled.
+
 **ACP session forks.** Pi advertises the optional ACP v1 draft
 `sessionCapabilities.fork` capability. A client can create an active branch
 from the source's complete selected conversation:
