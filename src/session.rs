@@ -17,8 +17,9 @@ use crate::model::{
     UserContent, UserMessage,
 };
 use crate::session_index::{
-    SessionIndex, SessionIndexRefreshSummary, begin_session_index_namespace_change,
-    enqueue_session_index_snapshot_update, is_session_file_path, session_file_stats,
+    DiscoveryWorkspace, SessionIndex, SessionIndexRefreshSummary,
+    begin_session_index_namespace_change, enqueue_session_index_snapshot_update,
+    is_session_file_path, session_file_stats,
 };
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
@@ -4369,12 +4370,13 @@ impl Session {
         let project_session_dir = base_dir.join(&encoded_cwd);
 
         let base_dir_clone = base_dir.clone();
-        let cwd_display = cwd.display().to_string();
+        let workspace = DiscoveryWorkspace::new(&cwd);
+        let lookup_workspace = workspace.clone();
         let (tx, mut rx) = oneshot::channel();
 
         let handle = thread::spawn(move || {
             let index = SessionIndex::for_sessions_root(&base_dir_clone);
-            let indexed_meta = index.discover_sessions(&cwd_display);
+            let indexed_meta = index.discover_sessions_for_workspace(&lookup_workspace);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(indexed_meta));
         });
@@ -4415,7 +4417,7 @@ impl Session {
         merge_scanned_session_entries(&mut by_path, scanned.entries);
         let mut entries = by_path
             .into_values()
-            .filter(|entry| Path::new(&entry.cwd) == cwd)
+            .filter(|entry| workspace.matches(&entry.cwd))
             .collect::<Vec<_>>();
 
         if entries.is_empty() {
@@ -5399,18 +5401,18 @@ impl Session {
     ) -> Result<Option<(Self, PathBuf)>> {
         let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
         let cwd = std::env::current_dir()?;
-        let cwd_display = cwd.display().to_string();
+        let workspace = DiscoveryWorkspace::new(&cwd);
         let encoded_cwd = encode_cwd(&cwd);
         let project_session_dir = base_dir.join(&encoded_cwd);
 
         // Prefer the session index for fast lookup.
         let base_dir_clone = base_dir.clone();
-        let cwd_display_clone = cwd_display.clone();
+        let lookup_workspace = workspace.clone();
         let (tx, mut rx) = oneshot::channel();
 
         let handle = thread::spawn(move || {
             let index = SessionIndex::for_sessions_root(&base_dir_clone);
-            let indexed_sessions = index.discover_sessions(&cwd_display_clone);
+            let indexed_sessions = index.discover_sessions_for_workspace(&lookup_workspace);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(indexed_sessions));
         });
@@ -5454,7 +5456,7 @@ impl Session {
 
         let mut candidates = by_path
             .into_values()
-            .filter(|entry| Path::new(&entry.cwd) == cwd)
+            .filter(|entry| workspace.matches(&entry.cwd))
             .collect::<Vec<_>>();
         candidates.sort_by_key(|entry| std::cmp::Reverse(entry.last_modified_ms));
 
@@ -18696,6 +18698,37 @@ mod tests {
             .expect("reopen canonical workspace");
         assert_eq!(reopened.header.cwd, session.header.cwd);
         assert_eq!(reopened.entries.len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_workspace_can_continue_and_pick_a_canonical_session() {
+        let _lock = current_dir_lock();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).expect("workspace");
+        let [ordinary, canonical] = windows_session_lock_test_roots(&project);
+        let sessions = temp.path().join("sessions");
+        let mut saved = Session::create_with_dir(Some(sessions.clone()));
+        saved.header.cwd = canonical.to_str().expect("UTF-8 fixture").to_owned();
+        saved.append_message(make_test_message("persisted turn"));
+        run_async(saved.save()).expect("save canonical workspace");
+
+        let _guard = CurrentDirGuard::new(&ordinary);
+        let config = Config::default();
+        let continued = run_async(Session::continue_recent_in_dir(Some(&sessions), &config))
+            .expect("continue saved workspace");
+        let picked = run_async(Session::resume_with_picker(
+            Some(&sessions),
+            &config,
+            Some("1".to_owned()),
+        ))
+        .expect("select saved workspace");
+        for reopened in [continued, picked] {
+            assert_eq!(reopened.path, saved.path);
+            assert_eq!(reopened.header.id, saved.header.id);
+            assert_eq!(reopened.to_messages().len(), 1);
+        }
     }
 
     #[cfg(windows)]
