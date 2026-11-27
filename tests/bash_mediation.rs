@@ -877,13 +877,13 @@ mod foreground_pipe_ownership {
         let backend = if use_pty { "pty" } else { "pipe" };
         let root = harness.temp_path(format!("{backend}-owner"));
         std::fs::create_dir_all(&root).expect("output lifecycle fixture");
-        let child = Command::new(std::env::current_exe().expect("test executable"))
-            .args(["--exact", test_name, "--nocapture"])
+        let mut cmd = Command::new(std::env::current_exe().expect("test executable"));
+        cmd.args(["--exact", test_name, "--nocapture"])
             .env(CASE_ENV, mode)
             .env(ROOT_ENV, &root)
             .stdin(Stdio::null())
-            .process_group(0)
-            .spawn()
+            .process_group(0);
+        let child = pi::tools::guard_unix_process_spawn(|| cmd.spawn())
             .expect("isolated output lifecycle regression");
         let mut process = CaseProcess {
             child,

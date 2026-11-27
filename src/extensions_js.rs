@@ -33190,10 +33190,12 @@ mod tests {
         // Incremental write acknowledgements, descriptor ownership and amortized
         // VFS growth are covered by the file-stream progress/storage regressions.
         // The existing bounded whole-file host snapshot is unchanged.
+        // Safe optional-chaining capture of globalThis.__pi_fs_watch_runtime?.enqueue
+        // at node:fs import time adds 119 bytes (ca7c4bc25).
         (
             "node:fs",
-            111_204,
-            "393f4ee83aaa34a4df0f6cbb019c52dea063c74da33f8fc1d4da0e649f032229",
+            111_323,
+            "15b85f03c8d46df0ada3f1e34e8be78b1eb40347bbf47b84215f49a24dff887b",
         ),
         (
             "@mariozechner/pi-ai",

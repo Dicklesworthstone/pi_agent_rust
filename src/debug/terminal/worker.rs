@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use super::*;
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize};
 
 const POLL: Duration = Duration::from_millis(25);
 
@@ -138,19 +138,18 @@ fn spawn(
         ));
     }
     let cwd = launch.directory(workspace)?;
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 40,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|error| {
-            tool_err(
-                "DAP_TERMINAL_PTY",
-                format!("cannot allocate terminal: {error}"),
-            )
-        })?;
+    let pair = crate::tools::open_pty_pair(PtySize {
+        rows: 40,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+    .map_err(|error| {
+        tool_err(
+            "DAP_TERMINAL_PTY",
+            format!("cannot allocate terminal: {error}"),
+        )
+    })?;
     let reader = pair
         .master
         .try_clone_reader()

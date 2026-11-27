@@ -344,7 +344,7 @@ printf '%s\n' "$task" >> launches
 case "$task" in
   'Task: source') answer='{"verdict":"repair"}' ;;
   'Task: missing') answer='{}' ;;
-  'Task: invalid'*) answer='not JSON' ;;
+  'Task: invalid'*|*'"previousOutput":"not JSON"'*) answer='not JSON' ;;
   'Task: broken') exit 7 ;;
   'Task: repair') printf 'repaired\n' > repaired.txt; answer='"done"' ;;
   'Task: verify_repaired') [ "$(cat repaired.txt)" = 'repaired' ] || exit 23; printf 'verified\n' > joined.txt; answer='"done"' ;;

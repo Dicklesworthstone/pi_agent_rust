@@ -1704,17 +1704,15 @@ fn start_inner(spec: &LaunchSpec, request: &ServiceRequest) -> Result<ServiceSna
 }
 
 fn spawn_pty(spec: &LaunchSpec, request: &ServiceRequest) -> Result<SpawnedService> {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{CommandBuilder, PtySize};
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 40,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| Error::tool("hub", format!("Failed to allocate PTY: {e}")))?;
+    let pair = crate::tools::open_pty_pair(PtySize {
+        rows: 40,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+    .map_err(|e| Error::tool("hub", format!("Failed to allocate PTY: {e}")))?;
 
     let mut cmd = CommandBuilder::new(&spec.program);
     cmd.args(&spec.args);

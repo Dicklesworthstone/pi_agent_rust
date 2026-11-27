@@ -9905,7 +9905,7 @@ pub(crate) async fn run_bash_command_pty(
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     shell_state: Option<&bash_session::ShellTransaction>,
 ) -> Result<BashRunResult> {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{CommandBuilder, PtySize};
 
     let timeout_secs = match timeout_secs {
         None => Some(DEFAULT_BASH_TIMEOUT_SECS),
@@ -9937,15 +9937,13 @@ pub(crate) async fn run_bash_command_pty(
     let shell = shell_path.map_or_else(default_bash_shell, |path| Ok(path.to_string()))?;
     let shell = shell.as_str();
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 40,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| Error::tool("bash", format!("Failed to allocate PTY: {e}")))?;
+    let pair = open_pty_pair(PtySize {
+        rows: 40,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+    .map_err(|e| Error::tool("bash", format!("Failed to allocate PTY: {e}")))?;
     #[cfg(unix)]
     prepare_bash_pty_master(pair.master.as_ref())?;
 
@@ -18377,6 +18375,46 @@ impl Drop for PtyProcessGuard {
     }
 }
 
+/// Coordinate Unix `portable_pty::openpty` against concurrent `Command::spawn`
+/// calls in the same process.
+///
+/// `portable-pty` 0.9 calls `libc::openpty` (which allocates both master and
+/// slave descriptors without `O_CLOEXEC`) and inspects `ttyname_r` before
+/// applying `FD_CLOEXEC`. Any thread that forks or calls `posix_spawn` during
+/// that window inherits the live PTY slave descriptor, preventing the PTY
+/// master from observing EOF when the PTY child exits. Holding a write lock
+/// around `openpty` and a shared read lock around process spawn closes that
+/// race without serializing ordinary spawns against each other.
+#[cfg(unix)]
+static OPENPTY_CLOEXEC_GATE: std::sync::LazyLock<std::sync::RwLock<()>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(()));
+
+/// Run a Unix subprocess spawn under the shared `OPENPTY_CLOEXEC_GATE` read
+/// lock so it cannot inherit transiently non-`FD_CLOEXEC` PTY descriptors from
+/// a concurrent `open_pty_pair` call.
+#[cfg(unix)]
+pub fn guard_unix_process_spawn<T>(spawn: impl FnOnce() -> T) -> T {
+    let _guard = OPENPTY_CLOEXEC_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    spawn()
+}
+
+/// Open a native PTY pair while preventing concurrent guarded subprocess spawns
+/// from inheriting the descriptors before `portable-pty` marks them `FD_CLOEXEC`.
+pub(crate) fn open_pty_pair(
+    size: portable_pty::PtySize,
+) -> std::result::Result<portable_pty::PtyPair, String> {
+    let result = {
+        #[cfg(unix)]
+        let _guard = OPENPTY_CLOEXEC_GATE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        portable_pty::native_pty_system().openpty(size)
+    };
+    result.map_err(|err| err.to_string())
+}
+
 /// Spawn with Windows Job membership established before any child code runs.
 ///
 /// Unix callers configure their process group on `command` before calling.
@@ -18388,9 +18426,17 @@ pub(crate) fn spawn_command_with_job_discipline(
     command: &mut Command,
 ) -> std::io::Result<std::process::Child> {
     #[cfg(windows)]
-    return win_job::spawn(command);
-    #[cfg(not(windows))]
-    command.spawn()
+    {
+        win_job::spawn(command)
+    }
+    #[cfg(unix)]
+    {
+        guard_unix_process_spawn(|| command.spawn())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        command.spawn()
+    }
 }
 
 /// Terminate descendants still covered by an already-reaped root's platform
@@ -25135,9 +25181,8 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn dropping_owner_retires_idle_pty_reader_while_slave_stays_open() {
-            let pair = portable_pty::native_pty_system()
-                .openpty(portable_pty::PtySize::default())
-                .expect("native PTY endpoints");
+            let pair =
+                open_pty_pair(portable_pty::PtySize::default()).expect("native PTY endpoints");
             prepare_bash_pty_master(pair.master.as_ref()).expect("nonblocking PTY master");
             let reader = pair.master.try_clone_reader().expect("native PTY reader");
             drop(pair.master);
@@ -25161,9 +25206,8 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn closed_pty_slave_is_clean_eof_instead_of_a_capture_error() {
-            let pair = portable_pty::native_pty_system()
-                .openpty(portable_pty::PtySize::default())
-                .expect("native PTY endpoints");
+            let pair =
+                open_pty_pair(portable_pty::PtySize::default()).expect("native PTY endpoints");
             prepare_bash_pty_master(pair.master.as_ref()).expect("nonblocking PTY master");
             let reader = pair.master.try_clone_reader().expect("native PTY reader");
             drop(pair.master);
@@ -25177,6 +25221,111 @@ mod tests {
                 matches!(terminal_frame, Err(mpsc::RecvTimeoutError::Disconnected)),
                 "closing the slave must end capture without an EIO frame: {terminal_frame:?}"
             );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn open_pty_pair_does_not_leak_slave_fd_to_concurrent_guarded_spawns() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::time::Instant;
+
+            struct ChildReaper(Vec<std::process::Child>);
+            impl Drop for ChildReaper {
+                fn drop(&mut self) {
+                    for child in &mut self.0 {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+            }
+
+            struct SpawnerGuard {
+                stop: Arc<AtomicBool>,
+                handle: Option<thread::JoinHandle<()>>,
+            }
+            impl Drop for SpawnerGuard {
+                fn drop(&mut self) {
+                    self.stop.store(true, Ordering::Release);
+                    if let Some(handle) = self.handle.take() {
+                        let _ = handle.join();
+                    }
+                }
+            }
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let spawner_stop = Arc::clone(&stop);
+            let handle = thread::spawn(move || {
+                let mut children = ChildReaper(Vec::new());
+                while !spawner_stop.load(Ordering::Acquire) && children.0.len() < 16 {
+                    let mut cmd = Command::new("/bin/sh");
+                    cmd.args(["-c", "exec sleep 10"])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+                    if let Ok(child) = guard_unix_process_spawn(|| cmd.spawn()) {
+                        children.0.push(child);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                while !spawner_stop.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(2));
+                }
+            });
+            let mut spawner = SpawnerGuard {
+                stop,
+                handle: Some(handle),
+            };
+
+            let mut buf = [0u8; 64];
+            for iteration in 0..24 {
+                let pair =
+                    open_pty_pair(portable_pty::PtySize::default()).expect("native PTY endpoints");
+                prepare_bash_pty_master(pair.master.as_ref()).expect("nonblocking PTY master");
+                let mut reader = pair.master.try_clone_reader().expect("native PTY reader");
+                drop(pair.master);
+                drop(pair.slave);
+
+                let deadline = Instant::now() + Duration::from_millis(500);
+                let mut saw_eof = false;
+                let mut unexpected_err = None;
+                while Instant::now() < deadline {
+                    match reader.read(&mut buf) {
+                        Ok(0) => {
+                            saw_eof = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(err) => {
+                            unexpected_err = Some(err.to_string());
+                            break;
+                        }
+                    }
+                }
+                assert!(
+                    unexpected_err.is_none(),
+                    "unexpected PTY read error on iteration {iteration}: {unexpected_err:?}"
+                );
+                assert!(
+                    saw_eof,
+                    "PTY master did not reach EOF within 500ms on iteration {iteration}; a concurrent spawn inherited the slave fd"
+                );
+            }
+
+            spawner.stop.store(true, Ordering::Release);
+            spawner
+                .handle
+                .take()
+                .expect("spawner handle")
+                .join()
+                .expect("spawner thread panicked");
         }
     }
 

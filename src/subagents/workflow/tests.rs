@@ -591,8 +591,12 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
         assert_eq!(details["nodes"][0]["nativeIsError"], false);
         assert_eq!(details["nodes"][0]["result"]["schemaRetries"], 1);
         assert_eq!(details["nodes"][1]["state"], "skipped");
-        assert_eq!(fixture.launches().matches("Task: BADJSON").count(), 2);
-        assert!(!fixture.launches().contains("BLOCKED"));
+        let launches = fixture.launches();
+        assert_eq!(launches.matches("Task: BADJSON").count(), 1);
+        assert_eq!(launches.lines().count(), 2);
+        assert!(launches.contains("\"previousOutput\":\"not JSON\""));
+        assert!(launches.contains("\"validationErrors\""));
+        assert!(!launches.contains("BLOCKED"));
     }
 
     #[test]
