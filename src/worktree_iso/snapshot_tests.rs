@@ -21,6 +21,12 @@ fn repository() -> TempDir {
     dir
 }
 
+fn unborn_repository() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    git_ok(dir.path(), &["init", "-b", "main"]).unwrap();
+    dir
+}
+
 fn index_bytes(repo: &Path) -> Vec<u8> {
     let index = git_ok(repo, &["rev-parse", "--git-path", "index"]).unwrap();
     let index = PathBuf::from(index.trim_end_matches('\n'));
@@ -30,6 +36,263 @@ fn index_bytes(repo: &Path) -> Vec<u8> {
         repo.join(index)
     })
     .unwrap()
+}
+
+#[test]
+fn an_empty_unborn_repository_can_isolate_and_apply_its_first_files() {
+    let repo = unborn_repository();
+    git_ok(repo.path(), &["config", "user.name", ""]).unwrap();
+    git_ok(repo.path(), &["config", "user.email", ""]).unwrap();
+    git_ok(repo.path(), &["config", "user.useConfigOnly", "true"]).unwrap();
+    git_ok(repo.path(), &["config", "commit.gpgSign", "true"]).unwrap();
+    git_ok(
+        repo.path(),
+        &["config", "gpg.program", "/not/a/real/signer"],
+    )
+    .unwrap();
+    let head = fs::read(repo.path().join(".git/HEAD")).unwrap();
+    assert!(!repo.path().join(".git/index").exists());
+
+    let handle = isolate(repo.path(), "empty-unborn").unwrap();
+    assert_eq!(
+        git_ok(
+            &handle.path,
+            &["rev-list", "--parents", "--max-count=1", &handle.baseline],
+        )
+        .unwrap(),
+        format!("{}\n", handle.baseline),
+        "the internal snapshot is a root commit"
+    );
+    assert!(collect_diff(&handle).unwrap().0.is_empty());
+    fs::create_dir(handle.path.join("src")).unwrap();
+    fs::write(handle.path.join("src/main.rs"), "fn main() {}\n").unwrap();
+    assert!(!repo.path().join("src").exists());
+    let (patch, _) = collect_diff(&handle).unwrap();
+    assert!(patch.contains("src/main.rs"));
+    apply_to_parent(&handle, &patch).unwrap();
+    assert_eq!(
+        fs::read(repo.path().join("src/main.rs")).unwrap(),
+        b"fn main() {}\n"
+    );
+    drop_worktree(&handle).unwrap();
+
+    assert_eq!(fs::read(repo.path().join(".git/HEAD")).unwrap(), head);
+    assert!(git_ok(repo.path(), &["rev-parse", "--verify", "HEAD"]).is_err());
+    assert!(!repo.path().join(".git/index").exists());
+    assert!(!repo.path().join(".git/refs/heads/main").exists());
+}
+
+#[test]
+fn an_unborn_scaffold_preserves_staging_and_shares_a_frozen_launch_baseline() {
+    let repo = unborn_repository();
+    fs::create_dir(repo.path().join("src")).unwrap();
+    fs::write(repo.path().join("src/main.rs"), "staged parent\n").unwrap();
+    fs::write(repo.path().join(".gitignore"), "*.private\n").unwrap();
+    fs::write(repo.path().join("tracked.private"), "tracked\n").unwrap();
+    fs::write(repo.path().join("secret.private"), "ignored\n").unwrap();
+    git_ok(repo.path(), &["add", "src/main.rs", ".gitignore"]).unwrap();
+    git_ok(repo.path(), &["add", "--force", "tracked.private"]).unwrap();
+    fs::write(repo.path().join("src/main.rs"), "working parent\n").unwrap();
+    fs::write(repo.path().join("untracked.bin"), [0, 255, 1, 128]).unwrap();
+    let parent_index = index_bytes(repo.path());
+    let parent_head = fs::read(repo.path().join(".git/HEAD")).unwrap();
+    let baseline = IsoBaseline::capture(isolation_root(repo.path()).unwrap()).unwrap();
+    let first = baseline.isolate("unborn-first").unwrap();
+    assert_eq!(
+        fs::read(first.path.join("src/main.rs")).unwrap(),
+        b"working parent\n"
+    );
+    assert_eq!(
+        fs::read(first.path.join("untracked.bin")).unwrap(),
+        [0, 255, 1, 128]
+    );
+    assert_eq!(
+        fs::read(first.path.join("tracked.private")).unwrap(),
+        b"tracked\n"
+    );
+    assert!(!first.path.join("secret.private").exists());
+    assert!(collect_diff(&first).unwrap().0.is_empty());
+    assert_eq!(index_bytes(repo.path()), parent_index);
+
+    fs::write(first.path.join("src/main.rs"), "staged child\n").unwrap();
+    git_ok(&first.path, &["add", "src/main.rs"]).unwrap();
+    fs::write(first.path.join("src/main.rs"), "working child\n").unwrap();
+    fs::write(first.path.join("untracked.bin"), [0, 254, 2, 127]).unwrap();
+    fs::write(first.path.join("new.txt"), "child addition\n").unwrap();
+    let child_index = index_bytes(&first.path);
+    let (patch, _) = collect_diff(&first).unwrap();
+    assert_eq!(index_bytes(&first.path), child_index);
+    assert_eq!(
+        fs::read(repo.path().join("src/main.rs")).unwrap(),
+        b"working parent\n"
+    );
+    apply_to_parent(&first, &patch).unwrap();
+    assert_eq!(
+        fs::read(repo.path().join("src/main.rs")).unwrap(),
+        b"working child\n"
+    );
+    assert_eq!(
+        fs::read(repo.path().join("untracked.bin")).unwrap(),
+        [0, 254, 2, 127]
+    );
+    assert_eq!(
+        fs::read(repo.path().join("new.txt")).unwrap(),
+        b"child addition\n"
+    );
+    assert_eq!(
+        fs::read(repo.path().join("secret.private")).unwrap(),
+        b"ignored\n"
+    );
+    assert_eq!(index_bytes(repo.path()), parent_index);
+    assert_eq!(
+        git_ok(repo.path(), &["show", ":src/main.rs"]).unwrap(),
+        "staged parent\n"
+    );
+
+    let second = baseline.isolate("unborn-second").unwrap();
+    assert_eq!(second.baseline, first.baseline);
+    assert_eq!(
+        fs::read(second.path.join("src/main.rs")).unwrap(),
+        b"working parent\n"
+    );
+    assert_eq!(
+        fs::read(second.path.join("untracked.bin")).unwrap(),
+        [0, 255, 1, 128]
+    );
+    assert!(!second.path.join("new.txt").exists());
+    assert!(collect_diff(&second).unwrap().0.is_empty());
+    drop_worktree(&first).unwrap();
+    drop_worktree(&second).unwrap();
+    assert_eq!(
+        fs::read(repo.path().join(".git/HEAD")).unwrap(),
+        parent_head
+    );
+    assert_eq!(index_bytes(repo.path()), parent_index);
+    assert!(git_ok(repo.path(), &["rev-parse", "--verify", "HEAD"]).is_err());
+}
+
+#[test]
+fn invalid_parent_references_are_never_treated_as_unborn_branches() {
+    for kind in [
+        "missing-object",
+        "malformed-branch",
+        "non-commit-object",
+        "dangling-symbolic-branch",
+        "non-branch-head",
+        "detached-missing-head",
+        "malformed-head",
+    ] {
+        let repo = unborn_repository();
+        fs::write(repo.path().join("scaffold.txt"), "staged scaffold\n").unwrap();
+        git_ok(repo.path(), &["add", "scaffold.txt"]).unwrap();
+        let index = index_bytes(repo.path());
+        let missing_object = format!("{}\n", "1".repeat(40));
+        let (reference, contents) = match kind {
+            "missing-object" => ("refs/heads/main", missing_object),
+            "malformed-branch" => ("refs/heads/main", "not-an-object\n".to_string()),
+            "non-commit-object" => (
+                "refs/heads/main",
+                git_ok(repo.path(), &["hash-object", "scaffold.txt"]).unwrap(),
+            ),
+            "dangling-symbolic-branch" => (
+                "refs/heads/main",
+                "ref: refs/heads/absent\n".to_string(),
+            ),
+            "non-branch-head" => ("HEAD", "ref: refs/tags/absent\n".to_string()),
+            "detached-missing-head" => ("HEAD", missing_object),
+            "malformed-head" => ("HEAD", "not-a-valid-head\n".to_string()),
+            _ => unreachable!("fixture kind is enumerated above"),
+        };
+        fs::write(repo.path().join(".git").join(reference), &contents).unwrap();
+        let head = fs::read(repo.path().join(".git/HEAD")).unwrap();
+        let error = isolate(repo.path(), kind).unwrap_err();
+        assert!(
+            error.to_string().contains("PI_ISO_SNAPSHOT")
+                || error.to_string().contains("PI_ISO_NOT_GIT"),
+            "{kind}: {error}"
+        );
+        assert_eq!(
+            fs::read(repo.path().join(".git/HEAD")).unwrap(),
+            head,
+            "{kind}"
+        );
+        assert_eq!(
+            fs::read(repo.path().join(".git").join(reference)).unwrap(),
+            contents.as_bytes(),
+            "{kind}"
+        );
+        // Even reading the index through Git can fail with a malformed HEAD.
+        assert_eq!(
+            fs::read(repo.path().join(".git/index")).unwrap(),
+            index,
+            "{kind}"
+        );
+        assert_eq!(
+            fs::read(repo.path().join("scaffold.txt")).unwrap(),
+            b"staged scaffold\n"
+        );
+        assert!(!repo.path().join(".git/worktrees").exists(), "{kind}");
+    }
+
+    let non_git = tempfile::tempdir().unwrap();
+    fs::write(non_git.path().join("scaffold.txt"), "not a repository\n").unwrap();
+    let error = isolate(non_git.path(), "non-git").unwrap_err();
+    assert!(error.to_string().contains("PI_ISO_NOT_GIT"), "{error}");
+    assert_eq!(
+        fs::read(non_git.path().join("scaffold.txt")).unwrap(),
+        b"not a repository\n"
+    );
+    assert!(!non_git.path().join(".git").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn switching_parent_branches_during_capture_is_detected_even_without_a_commit_change() {
+    for unborn in [true, false] {
+        let repo = if unborn {
+            unborn_repository()
+        } else {
+            repository()
+        };
+        fs::write(repo.path().join("staged.txt"), "staged\n").unwrap();
+        git_ok(repo.path(), &["add", "staged.txt"]).unwrap();
+        if !unborn {
+            git_ok(repo.path(), &["branch", "during-snapshot"]).unwrap();
+        }
+        let index = index_bytes(repo.path());
+        fs::write(
+            repo.path().join(".gitattributes"),
+            "trigger.txt filter=switch-head\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("trigger.txt"), "trigger\n").unwrap();
+        git_ok(
+            repo.path(),
+            &[
+                "config",
+                "filter.switch-head.clean",
+                "git symbolic-ref HEAD refs/heads/during-snapshot && cat",
+            ],
+        )
+        .unwrap();
+        git_ok(
+            repo.path(),
+            &["config", "filter.switch-head.required", "true"],
+        )
+        .unwrap();
+        let error = isolate(repo.path(), "head-race").unwrap_err();
+        assert!(
+            error.to_string().contains("PI_ISO_PARENT_CHANGED"),
+            "{error}"
+        );
+        assert_eq!(
+            git_ok(repo.path(), &["symbolic-ref", "HEAD"]).unwrap(),
+            "refs/heads/during-snapshot\n",
+            "do not undo the external branch change"
+        );
+        assert_eq!(index_bytes(repo.path()), index);
+        assert!(!repo.path().join(".git/worktrees").exists());
+    }
 }
 
 #[test]

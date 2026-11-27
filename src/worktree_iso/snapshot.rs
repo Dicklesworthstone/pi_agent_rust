@@ -6,21 +6,18 @@
 //! This is not a filesystem-wide atomic snapshot of concurrent external writers.
 
 use crate::error::{Error, Result};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 mod sparse;
 
 const MAX_INDEX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Git revision syntax that peels `HEAD` to a commit object, rejecting a tag or
-/// tree that happens to be there.
-///
-/// Named rather than repeated at the two call sites because `{commit}` reads as
-/// a format placeholder to `clippy::literal_string_with_formatting_args`, so
-/// each literal use needs its own allow; the const needs one.
+/// Git revision syntax that peels `HEAD` to a commit object.
+/// `{commit}` is revision syntax, not a format placeholder.
 #[allow(clippy::literal_string_with_formatting_args)]
 const HEAD_COMMIT_REV: &str = "HEAD^{commit}";
 
@@ -56,19 +53,27 @@ fn command(repo: &Path) -> Command {
     command
 }
 
-fn run(command: &mut Command, operation: &str) -> Result<Vec<u8>> {
-    let output = command
+fn output(command: &mut Command, operation: &str) -> Result<Output> {
+    command
         .output()
-        .map_err(|error| failure("PI_ISO_SNAPSHOT", &format!("Cannot {operation}: {error}")))?;
+        .map_err(|error| failure("PI_ISO_SNAPSHOT", &format!("Cannot {operation}: {error}")))
+}
+
+fn command_failure(output: &Output, operation: &str) -> Error {
+    let diagnostic: String = String::from_utf8_lossy(&output.stderr)
+        .chars()
+        .take(4096)
+        .collect();
+    failure(
+        "PI_ISO_SNAPSHOT",
+        &format!("Cannot {operation}: {}", diagnostic.trim()),
+    )
+}
+
+fn run(command: &mut Command, operation: &str) -> Result<Vec<u8>> {
+    let output = output(command, operation)?;
     if !output.status.success() {
-        let diagnostic: String = String::from_utf8_lossy(&output.stderr)
-            .chars()
-            .take(4096)
-            .collect();
-        return Err(failure(
-            "PI_ISO_SNAPSHOT",
-            &format!("Cannot {operation}: {}", diagnostic.trim()),
-        ));
+        return Err(command_failure(&output, operation));
     }
     Ok(output.stdout)
 }
@@ -83,12 +88,9 @@ fn object_id(bytes: &[u8]) -> Result<String> {
     Ok(id.to_string())
 }
 
-/// Strip only Git's record terminator, never whitespace belonging to a path.
-fn repository_path(cwd: &Path, flag: &str) -> Result<PathBuf> {
-    let mut bytes = run(
-        command(cwd).args(["rev-parse", flag]),
-        "locate repository path",
-    )?;
+/// Strip only Git's record terminator, never whitespace belonging to a path or
+/// a reference. Preserve non-UTF-8 names on platforms that support them.
+fn terminated_os_string(mut bytes: Vec<u8>) -> Result<OsString> {
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
     }
@@ -97,17 +99,98 @@ fn repository_path(cwd: &Path, flag: &str) -> Result<PathBuf> {
         bytes.pop();
     }
     #[cfg(unix)]
-    let path = {
+    let value = {
         use std::os::unix::ffi::OsStringExt as _;
-        PathBuf::from(std::ffi::OsString::from_vec(bytes))
+        OsString::from_vec(bytes)
     };
     #[cfg(not(unix))]
-    let path = PathBuf::from(String::from_utf8(bytes).map_err(|_| {
+    let value = OsString::from(String::from_utf8(bytes).map_err(|_| {
         failure(
             "PI_ISO_SNAPSHOT",
-            "Repository root is not representable on this platform",
+            "Git path or reference is not representable on this platform",
         )
     })?);
+    Ok(value)
+}
+
+fn symbolic_reference(repo: &Path, reference: &OsStr) -> Result<Option<OsString>> {
+    let output = output(
+        command(repo)
+            .args(["symbolic-ref", "--quiet", "--no-recurse"])
+            .arg(reference),
+        "read symbolic reference",
+    )?;
+    match output.status.code() {
+        Some(0) => terminated_os_string(output.stdout).map(Some),
+        Some(1) => Ok(None),
+        _ => Err(command_failure(&output, "read symbolic reference")),
+    }
+}
+
+/// A missing commit is valid only for a symbolic HEAD whose branch does not
+/// exist yet. Keep its exact identity so switching unborn branches during a
+/// capture is detected just like creating the first commit.
+#[derive(Debug, PartialEq, Eq)]
+struct ParentHead {
+    branch: Option<OsString>,
+    commit: Option<String>,
+}
+
+impl ParentHead {
+    fn read(repo: &Path) -> Result<Self> {
+        let branch = symbolic_reference(repo, OsStr::new("HEAD"))?;
+        let resolved = output(
+            command(repo).args(["rev-parse", "--verify", "--quiet", HEAD_COMMIT_REV]),
+            "resolve parent commit",
+        )?;
+        if resolved.status.success() {
+            return Ok(Self {
+                branch,
+                commit: Some(object_id(&resolved.stdout)?),
+            });
+        }
+        let error = command_failure(&resolved, "resolve parent commit");
+        let Some(branch) = branch else {
+            return Err(error);
+        };
+        if resolved.status.code() != Some(1)
+            || !branch.as_encoded_bytes().starts_with(b"refs/heads/")
+        {
+            return Err(error);
+        }
+        run(
+            command(repo).arg("check-ref-format").arg(&branch),
+            "validate unborn branch",
+        )?;
+        // A malformed loose ref can look absent to show-ref --verify, and
+        // a dangling symbolic branch can look absent to revision resolution.
+        // symbolic-ref reports malformed refs as errors; reject aliases too.
+        if symbolic_reference(repo, &branch)?.is_some() {
+            return Err(error);
+        }
+        let existing = output(
+            command(repo)
+                .args(["show-ref", "--verify", "--quiet", "--"])
+                .arg(&branch),
+            "verify unborn branch",
+        )?;
+        if existing.status.code() != Some(1) {
+            // This includes existing refs to missing or non-commit objects.
+            // Never turn repository corruption into an empty launch history.
+            return Err(error);
+        }
+        Ok(Self {
+            branch: Some(branch),
+            commit: None,
+        })
+    }
+}
+
+fn repository_path(cwd: &Path, flag: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(terminated_os_string(run(
+        command(cwd).args(["rev-parse", flag]),
+        "locate repository path",
+    )?)?);
     path.canonicalize().map_err(|error| {
         failure(
             "PI_ISO_SNAPSHOT",
@@ -294,10 +377,7 @@ impl Snapshot {
 /// additions remain tracked. Refresh only the private index from the filesystem.
 pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
     let checkout_mode = sparse::CheckoutMode::read(repo)?;
-    let head = object_id(&run(
-        command(repo).args(["rev-parse", "--verify", HEAD_COMMIT_REV]),
-        "resolve parent commit",
-    )?)?;
+    let head = ParentHead::read(repo)?;
     let scratch = Scratch::new(repo)?;
     let parent_entries = scratch.entries(command(repo), "parent")?;
     reject_gitlinks(&parent_entries)?;
@@ -335,18 +415,15 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
     // Plumbing does not run commit hooks, use the user's signing key, move HEAD,
     // or require a configured author. This commit belongs only to the pi-iso
     // branch and records the launch baseline, not a user-authored source commit.
+    // An unborn parent gets an internal root commit without creating its first
+    // source commit or changing its symbolic HEAD.
     let mut commit = command(repo);
+    commit.args(["-c", "commit.gpgSign=false", "commit-tree", &tree]);
+    if let Some(parent) = &head.commit {
+        commit.args(["-p", parent]);
+    }
     commit
-        .args([
-            "-c",
-            "commit.gpgSign=false",
-            "commit-tree",
-            &tree,
-            "-p",
-            &head,
-            "--no-gpg-sign",
-            "-m",
-        ])
+        .args(["--no-gpg-sign", "-m"])
         .arg(format!("pi-iso baseline {id}"))
         .env("GIT_AUTHOR_NAME", "Pi Isolation")
         .env("GIT_AUTHOR_EMAIL", "pi-isolation@localhost")
@@ -355,10 +432,7 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
         .env_remove("GIT_AUTHOR_DATE")
         .env_remove("GIT_COMMITTER_DATE");
     let baseline = object_id(&run(&mut commit, "record snapshot baseline")?)?;
-    let current_head = object_id(&run(
-        command(repo).args(["rev-parse", "--verify", HEAD_COMMIT_REV]),
-        "verify parent commit",
-    )?)?;
+    let current_head = ParentHead::read(repo)?;
     if current_head != head || scratch.entries(command(repo), "verify")? != parent_entries {
         return Err(failure(
             "PI_ISO_PARENT_CHANGED",
