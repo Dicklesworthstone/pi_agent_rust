@@ -29267,38 +29267,44 @@ if (typeof globalThis.atob !== 'function') {
 }
 
 if (typeof globalThis.TextEncoder === 'undefined') {
-    class TextEncoder {
-        encode(input) {
-            const s = String(input === undefined || input === null ? '' : input);
-            const bytes = [];
-            for (let i = 0; i < s.length; i++) {
-                let code = s.charCodeAt(i);
-                if (code < 0x80) {
-                    bytes.push(code);
-                    continue;
-                }
-                if (code < 0x800) {
-                    bytes.push(0xc0 | (code >> 6));
-                    bytes.push(0x80 | (code & 0x3f));
-                    continue;
-                }
-                if (code >= 0xd800 && code <= 0xdbff && i + 1 < s.length) {
-                    const next = s.charCodeAt(i + 1);
-                    if (next >= 0xdc00 && next <= 0xdfff) {
-                        const cp = ((code - 0xd800) << 10) + (next - 0xdc00) + 0x10000;
-                        bytes.push(0xf0 | (cp >> 18));
-                        bytes.push(0x80 | ((cp >> 12) & 0x3f));
-                        bytes.push(0x80 | ((cp >> 6) & 0x3f));
-                        bytes.push(0x80 | (cp & 0x3f));
-                        i++;
-                        continue;
+    // A null destination measures the exact allocation needed by encode().
+    // encodeInto() uses the same scalar boundaries when it reaches capacity.
+    const encodeUtf8 = (text, destination) => {
+        const capacity = destination === null ? Infinity : destination.length;
+        let read = 0, written = 0;
+        while (read < text.length && written < capacity) {
+            let point = text.codePointAt(read);
+            if (point >= 0xd800 && point <= 0xdfff) point = 0xfffd;
+            const width = point < 0x80 ? 1 : point < 0x800 ? 2 : point < 0x10000 ? 3 : 4;
+            if (width > capacity - written) break;
+            if (destination !== null) {
+                if (width === 1) destination[written] = point;
+                else {
+                    const lead = width === 2 ? 0xc0 : width === 3 ? 0xe0 : 0xf0;
+                    destination[written] = lead | (point >> (6 * (width - 1)));
+                    for (let offset = 1; offset < width; offset++) {
+                        const shift = 6 * (width - offset - 1);
+                        destination[written + offset] = 0x80 | ((point >> shift) & 0x3f);
                     }
                 }
-                bytes.push(0xe0 | (code >> 12));
-                bytes.push(0x80 | ((code >> 6) & 0x3f));
-                bytes.push(0x80 | (code & 0x3f));
             }
-            return new Uint8Array(bytes);
+            read += point > 0xffff ? 2 : 1;
+            written += width;
+        }
+        return { read, written };
+    };
+    class TextEncoder {
+        get encoding() { return 'utf-8'; }
+        encode(input = '') {
+            const text = `${input}`;
+            const bytes = new Uint8Array(encodeUtf8(text, null).written);
+            encodeUtf8(text, bytes);
+            return bytes;
+        }
+        encodeInto(source, destination) {
+            const text = `${source}`;
+            if (!(destination instanceof Uint8Array)) throw new TypeError('Expected a Uint8Array destination');
+            return encodeUtf8(text, destination);
         }
     }
     globalThis.TextEncoder = TextEncoder;
@@ -52374,6 +52380,36 @@ const defer = () => { let resolve, reject; const promise = new Promise((a,b) => 
                 "{result}",
             );
         });
+    }
+
+    #[test]
+    fn pijs_text_encoder_writes_complete_scalars_into_bounded_views() {
+        assert_web_stream_fixture(
+            r"
+const encoder = new TextEncoder();
+check(encoder.encode('\ud800A\udc00').join(',') === '239,191,189,65,239,191,189', 'unpaired surrogates become replacement scalars');
+check(encoder.encoding === 'utf-8', 'encoder advertises UTF-8');
+check(encoder.encode().length === 0 && encoder.encode(null).join(',') === '110,117,108,108', 'only omitted and undefined input use the empty default');
+const text = 'A\u00e9\u20ac\ud83d\ude42\ud800!';
+const expected = [65,195,169,226,130,172,240,159,153,130,239,191,189,33];
+const units = [[0,0],[1,1],[2,3],[3,6],[5,10],[6,13],[7,14]];
+check(encoder.encode(text).join(',') === expected.join(','), 'scalar widths and astral pairs encode to the expected bytes');
+for (let capacity = 0; capacity <= expected.length + 1; capacity++) {
+    const storage = new Uint8Array(capacity + 4).fill(253);
+    const { read, written } = encoder.encodeInto(text, storage.subarray(2, 2 + capacity));
+    const [expectedRead, expectedWritten] = units.filter(([, count]) => count <= capacity).pop();
+    check(read === expectedRead && written === expectedWritten, 'UTF-16 progress at capacity ' + capacity);
+    check(storage.every((byte, index) => byte === (index >= 2 && index < 2 + written ? expected[index - 2] : 253)), 'only complete scalars touch the destination at capacity ' + capacity);
+}
+for (const invalid of [new Int8Array(8), new Uint8ClampedArray(8), new ArrayBuffer(8), null]) {
+    let refused = false;
+    try { encoder.encodeInto('a', invalid); } catch (error) { refused = error instanceof TypeError; }
+    check(refused, 'invalid destination is refused');
+}
+return checks;
+",
+            40,
+        );
     }
 
     #[test]
