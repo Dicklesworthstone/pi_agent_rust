@@ -120,6 +120,13 @@ fn parse_gitlab_payload(
     text: &str,
     allowed_tools: &std::collections::HashSet<String>,
 ) -> Result<ParsedGitLabPayload> {
+    // Check the original bytes before Value can discard a repeated field.
+    serde_json::from_str::<super::openai::UniqueToolArgumentKeys>(text).map_err(|err| {
+        Error::provider(
+            "gitlab",
+            format!("Invalid GitLab Chat JSON success response: {err}"),
+        )
+    })?;
     let value = serde_json::from_str::<serde_json::Value>(text).map_err(|err| {
         Error::provider(
             "gitlab",
@@ -168,10 +175,10 @@ fn parse_gitlab_payload(
                 };
                 let args = match tc.arguments {
                     val @ serde_json::Value::Object(_) => val,
-                    serde_json::Value::String(raw) => serde_json::from_str(&raw)
-                        .ok()
-                        .filter(serde_json::Value::is_object)
-                        .ok_or_else(invalid_arguments)?,
+                    serde_json::Value::String(raw) if !raw.trim().is_empty() => {
+                        super::openai::parse_final_tool_arguments(&raw)
+                            .map_err(|_| invalid_arguments())?
+                    }
                     _ => return Err(invalid_arguments()),
                 };
                 reported_tool_calls.push(crate::model::ToolCall {
@@ -1802,6 +1809,21 @@ mod tests {
                         if text.text == "Ordinary answer.")
             ));
         }
+    }
+
+    #[test]
+    fn test_gitlab_duplicate_json_keys_withhold_the_native_batch() {
+        let tools = std::collections::HashSet::from(["echo".to_string()]);
+        for ambiguous in [
+            r#"{"name":"echo","name":"echo"}"#,
+            r#"{"name":"echo","arguments":{"items":[{"text":1,"te\u0078t":2}]}}"#,
+            r#"{"name":"echo","arguments":"{\"text\":1,\"text\":2}"}"#,
+        ] {
+            let raw = format!(r#"{{"tool_calls":[{{"name":"echo"}},{ambiguous}]}}"#);
+            assert!(parse_gitlab_payload(&raw, &tools).is_err());
+        }
+        let ambiguous_usage = r#"{"response":"ok","usage":{"input_tokens":10,"input_tokens":1}}"#;
+        assert!(parse_gitlab_payload(ambiguous_usage, &tools).is_err());
     }
 
     #[test]
