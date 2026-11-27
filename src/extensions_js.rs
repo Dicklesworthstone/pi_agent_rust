@@ -31728,29 +31728,51 @@ if (typeof globalThis.fetch !== 'function') {
                 }));
             }
             values(options = {}) {
+                const preventCancel = !!options?.preventCancel;
                 const reader = this.getReader();
                 let ended = false;
+                let ongoing = null;
+                // A return must follow every previously requested chunk. Reserve
+                // the slot before calling user cleanup, which can reenter here.
+                const sequence = (step) => {
+                    const previous = ongoing;
+                    const done = __pi_stream_deferred();
+                    ongoing = done.promise;
+                    const result = previous ? previous.then(step) : step();
+                    const finish = () => {
+                        if (ongoing === done.promise) ongoing = null;
+                        done.resolve();
+                    };
+                    result.then(finish, finish);
+                    return result;
+                };
                 return {
-                    async next() {
-                        if (ended) return { value: undefined, done: true };
-                        try {
-                            const result = await reader.read();
-                            if (result.done) { ended = true; reader.releaseLock(); }
-                            return result;
-                        } catch (error) { ended = true; reader.releaseLock(); throw error; }
+                    next() {
+                        return sequence(async () => {
+                            if (ended) return { value: undefined, done: true };
+                            try {
+                                const result = await reader.read();
+                                if (result.done) { ended = true; reader.releaseLock(); }
+                                return result;
+                            } catch (error) { ended = true; reader.releaseLock(); throw error; }
+                        });
                     },
-                    async return() {
-                        if (!ended) {
-                            ended = true;
-                            try { if (!options.preventCancel) await reader.cancel(); }
-                            finally { reader.releaseLock(); }
-                        }
-                        return { value: undefined, done: true };
+                    return(value) {
+                        return sequence(async () => {
+                            if (!ended) {
+                                ended = true;
+                                let cleanup;
+                                try { if (!preventCancel) cleanup = reader.cancel(value); }
+                                finally { reader.releaseLock(); }
+                                await cleanup;
+                            }
+                            return { value, done: true };
+                        });
                     },
                     [Symbol.asyncIterator]() { return this; },
                 };
             }
-            [Symbol.asyncIterator]() { return this.values(); }
+            [Symbol.asyncIterator](options) { return this.values(options); }
         }
         globalThis.ReadableStream = ReadableStream;
     }
@@ -52413,6 +52435,65 @@ check(!badRead.ok && badRead.error instanceof TypeError, 'malformed next result 
 check(!badCancel.ok && badCancel.error instanceof TypeError, 'malformed return result rejects cancellation');
 const refusing = { [Symbol.asyncIterator]() { return this; }, return() { throw reason; } };
 await rejectsWith(ReadableStream.from(refusing).cancel(), reason, 'producer cleanup failure reaches caller');
+return checks;
+",
+            14,
+        );
+    }
+
+    #[test]
+    fn pijs_web_stream_async_iteration_orders_reads_and_return() {
+        assert_web_stream_fixture(
+            r"
+let controller, calls = 0, received;
+const cleanup = defer(), reason = { stopped: true };
+const source = new ReadableStream({
+    start(value) { controller = value; },
+    cancel(value) { calls++; received = value; return cleanup.promise; },
+});
+const iterator = source.values();
+const first = iterator.next(), second = iterator.next();
+const stop = iterator.return(reason), afterStop = iterator.next();
+let finished = false;
+stop.then(() => { finished = true; });
+await tick();
+check(calls === 0 && source.locked, 'return queues behind both pending next calls');
+controller.enqueue('one');
+check((await success(first, 'first read')).value === 'one' && calls === 0, 'first chunk survives queued return');
+controller.enqueue('two');
+check((await success(second, 'second read')).value === 'two', 'second chunk survives queued return');
+await tick();
+check(calls === 1 && received === reason, 'producer sees the caller-supplied return reason once');
+check(!source.locked && !finished, 'cancellation releases the reader before cleanup settles');
+cleanup.resolve();
+const terminal = await success(stop, 'early return');
+check(terminal.done && terminal.value === reason, 'return preserves its value');
+check((await success(afterStop, 'post-return read')).done, 'read queued after return sees EOF');
+
+let cancellations = 0;
+const options = { preventCancel: true };
+const keep = new ReadableStream({
+    start(c) { c.enqueue(1); c.enqueue(2); },
+    cancel() { cancellations++; },
+});
+const preserving = keep[Symbol.asyncIterator](options);
+options.preventCancel = false;
+check((await success(preserving.next(), 'first retained chunk')).value === 1, 'iteration reads first chunk');
+await success(preserving.return(), 'preserve producer');
+check(!keep.locked && cancellations === 0, 'iterator snapshots preventCancel before reading');
+check((await success(keep.getReader().read(), 'resume with new reader')).value === 2, 'a new reader can consume the remaining data');
+
+let failureController;
+const failed = new ReadableStream({ start(c) { failureController = c; } });
+const failing = failed.values(), pending = failing.next(), following = failing.next();
+failureController.error(reason);
+await rejectsWith(pending, reason, 'first queued next receives producer error');
+check((await success(following, 'next after error')).done && !failed.locked, 'queued iteration finishes after producer error');
+
+const refusing = new ReadableStream({ cancel() { throw reason; } });
+const refused = refusing.values();
+await rejectsWith(refused.return(reason), reason, 'cleanup rejection reaches return');
+check(!refusing.locked && (await success(refused.next(), 'next after failed cleanup')).done, 'cleanup failure leaves iterator terminal and stream unlocked');
 return checks;
 ",
             14,
