@@ -1356,8 +1356,10 @@ pub(crate) fn complete_partial_json(input: &str) -> Option<serde_json::Value> {
         return None;
     }
     // Fast path: the accumulated prefix is already valid JSON.
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
-        return Some(value);
+    match parse_unique_json_value(s) {
+        Ok(value) => return Some(value),
+        Err(err) if err.is_data() => return None,
+        Err(_) => {}
     }
 
     // Structural scan to learn what is still open.
@@ -1402,7 +1404,7 @@ pub(crate) fn complete_partial_json(input: &str) -> Option<serde_json::Value> {
         out.push(closer);
     }
 
-    serde_json::from_str::<serde_json::Value>(&out).ok()
+    parse_unique_json_value(&out).ok()
 }
 
 /// Before appending a container's closer, drop a trailing comma, and (for an
@@ -2241,6 +2243,14 @@ pub(super) fn parse_final_tool_arguments(
     Ok(arguments)
 }
 
+/// Decode a value only when every object has unambiguous field names. Use the
+/// same decoded-key check as terminal tool arguments, including escaped keys.
+pub(crate) fn parse_unique_json_value(raw: &str) -> serde_json::Result<serde_json::Value> {
+    let value = serde_json::from_str(raw)?;
+    serde_json::from_str::<UniqueToolArgumentKeys>(raw)?;
+    Ok(value)
+}
+
 /// Validation-only JSON traversal that rejects duplicate decoded object keys
 /// before serde_json::Value can silently keep the last occurrence.
 pub(super) struct UniqueToolArgumentKeys;
@@ -3036,6 +3046,20 @@ mod tests {
         assert_eq!(
             complete_partial_json(r#"{"path": "src/lib.rs", "content": "hello"}"#),
             Some(json!({"path": "src/lib.rs", "content": "hello"}))
+        );
+    }
+
+    #[test]
+    fn ambiguous_arguments_cannot_replace_the_last_good_preview() {
+        for raw in [
+            r#"{"text":1,"text":2}"#,
+            r#"{"items":[{"text":1,"te\u0078t":2"#,
+        ] {
+            assert_eq!(complete_partial_json(raw), None);
+        }
+        assert_eq!(
+            complete_partial_json(r#"{"items":[{"text":1},{"text":2"#),
+            Some(serde_json::json!({"items": [{"text":1}, {"text":2}]}))
         );
     }
 
