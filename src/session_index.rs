@@ -232,6 +232,19 @@ impl SessionIndex {
         self.list_sessions_for_cwds(cwd.as_slice())
     }
 
+    /// Query indexed sessions for any verified path spelling of `cwd` without
+    /// triggering a full namespace reindex (suitable for latency-sensitive
+    /// shell completion queries).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session index database cannot be opened or queried.
+    pub fn list_sessions_for_workspace(&self, cwd: &Path) -> Result<Vec<SessionMeta>> {
+        let workspace = DiscoveryWorkspace::new(cwd);
+        let keys: Vec<_> = workspace.spellings.iter().map(String::as_str).collect();
+        self.list_sessions_for_cwds(&keys)
+    }
+
     fn list_sessions_for_cwds(&self, cwds: &[&str]) -> Result<Vec<SessionMeta>> {
         self.with_lock(|conn| {
             init_schema(conn)?;
@@ -292,7 +305,7 @@ impl SessionIndex {
             Ok(sessions) => sessions,
             Err(error) => {
                 tracing::warn!(error = %error, "Session index unavailable; reading saved metadata");
-                walk_sessions(self.sessions_root())
+                let mut sessions: Vec<SessionMeta> = walk_sessions(self.sessions_root())
                     .into_iter()
                     .filter_map(|path| {
                         let path = path.ok()?;
@@ -309,7 +322,13 @@ impl SessionIndex {
                             }
                         }
                     })
-                    .collect()
+                    .collect();
+                sessions.sort_by(|a, b| {
+                    b.last_modified_ms
+                        .cmp(&a.last_modified_ms)
+                        .then_with(|| a.path.cmp(&b.path))
+                });
+                sessions
             }
         }
     }
@@ -1851,6 +1870,54 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "target");
         assert!(workspace.matches(&rows[0].cwd));
+
+        let fast_rows = index
+            .list_sessions_for_workspace(&project.join("."))
+            .expect("indexed workspace spelling lookup");
+        assert_eq!(fast_rows.len(), 1);
+        assert_eq!(fast_rows[0].id, "target");
+        let other_rows = index
+            .list_sessions_for_workspace(&other.join("."))
+            .expect("other workspace spelling lookup");
+        assert_eq!(other_rows.len(), 1);
+        assert_eq!(other_rows[0].id, "unrelated");
+    }
+
+    #[test]
+    fn discover_sessions_fallback_sorts_newest_first() {
+        let temp = tempfile::tempdir().expect("fixture");
+        let project = temp.path().join("project");
+        let storage = temp.path().join("sessions");
+        fs::create_dir(&project).expect("project dir");
+        fs::create_dir(&storage).expect("storage dir");
+
+        let canonical_cwd = project.canonicalize().expect("canonical cwd");
+        let cwd_str = canonical_cwd.to_str().expect("UTF-8 cwd");
+        let older_path = storage.join("aaa-older.jsonl");
+        let newer_path = storage.join("zzz-newer.jsonl");
+        let newest_path = storage.join("mmm-newest.jsonl");
+        for (path, id, mtime_secs) in [
+            (&older_path, "older", 1_700_000_100),
+            (&newer_path, "newer", 1_700_000_200),
+            (&newest_path, "newest", 1_700_000_300),
+        ] {
+            write_session_jsonl(
+                path,
+                &make_header(id, cwd_str),
+                &[make_user_entry(None, "m1", "turn")],
+            );
+            filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(mtime_secs, 0))
+                .expect("set deterministic mtime");
+        }
+
+        let index = SessionIndex::for_sessions_root(&storage);
+        // Place a directory at db_path so SQLite open fails even when running as root,
+        // forcing the walk_sessions() fallback path.
+        fs::create_dir(&index.db_path).expect("block db_path with directory");
+
+        let rows = index.discover_sessions(project.join(".").to_str().expect("UTF-8 cwd"));
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, vec!["newest", "newer", "older"]);
     }
 
     #[test]

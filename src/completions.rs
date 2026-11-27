@@ -181,10 +181,20 @@ fn model_candidates(prefix: &str) -> Vec<String> {
 
 fn session_candidates(prefix: &str) -> Vec<String> {
     let index = crate::session_index::SessionIndex::new();
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string());
-    let sessions = index.list_sessions(cwd.as_deref()).unwrap_or_default();
+    let cwd = std::env::current_dir().ok();
+    session_candidates_in(&index, cwd.as_deref(), prefix)
+}
+
+fn session_candidates_in(
+    index: &crate::session_index::SessionIndex,
+    cwd: Option<&std::path::Path>,
+    prefix: &str,
+) -> Vec<String> {
+    let sessions = match cwd {
+        Some(dir) => index.list_sessions_for_workspace(dir),
+        None => index.list_sessions(None),
+    }
+    .unwrap_or_default();
     let lowered = prefix.to_ascii_lowercase();
     let mut out = Vec::new();
     for meta in sessions {
@@ -198,7 +208,7 @@ fn session_candidates(prefix: &str) -> Vec<String> {
                 .to_ascii_lowercase()
                 .contains(&lowered)
         {
-            out.push(meta.path.clone());
+            out.push(meta.path);
         }
     }
     out
@@ -335,5 +345,55 @@ mod tests {
         let all = model_candidates("");
         let filtered = model_candidates("ANTHROPIC");
         assert!(filtered.len() <= all.len());
+    }
+
+    #[test]
+    fn session_candidates_match_canonical_workspace_spellings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        let other = tmp.path().join("other");
+        let storage = tmp.path().join("sessions");
+        std::fs::create_dir(&project).expect("project dir");
+        std::fs::create_dir(&other).expect("other dir");
+        std::fs::create_dir(&storage).expect("storage dir");
+
+        let canonical_project = project.canonicalize().expect("canonical project");
+        let canonical_other = other.canonicalize().expect("canonical other");
+        let index = crate::session_index::SessionIndex::for_sessions_root(&storage);
+        index
+            .upsert_session_meta(crate::session_index::SessionMeta {
+                path: storage.join("target.jsonl").display().to_string(),
+                id: "sess-target".to_string(),
+                cwd: canonical_project.display().to_string(),
+                timestamp: "2026-11-27T00:00:00Z".to_string(),
+                message_count: 2,
+                last_modified_ms: 2_000,
+                size_bytes: 128,
+                name: Some("Alpha Work".to_string()),
+            })
+            .expect("upsert target");
+        index
+            .upsert_session_meta(crate::session_index::SessionMeta {
+                path: storage.join("other.jsonl").display().to_string(),
+                id: "sess-other".to_string(),
+                cwd: canonical_other.display().to_string(),
+                timestamp: "2026-11-27T00:00:00Z".to_string(),
+                message_count: 1,
+                last_modified_ms: 1_000,
+                size_bytes: 64,
+                name: Some("Other".to_string()),
+            })
+            .expect("upsert other");
+
+        let dot_spelling = project.join(".");
+        let matched = session_candidates_in(&index, Some(&dot_spelling), "alpha");
+        assert_eq!(
+            matched,
+            vec![storage.join("target.jsonl").display().to_string()]
+        );
+        assert!(
+            session_candidates_in(&index, Some(&dot_spelling), "other").is_empty(),
+            "unrelated workspace sessions must not leak into completion candidates"
+        );
     }
 }

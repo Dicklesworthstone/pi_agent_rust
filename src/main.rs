@@ -6335,7 +6335,7 @@ async fn handle_handoff(
         } else {
             let index = pi::session_index::SessionIndex::new();
             let cwd_str = cwd.display().to_string();
-            let sessions = index.list_sessions(Some(&cwd_str))?;
+            let sessions = index.discover_sessions(&cwd_str);
             if let Some(matching) = sessions.iter().find(|s| s.id == spec) {
                 Session::open(&matching.path).await?
             } else {
@@ -6345,7 +6345,7 @@ async fn handle_handoff(
     } else {
         let index = pi::session_index::SessionIndex::new();
         let cwd_str = cwd.display().to_string();
-        let sessions = index.list_sessions(Some(&cwd_str))?;
+        let sessions = index.discover_sessions(&cwd_str);
         if let Some(latest) = sessions.first() {
             Session::open(&latest.path).await?
         } else {

@@ -493,9 +493,13 @@ fn subcommands_section(readme_text: &str) -> &str {
         .find("### Subcommands\n")
         .expect("README has a `### Subcommands` section"); // ubs:ignore test assertion
     let rest = &readme_text[start..];
-    let end = rest[1..]
-        .find("\n## ")
-        .map_or(rest.len(), |offset| offset + 1);
+    let next_h2 = rest[1..].find("\n## ");
+    let next_h3 = rest[1..].find("\n### ");
+    let end = match (next_h2, next_h3) {
+        (Some(a), Some(b)) => a.min(b) + 1,
+        (Some(a), None) | (None, Some(a)) => a + 1,
+        (None, None) => rest.len(),
+    };
     &rest[..end]
 }
 
@@ -531,5 +535,13 @@ fn readme_subcommands_cover_all_visible_cli_commands() {
     assert!(
         missing.is_empty(),
         "visible CLI subcommands omitted from README `### Subcommands`: {missing:?}"
+    );
+
+    // Planted-red: a subsequent `###` subsection must not mask an omitted subcommand.
+    let bounded = subcommands_section("### Subcommands\n- `alpha`\n### Other\n- `beta`\n## Next\n");
+    assert!(bounded.contains("`alpha`"));
+    assert!(
+        !bounded.contains("`beta`"),
+        "subcommands_section must stop at the next `###` heading: {bounded:?}"
     );
 }
