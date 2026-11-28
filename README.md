@@ -795,13 +795,16 @@ ownership, including during cancellation and cleanup. The low-level SDK's
 explicit durable-owner job observation and teardown APIs remain owner-wide.
 
 SDK handle shutdown and replacement retire only that handle's live job scope,
-including shell and native jobs from sessions previously selected within it.
+including shell jobs, foreground subagents, `/tan`, and persistent workers
+from sessions previously selected within it.
 The admission fence and cancellation requests are installed before waiting for
-session saves or locks. Dropping shutdown leaves the fence closed; awaiting it
-confirms bounded cancellation, process reaping, and output draining. Discarding
-a replacement candidate cannot stop an active handle's jobs merely because
-both loaded the same saved session. Bound SDK `read` and `grep` calls also
-resolve `agent://` results through the same live owner as native delegation.
+session saves or locks. Dropping shutdown leaves the fence closed. Awaiting it
+waits within bounded budgets for process reaping, output draining, isolated
+writeback disposition, and accepted-result retention; unfinished cleanup is
+reported instead of treating a cancelled roster entry as proof of process exit.
+Discarding a replacement candidate cannot stop an active handle's work merely
+because both loaded the same saved session. Bound SDK `read` and `grep` calls
+also resolve `agent://` results through the same live owner as native delegation.
 
 Sibling messages enter the recipient's steering queue between turns and remain
 available in its inbox. The parent reads child reports with

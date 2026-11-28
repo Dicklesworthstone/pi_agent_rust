@@ -342,6 +342,28 @@ impl AgentHubRegistry {
         self.job_scope.clone()
     }
 
+    pub(crate) fn scope_is_closed(&self) -> bool {
+        self.job_scope.as_ref().is_some_and(|scope| scope.is_closed())
+    }
+
+    /// Revoke every unfinished child while its native execution lease keeps
+    /// responsibility for process-tree reap and worktree disposition. Status
+    /// alone is not proof of cleanup: live PID authority must survive until
+    /// the process lease actually observes or performs the reap.
+    pub(crate) fn retire_scope_children(&mut self) {
+        let finished_ms = now_ms();
+        for entry in self.entries.values_mut() {
+            if !entry.status.settled() {
+                entry.status = ChildStatus::Cancelled;
+                entry.finished_ms = Some(finished_ms);
+            }
+        }
+    }
+
+    pub(crate) fn native_cleanup_pending(&self) -> bool {
+        !self.active_executions.is_empty() || !self.live_processes.is_empty()
+    }
+
     pub(crate) fn admits_native_owner(&self, session_id: &str) -> bool {
         self.owner_session_id
             .as_deref()
@@ -596,6 +618,9 @@ impl AgentHubRegistry {
     /// Mark a newly spawned child running. A late spawn callback cannot
     /// resurrect an already killed or cancelled run.
     pub fn mark_running(&mut self, id: &str, pid: u32) {
+        if self.scope_is_closed() {
+            return;
+        }
         if let Some(entry) = self.entries.get_mut(id)
             && entry.status == ChildStatus::Starting
         {
@@ -609,7 +634,8 @@ impl AgentHubRegistry {
     /// its process has been reaped. Historical `entry.pid` is not authority:
     /// the live-process map must be empty before another child can own it.
     pub(crate) fn can_start_schema_correction(&self, id: &str) -> bool {
-        self.active_executions.contains(id)
+        !self.scope_is_closed()
+            && self.active_executions.contains(id)
             && self.native_launches.contains_key(id)
             && self.control_pid(id).is_none()
             && self
@@ -1561,6 +1587,38 @@ mod tests {
             fs::read_to_string(retained.join(child.transcript_path.file_name().unwrap())).unwrap(),
             "original history\n"
         );
+    }
+
+    #[test]
+    fn scope_retirement_retains_native_cleanup_until_both_process_and_execution_retire() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = crate::jobs::JobSessionScope::fixed("native-cleanup-lease");
+        let registry = scope.agent_hub_for_session("native-cleanup-lease").unwrap();
+        let (active, complete) = {
+            let mut hub = registry.lock().unwrap();
+            hub.set_dir_for_tests(root.path().to_path_buf());
+            let active = hub.register("active", "pending result acceptance").unwrap();
+            hub.active_executions.insert(active.id.clone());
+            hub.mark_running(&active.id, 123);
+            let complete = hub.register("complete", "already accepted").unwrap();
+            hub.settle(&complete.id, ChildStatus::Done);
+            (active, complete)
+        };
+        drop(scope.begin_shutdown().unwrap());
+        let mut hub = registry.lock().unwrap();
+        assert!(hub.scope_is_closed());
+        assert_eq!(hub.get(&active.id).unwrap().status, ChildStatus::Cancelled);
+        assert_eq!(hub.get(&complete.id).unwrap().status, ChildStatus::Done);
+        assert_eq!(hub.control_pid(&active.id), Some(123));
+        assert!(hub.native_cleanup_pending());
+        assert!(!hub.can_start_schema_correction(&active.id));
+        assert!(hub.native_revival_source(&active.id).is_err());
+        hub.mark_running(&active.id, 456);
+        assert_eq!(hub.control_pid(&active.id), Some(123));
+        hub.mark_process_reaped(&active.id);
+        assert!(hub.native_cleanup_pending(), "unapplied result lease still owns cleanup");
+        hub.finish_native_execution(&active.id);
+        assert!(!hub.native_cleanup_pending());
     }
 
     #[test]

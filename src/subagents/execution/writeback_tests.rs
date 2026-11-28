@@ -422,6 +422,54 @@ fn parent_cancel_and_hub_kill_reject_queued_native_writeback_and_preserve_edits(
 }
 
 #[test]
+fn scope_retirement_rejects_queued_writeback_before_reporting_native_cleanup_done() {
+    let _guard = crate::jobs::process_test_guard();
+    let (_root, mut runner, request) = fixture();
+    let scope = crate::jobs::JobSessionScope::fixed("retiring-writeback");
+    let hub = scope.agent_hub_for_session("retiring-writeback").unwrap();
+    runner.hub = Arc::clone(&hub);
+    let agents = BTreeMap::from([("tan".to_string(), super::super::tan_agent_definition())]);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(crate::agent_hub::with_registry(Arc::clone(&hub), async {
+        let owner = AgentCx::for_request();
+        let pending = owner
+            .with_current(runner.run_pending(&agents, request, None, None, None))
+            .await;
+        let PendingRun::AwaitingWriteback { attempt, .. } = &pending else {
+            panic!("native child must reach ordered writeback");
+        };
+        let id = attempt.result.hub_id.clone().unwrap();
+        let worktree = attempt.isolation.as_ref().unwrap().0.path.clone();
+        {
+            let hub = hub.lock().unwrap();
+            assert_eq!(hub.get(&id).unwrap().status, ChildStatus::Running);
+            assert!(hub.control_pid(&id).is_none());
+            assert!(hub.native_cleanup_pending());
+        }
+        let held = HeldApply::new();
+        let mut finishing = Box::pin(pending.finish(None));
+        assert!(futures::poll!(&mut finishing).is_pending());
+        let mut shutdown = Box::pin(scope.begin_shutdown().unwrap().finish());
+        assert!(futures::poll!(&mut shutdown).is_pending(), "reaped process still retains its worktree disposition lease");
+        let result = finishing.await;
+        shutdown.await.unwrap();
+        // Both complete while the unrelated writer still holds the lane.
+        held.release();
+        assert!(owner.checkpoint().is_ok(), "scope retirement does not cancel an unrelated request context");
+        assert!(matches!(result.status, SubagentStatus::Cancelled));
+        assert!(result.is_error);
+        assert!(!hub.lock().unwrap().native_cleanup_pending());
+        let isolation = result.iso.unwrap();
+        assert!(!isolation.applied);
+        assert_eq!(isolation.apply_mode, "keep");
+        assert!(isolation.patch.contains("child edit"));
+        assert_eq!(PathBuf::from(isolation.worktree_path), worktree);
+        assert_eq!(fs::read(runner.cwd.join("tracked.txt")).unwrap(), b"original\n");
+        assert_eq!(fs::read(worktree.join("tracked.txt")).unwrap(), b"child edit\n");
+    }));
+}
+
+#[test]
 fn dropping_queued_native_writeback_settles_ownership_without_installing_edits() {
     let (_root, runner, request) = fixture();
     let agents = BTreeMap::from([("tan".to_string(), super::super::tan_agent_definition())]);

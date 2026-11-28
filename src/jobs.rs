@@ -79,6 +79,7 @@ pub struct JobSessionScope {
 pub(crate) struct JobScopeLifecycle {
     instance_id: String,
     closed: AtomicBool,
+    closed_notify: Notify,
 }
 
 impl JobScopeLifecycle {
@@ -114,6 +115,7 @@ impl JobSessionScope {
             lifecycle: Arc::new(JobScopeLifecycle {
                 instance_id: instance_id.clone(),
                 closed: AtomicBool::new(false),
+                closed_notify: Notify::new(),
             }),
             instance_id,
             agent_hubs: Arc::new(Mutex::new(HashMap::new())),
@@ -137,6 +139,9 @@ impl JobSessionScope {
                 "PI_HUB_SESSION_UNAVAILABLE: session hub registry is poisoned",
             )
         })?;
+        // Retirement snapshots this map after closing admission. A caller
+        // that waited for the map must not create a hub outside that snapshot.
+        self.lifecycle.ensure_open()?;
         Ok(Arc::clone(
             hubs.entry(session_id.to_string()).or_insert_with(|| {
                 Arc::new(Mutex::new(crate::agent_hub::AgentHubRegistry::for_job_scope(
@@ -216,6 +221,16 @@ impl JobSessionScope {
         &self.instance_id
     }
 
+    /// Wait for this exact live registry to retire. The permanent flag makes
+    /// late subscribers ready too; unrelated request cancellation does not
+    /// satisfy this signal or consume another subscriber's notification.
+    pub async fn wait_for_shutdown(&self) {
+        self.lifecycle
+            .closed_notify
+            .wait_until(|| self.lifecycle.is_closed())
+            .await;
+    }
+
     /// Rebind this shared scope to a live session resolver.
     pub fn bind(&self, resolver: JobSessionIdResolver) {
         *self
@@ -233,8 +248,20 @@ impl JobSessionScope {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let session_id = resolver()
-            .await
+        let session_id = {
+            let resolved = resolver().fuse();
+            let retired = self.wait_for_shutdown().fuse();
+            futures::pin_mut!(resolved, retired);
+            // A retired handle cannot keep a bound invocation suspended in an
+            // arbitrary host resolver. Closing wins a simultaneous Ready, and
+            // dropping the resolver preserves its ordinary cancellation path.
+            futures::select_biased! {
+                () = retired => None,
+                session_id = resolved => session_id,
+            }
+        };
+        self.lifecycle.ensure_open()?;
+        let session_id = session_id
             .filter(|session_id| !session_id.trim().is_empty())
             .ok_or_else(|| {
                 Error::tool(
@@ -255,8 +282,9 @@ impl JobSessionScope {
     /// requested; call [`JobScopeShutdown::finish`] to confirm bounded cleanup.
     pub fn begin_shutdown(&self) -> Result<JobScopeShutdown> {
         self.lifecycle.closed.store(true, Ordering::Release);
+        self.lifecycle.closed_notify.notify_waiters();
         let locked = registry().lock();
-        let poisoned = locked.is_err();
+        let mut poisoned = locked.is_err();
         // Cleanup authority survives a poisoned observer or publisher. Report
         // the fault, but still close admission and request every cancellation.
         let mut reg = locked.unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -270,11 +298,38 @@ impl JobSessionScope {
             job.cancel_requested = true;
         }
         drop(reg);
+        // Never hold the jobs or hub-map lock while taking a child hub lock.
+        // Native admission can inspect jobs while owning its hub, so reversing
+        // that order here would deadlock process cancellation and reap.
+        let locked = self.agent_hubs.lock();
+        poisoned |= locked.is_err();
+        let hubs = locked
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for hub in &hubs {
+            match hub.try_lock() {
+                Ok(mut hub) => hub.retire_scope_children(),
+                // The atomic scope fence already revokes native checkpoints.
+                // Reap and transcript I/O can hold this mutex: leave bounded
+                // observation to the token instead of blocking first poll.
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    poisoned = true;
+                    error.into_inner().retire_scope_children();
+                }
+            }
+        }
         if poisoned {
-            return Err(Error::tool("jobs", "jobs registry poisoned during scope shutdown"));
+            return Err(Error::tool(
+                "jobs",
+                "PI_JOBS_SCOPE_SHUTDOWN_POISONED: registry poisoned during scope shutdown; admissions remain closed and cancellation requested",
+            ));
         }
         Ok(JobScopeShutdown {
             lifecycle: Arc::clone(&self.lifecycle),
+            hubs,
         })
     }
 }
@@ -4486,16 +4541,65 @@ fn enqueue_owned_completion_notice(
 /// owned cancellation; this token never reopens the registry when dropped.
 pub struct JobScopeShutdown {
     lifecycle: Arc<JobScopeLifecycle>,
+    hubs: Vec<crate::agent_hub::SharedHub>,
 }
 
 impl JobScopeShutdown {
     /// Wait for in-flight spawn publication to stop, then confirm that this
-    /// registry's jobs have completed cancellation, reap and output draining.
+    /// registry's jobs and native children have completed cancellation, reap,
+    /// output draining and pending worktree disposition.
     /// Other live registries, including ones loading the same saved session,
     /// remain available throughout this bounded operation.
     pub async fn finish(self) -> Result<()> {
-        let handles = self.snapshot().await?;
-        finish_shutdown_handles(&handles).await
+        // Both cleanup paths must be observed even if one fails. Neither uses
+        // the cancelled caller's timer or requires its session resolver/store.
+        let jobs = async {
+            let handles = self.snapshot().await?;
+            finish_shutdown_handles(&handles).await
+        };
+        let children = self.finish_children(SESSION_SHUTDOWN_TIMEOUT);
+        match futures::join!(jobs, children) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(jobs), Err(children)) => Err(Error::tool(
+                "jobs",
+                format!("{jobs}; {children}"),
+            )),
+        }
+    }
+
+    async fn finish_children(&self, timeout: Duration) -> Result<()> {
+        if scope_children_settled(&self.hubs)? {
+            return Ok(());
+        }
+        let receiver = {
+            #[cfg(test)]
+            let _shutdown_isolation = acquire_shutdown_capacity_read_guard();
+            let worker = SessionShutdownWorker::reserve()?;
+            let hubs = self.hubs.clone();
+            let started = Instant::now();
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            std::thread::Builder::new()
+                .name("pi-scope-child-shutdown".to_string())
+                .spawn(move || {
+                    let result = wait_scope_children(&hubs, started, timeout, || sender.is_canceled());
+                    let _ = sender.send(result);
+                    drop(worker);
+                })
+                .map_err(|error| {
+                    Error::tool(
+                        "hub",
+                        format!("PI_HUB_SCOPE_SHUTDOWN_WORKER: failed to start cleanup observer: {error}"),
+                    )
+                })?;
+            receiver
+        };
+        receiver.await.map_err(|_| {
+            Error::tool(
+                "hub",
+                "PI_HUB_SCOPE_SHUTDOWN_WORKER: cleanup observer exited without a result",
+            )
+        })?
     }
 
     async fn snapshot(&self) -> Result<Vec<JobWaitHandle>> {
@@ -4532,6 +4636,56 @@ impl JobScopeShutdown {
                 "PI_JOBS_SESSION_SHUTDOWN_WORKER: worker exited without a scope snapshot",
             )
         })?
+    }
+}
+
+fn scope_children_settled(hubs: &[crate::agent_hub::SharedHub]) -> Result<bool> {
+    let mut settled = true;
+    for hub in hubs {
+        match hub.try_lock() {
+            Ok(mut hub) => {
+                // A contended hub may have skipped synchronous retirement.
+                // Cancel its roster before accepting even an empty native
+                // lease set, including public Starting-only registrations.
+                hub.retire_scope_children();
+                settled &= !hub.native_cleanup_pending();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => settled = false,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(Error::tool(
+                    "hub",
+                    "PI_HUB_SCOPE_SHUTDOWN_POISONED: cannot verify native child cleanup",
+                ));
+            }
+        }
+    }
+    Ok(settled)
+}
+
+fn wait_scope_children(
+    hubs: &[crate::agent_hub::SharedHub],
+    started: Instant,
+    timeout: Duration,
+    abandoned: impl Fn() -> bool,
+) -> Result<()> {
+    let deadline = started.checked_add(timeout).unwrap_or(started);
+    loop {
+        if abandoned() {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_SCOPE_SHUTDOWN_ABANDONED: native cleanup observer was dropped",
+            ));
+        }
+        if scope_children_settled(hubs)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_SCOPE_SHUTDOWN_INCOMPLETE: native child execution or process reap remains pending",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -8630,6 +8784,132 @@ mod tests {
         }
         assert!(registry().lock().unwrap().jobs[&id].cancel_requested);
         registry().lock().unwrap().jobs.remove(&id);
+    }
+
+    #[test]
+    fn scope_shutdown_drops_a_stalled_session_resolver_and_refuses_late_resolution() {
+        struct PendingResolver(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl std::future::Future for PendingResolver {
+            type Output = Option<String>;
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for PendingResolver {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let _guard = process_test_guard();
+        let scope = JobSessionScope::fixed("stalled-scope-resolver");
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        scope.bind({
+            let started = Arc::clone(&started);
+            let dropped = Arc::clone(&dropped);
+            Arc::new(move || {
+                started.fetch_add(1, Ordering::AcqRel);
+                Box::pin(PendingResolver(Arc::clone(&dropped)))
+            })
+        });
+        futures::executor::block_on(async {
+            let mut resolution = Box::pin(scope.session_id());
+            assert!(futures::poll!(&mut resolution).is_pending());
+            assert_eq!(started.load(Ordering::Acquire), 1);
+            assert_eq!(dropped.load(Ordering::Acquire), 0);
+            drop(scope.begin_shutdown().unwrap());
+            let std::task::Poll::Ready(result) = futures::poll!(&mut resolution) else {
+                panic!("scope retirement must wake the original pending resolver");
+            };
+            assert!(result.unwrap_err().to_string().contains("PI_JOBS_SCOPE_CLOSED"));
+            assert_eq!(dropped.load(Ordering::Acquire), 1);
+            assert!(scope.session_id().await.is_err());
+            assert_eq!(started.load(Ordering::Acquire), 1, "late admission must not even start the resolver");
+            scope.begin_shutdown().unwrap().finish().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn scope_shutdown_signal_is_permanent_shared_and_independent_of_same_id_peers() {
+        let _guard = process_test_guard();
+        futures::executor::block_on(async {
+            let scope = JobSessionScope::fixed("shared-shutdown-signal");
+            let cloned = scope.clone();
+            let peer = JobSessionScope::fixed("shared-shutdown-signal");
+            let mut first = Box::pin(scope.wait_for_shutdown());
+            let mut second = Box::pin(cloned.wait_for_shutdown());
+            let mut foreign = Box::pin(peer.wait_for_shutdown());
+            assert!(futures::poll!(&mut first).is_pending());
+            assert!(futures::poll!(&mut second).is_pending());
+            assert!(futures::poll!(&mut foreign).is_pending());
+            drop(scope.begin_shutdown().unwrap());
+            assert!(futures::poll!(&mut first).is_ready());
+            assert!(futures::poll!(&mut second).is_ready());
+            assert!(futures::poll!(&mut foreign).is_pending());
+            let mut late = Box::pin(cloned.wait_for_shutdown());
+            assert!(futures::poll!(&mut late).is_ready());
+            scope.begin_shutdown().unwrap().finish().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn scope_shutdown_does_not_block_first_poll_behind_a_busy_child_hub() {
+        let _guard = process_test_guard();
+        let root = tempfile::tempdir().unwrap();
+        let scope = JobSessionScope::fixed("busy-scope-hub");
+        let hub = scope.agent_hub_for_session("busy-scope-hub").unwrap();
+        let child = {
+            let mut hub = hub.lock().unwrap();
+            hub.set_dir_for_tests(root.path().to_path_buf());
+            hub.register("starting", "not yet owned by a native lease").unwrap()
+        };
+        futures::executor::block_on(async {
+            let held = hub.lock().unwrap();
+            let shutdown = scope.begin_shutdown().unwrap();
+            let mut signal = Box::pin(scope.wait_for_shutdown());
+            assert!(futures::poll!(&mut signal).is_ready(), "retirement is visible before the busy hub unlocks");
+            assert_eq!(held.get(&child.id).unwrap().status, crate::agent_hub::ChildStatus::Starting);
+            let mut finish = Box::pin(shutdown.finish());
+            assert!(futures::poll!(&mut finish).is_pending());
+            drop(held);
+            finish.await.unwrap();
+        });
+        assert_eq!(hub.lock().unwrap().get(&child.id).unwrap().status, crate::agent_hub::ChildStatus::Cancelled);
+    }
+
+    #[test]
+    fn scope_shutdown_reports_unreaped_native_process_without_losing_pid_authority() {
+        let _guard = process_test_guard();
+        let root = tempfile::tempdir().unwrap();
+        let scope = JobSessionScope::fixed("unreaped-native-process");
+        let hub = scope.agent_hub_for_session("unreaped-native-process").unwrap();
+        let child = {
+            let mut hub = hub.lock().unwrap();
+            hub.set_dir_for_tests(root.path().to_path_buf());
+            let child = hub.register("worker", "pending cleanup").unwrap();
+            hub.mark_running(&child.id, 123);
+            child
+        };
+        let shutdown = scope.begin_shutdown().unwrap();
+        assert_eq!(hub.lock().unwrap().control_pid(&child.id), Some(123));
+        let error = futures::executor::block_on(shutdown.finish_children(Duration::from_millis(20)))
+            .expect_err("terminal status alone cannot prove process reap");
+        assert!(error.to_string().contains("PI_HUB_SCOPE_SHUTDOWN_INCOMPLETE"));
+        {
+            let mut hub = hub.lock().unwrap();
+            assert_eq!(hub.get(&child.id).unwrap().status, crate::agent_hub::ChildStatus::Cancelled);
+            assert_eq!(hub.control_pid(&child.id), Some(123));
+            assert!(hub.register("late", "must stay fenced").is_err());
+            hub.mark_process_reaped(&child.id);
+        }
+        futures::executor::block_on(shutdown.finish()).unwrap();
     }
 
     #[cfg(unix)]

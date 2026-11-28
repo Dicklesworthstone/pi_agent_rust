@@ -2386,6 +2386,53 @@ done
     }
 
     #[test]
+    fn live_scope_retirement_reaps_idle_worker_and_preserves_same_session_peer() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(RPC_CHILD);
+        let mut peer = Fixture::new(RPC_CHILD);
+        peer.owner.clone_from(&fixture.owner);
+        peer.tool.bind_job_session_scope(crate::jobs::JobSessionScope::fixed(&peer.owner));
+        let scope = fixture.tool.job_session_scope.clone();
+        let hub = scope.agent_hub_for_session(&fixture.owner).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let started = fixture.call(json!({"operation":"worker_start", "agent":"worker", "task":"immediate answer"})).await;
+            let worker = field(&started, "workerId");
+            let peer_started = peer.call(json!({"operation":"worker_start", "agent":"worker", "task":"peer answer"})).await;
+            let peer_worker = field(&peer_started, "workerId");
+            let first = fixture.wait(&worker, 1).await;
+            let second = peer.wait(&peer_worker, 1).await;
+            let pid = native_result(&first)["pid"].as_i64()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .and_then(rustix::process::Pid::from_raw).unwrap();
+            let peer_pid = native_result(&second)["pid"].as_i64()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .and_then(rustix::process::Pid::from_raw).unwrap();
+            assert!(rustix::process::test_kill_process(pid).is_ok());
+            assert!(rustix::process::test_kill_process(peer_pid).is_ok());
+            assert!(hub.lock().unwrap().native_cleanup_pending());
+            scope.begin_shutdown().unwrap().finish().await.unwrap();
+            assert!(rustix::process::test_kill_process(pid).is_err(), "native cleanup must await the retained worker's actual reap");
+            assert!(rustix::process::test_kill_process(peer_pid).is_ok(), "another live handle with the same durable ID retains its worker");
+            {
+                let hub = hub.lock().unwrap();
+                assert!(!hub.native_cleanup_pending());
+                assert!(hub.roster().iter().all(|entry| entry.status == crate::agent_hub::ChildStatus::Cancelled));
+            }
+            assert!(fixture.tool.execute(
+                "late-worker-send",
+                json!({"operation":"worker_send", "workerId":worker, "task":"must not reach the child"}),
+                None,
+            ).await.is_err());
+            peer.call(json!({"operation":"worker_send", "workerId":peer_worker, "task":"keep using the same process"})).await;
+            let continued = peer.wait(&peer_worker, 2).await;
+            assert_eq!(native_result(&continued)["pid"], native_result(&second)["pid"]);
+            peer.call(json!({"operation":"worker_close", "workerId":peer_worker})).await;
+            assert!(rustix::process::test_kill_process(peer_pid).is_err());
+        });
+    }
+
+    #[test]
     fn session_shutdown_reaps_a_worker_that_stops_reading_commands() {
         let _guard = crate::jobs::process_test_guard();
         let fixture = Fixture::new(
