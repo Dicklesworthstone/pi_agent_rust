@@ -1441,8 +1441,15 @@ async fn run_with_input(
                             continue;
                         };
 
-                        let mut prompt_command = match mcp::command_from_prompt(prompt_blocks) {
-                            Ok(command) => command.map(commands::PromptCommand::Mcp),
+                        let mut prompt_command = match commands::context_from_prompt(prompt_blocks) {
+                            Ok(Some(command)) => Some(command),
+                            Ok(None) => match mcp::command_from_prompt(prompt_blocks) {
+                                Ok(command) => command.map(commands::PromptCommand::Mcp),
+                                Err(error) => {
+                                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                                    continue;
+                                }
+                            },
                             Err(error) => {
                                 let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
                                 continue;
@@ -3864,24 +3871,42 @@ async fn run_prompt(
         event_handler(event);
     });
     let commands_before = commands::available(Some(&agent_session), mcp_state.is_some());
-    let (mcp_command, extension_command) = match command {
-        Some(commands::PromptCommand::Mcp(command)) => (Some(command), None),
-        Some(commands::PromptCommand::Extension { name, args }) => (None, Some((name, args))),
-        None => (None, None),
+    let (context_command, mcp_command, extension_command) = match command {
+        Some(commands::PromptCommand::Context(command)) => (Some(command), None, None),
+        Some(commands::PromptCommand::Mcp(command)) => (None, Some(command), None),
+        Some(commands::PromptCommand::Extension { name, args }) => (None, None, Some((name, args))),
+        None => (None, None, None),
     };
 
-    let prepared = mcp::before_prompt(
-        mcp_state.as_ref(),
-        agent_session.session_mut(),
-        mcp_command,
-        &abort_signal,
-        &cx,
-        &out_tx,
-        &session_id,
-    )
-    .await;
+    // Context maintenance needs no tools or MCP refresh. In particular /shake
+    // stays provider-free even when an optional MCP server is unavailable.
+    let prepared = if context_command.is_some() {
+        None
+    } else {
+        mcp::before_prompt(
+            mcp_state.as_ref(),
+            agent_session.session_mut(),
+            mcp_command,
+            &abort_signal,
+            &cx,
+            &out_tx,
+            &session_id,
+        )
+        .await
+    };
     let stop_reason = if let Some(reason) = prepared {
         reason
+    } else if let Some(command) = context_command {
+        let command_events = Arc::clone(&on_event);
+        commands::execute_context(
+            &mut agent_session,
+            command,
+            abort_signal,
+            &out_tx,
+            &session_id,
+            move |event| command_events(event),
+        )
+        .await
     } else if let Some((name, args)) = extension_command {
         let command_events = Arc::clone(&on_event);
         let guidance = planning::PromptGuidance::install(&mut agent_session);
@@ -5071,6 +5096,9 @@ mod tests {
                     pi.sendUserMessage('must never run');
                 }});
                 pi.registerCommand('mcp', { handler: () => { throw new Error('reserved'); }});
+                for (const name of ['compact', 'shake', 'handoff']) {
+                    pi.registerCommand(name, { handler: () => { throw new Error('reserved context command'); }});
+                }
             }
             ",
         )
@@ -5222,6 +5250,9 @@ mod tests {
                 vec![json!({"type": "resource_link", "uri": "/echo planted", "name": "context"})],
                 vec![json!({"type": "text", "text": "/unknown pass through"})],
                 vec![json!({"type": "text", "text": "/mcp list"})],
+                vec![json!({"type": "text", "text": "/compact"})],
+                vec![json!({"type": "text", "text": "/SHAKE"})],
+                vec![json!({"type": "text", "text": "/handoff focus"})],
             ] {
                 assert!(
                     commands::extension_from_prompt(&blocks, handle)
@@ -5240,6 +5271,11 @@ mod tests {
                 .is_err()
             );
             let catalog = commands::available(handle, true);
+            for name in ["compact", "shake", "handoff"] {
+                let matches: Vec<_> = catalog.iter().filter(|command| command["name"] == name).collect();
+                assert_eq!(matches.len(), 1);
+                assert!(matches[0]["description"].as_str().unwrap().len() > 20, "native command metadata wins over the extension");
+            }
             assert_eq!(
                 catalog
                     .iter()

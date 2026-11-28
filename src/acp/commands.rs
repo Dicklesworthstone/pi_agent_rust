@@ -1,15 +1,101 @@
-//! ACP slash commands use the same live extension registrations and execution
-//! boundary as the native hosts. Only authored wire text can invoke a command;
+//! ACP slash commands use native context maintenance and the same live extension
+//! registrations as the native hosts. Only authored wire text can invoke a command;
 //! decoded resources and attachments are always model input.
 
 use super::*;
+use crate::compaction::ManualCompactionMode;
 use crate::model::{Message, StopReason, UserContent};
 use crate::session::{SessionEntry, SessionMessage};
 use std::collections::{BTreeMap, HashSet};
 
 pub(super) enum PromptCommand {
+    Context(ContextCommand),
     Mcp(mcp::Command),
     Extension { name: String, args: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ContextCommand {
+    Compact {
+        mode: ManualCompactionMode,
+        instructions: Option<String>,
+    },
+    Handoff {
+        focus: String,
+    },
+}
+
+fn reserved(name: &str) -> bool {
+    ["compact", "shake", "handoff", "mcp"]
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+pub(super) fn context_from_prompt(
+    blocks: &[Value],
+) -> std::result::Result<Option<PromptCommand>, String> {
+    let Some(text) = blocks
+        .first()
+        .filter(|block| block["type"] == "text")
+        .and_then(|block| block["text"].as_str())
+    else {
+        return Ok(None);
+    };
+    let Some(command) = text.trim_start().strip_prefix('/') else {
+        return Ok(None);
+    };
+    let (name, args) = command
+        .split_once(char::is_whitespace)
+        .unwrap_or((command, ""));
+    if !["compact", "shake", "handoff"]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        return Ok(None);
+    }
+    if blocks.len() != 1 {
+        return Err(
+            "A context command must be one standalone text block without attachments".into(),
+        );
+    }
+    let args = args.trim();
+    let context = if name.eq_ignore_ascii_case("handoff") {
+        let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+        if first.starts_with('-') && first != "--" {
+            return Err(
+                "ACP supports /handoff [focus] in the current session. Report, preview, export and import options are not available here. Use /handoff -- <focus> for focus beginning with '-'.".into(),
+            );
+        }
+        let focus = if first == "--" { rest.trim() } else { args };
+        if focus.len() > 4096 || focus.contains('\0') {
+            return Err(
+                "Handoff focus must contain at most 4096 UTF-8 bytes and no NUL characters".into(),
+            );
+        }
+        ContextCommand::Handoff {
+            focus: focus.into(),
+        }
+    } else {
+        let (mode, instructions) = if name.eq_ignore_ascii_case("shake") {
+            (ManualCompactionMode::Shake, args)
+        } else {
+            let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+            if first.eq_ignore_ascii_case("shake") || first.eq_ignore_ascii_case("--shake") {
+                (ManualCompactionMode::Shake, rest.trim())
+            } else if first.eq_ignore_ascii_case("aggressive")
+                || first.eq_ignore_ascii_case("--aggressive")
+            {
+                (ManualCompactionMode::Aggressive, rest.trim())
+            } else {
+                (ManualCompactionMode::Summary, args)
+            }
+        };
+        ContextCommand::Compact {
+            mode,
+            instructions: (!instructions.is_empty()).then(|| instructions.to_string()),
+        }
+    };
+    Ok(Some(PromptCommand::Context(context)))
 }
 
 pub(super) fn extension_from_prompt(
@@ -29,9 +115,9 @@ pub(super) fn extension_from_prompt(
     let (name, args) = command
         .split_once(char::is_whitespace)
         .unwrap_or((command, ""));
-    // /mcp remains an operator command even if an extension claims its name.
+    // Native operator commands cannot be replaced by an extension registration.
     if name.is_empty()
-        || name == "mcp"
+        || reserved(name)
         || !handle
             .and_then(AgentSessionHandle::extension_manager)
             .is_some_and(|manager| manager.has_command(name))
@@ -52,12 +138,38 @@ pub(super) fn extension_from_prompt(
 
 pub(super) fn available(handle: Option<&AgentSessionHandle>, has_mcp: bool) -> Vec<Value> {
     let mut commands = BTreeMap::new();
+    if handle.is_some() {
+        for (name, description, hint) in [
+            (
+                "compact",
+                "Compact older conversation context while preserving recent turns",
+                "[shake|aggressive] [focus]",
+            ),
+            (
+                "shake",
+                "Drop bulky older tool output without a model request",
+                "[focus]",
+            ),
+            (
+                "handoff",
+                "Save a continuation brief in this conversation using the current model",
+                "[focus]",
+            ),
+        ] {
+            commands.insert(
+                name.to_string(),
+                json!({
+                    "name": name, "description": description, "input": { "hint": hint },
+                }),
+            );
+        }
+    }
     if let Some(manager) = handle.and_then(AgentSessionHandle::extension_manager) {
         for command in manager.list_commands() {
             let Some(name) = command["name"].as_str() else {
                 continue;
             };
-            if name == "mcp" || !manager.has_callable_command(name) {
+            if reserved(name) || !manager.has_callable_command(name) {
                 continue;
             }
             commands.entry(name.to_string()).or_insert_with(|| {
@@ -124,6 +236,72 @@ async fn emit_text(out: &AcpOutput, id: &str, text: &str) {
         ),
     )
     .await;
+}
+
+/// Run the native durable transaction, not an ordinary user/model turn. The
+/// existing prompt reservation owns cancellation and queued input throughout;
+/// keep awaiting after cancellation so an admitted save can settle or fence.
+pub(super) async fn execute_context(
+    handle: &mut AgentSessionHandle,
+    command: ContextCommand,
+    abort: AbortSignal,
+    out: &AcpOutput,
+    id: &str,
+    on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+) -> &'static str {
+    let (progress, complete) = match &command {
+        ContextCommand::Compact {
+            mode: ManualCompactionMode::Shake,
+            ..
+        } => (
+            "Dropping older tool output…\n",
+            "Older tool output dropped; continuing with compacted context.",
+        ),
+        ContextCommand::Compact {
+            mode: ManualCompactionMode::Aggressive,
+            ..
+        } => (
+            "Compacting conversation aggressively…\n",
+            "Conversation compacted aggressively; recent complete turns are preserved.",
+        ),
+        ContextCommand::Compact { .. } => (
+            "Compacting conversation…\n",
+            "Conversation compacted; recent complete turns are preserved.",
+        ),
+        ContextCommand::Handoff { .. } => (
+            "Preparing a continuation brief…\n",
+            "Handoff saved; continuing in this session with compacted context.",
+        ),
+    };
+    // Do not publish progress for a request whose owner was already cancelled.
+    if abort.is_aborted() {
+        return ACP_STOP_REASON_CANCELLED;
+    }
+    emit_text(out, id, progress).await;
+    let result = match command {
+        ContextCommand::Compact { mode, instructions } => {
+            handle
+                .compact_in_mode_with_abort(mode, instructions.as_deref(), abort, on_event)
+                .await
+        }
+        ContextCommand::Handoff { focus } => {
+            handle.handoff(&focus, &abort, on_event).await.map(|()| true)
+        }
+    };
+    match result {
+        Ok(changed) => {
+            // Native success is the durable outcome. A cancellation arriving
+            // after installation must not turn it into a retryable failure.
+            let message = if changed {
+                complete
+            } else {
+                "Compaction skipped: there is no older context outside the retained recent turns."
+            };
+            emit_text(out, id, message).await;
+            ACP_STOP_REASON_END_TURN
+        }
+        Err(error) => report_prompt_error(out, id, &error).await,
+    }
 }
 
 pub(super) struct CommandOutcome {
@@ -290,5 +468,69 @@ pub(super) async fn execute(
     CommandOutcome {
         stop_reason: terminal.map_or(ACP_STOP_REASON_END_TURN, |(reason, _, _)| map_stop_reason(reason)),
         succeeded: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> ContextCommand {
+        let Some(PromptCommand::Context(command)) =
+            context_from_prompt(&[json!({"type": "text", "text": text})]).unwrap()
+        else {
+            panic!("expected native context command");
+        };
+        command
+    }
+
+    #[test]
+    fn context_command_modes_preserve_literal_focus() {
+        for (text, mode, focus) in [
+            (" /COMPACT ", ManualCompactionMode::Summary, None),
+            ("/compact Keep  IDs\nnext line", ManualCompactionMode::Summary, Some("Keep  IDs\nnext line")),
+            ("/compact --aggressive Keep  IDs", ManualCompactionMode::Aggressive, Some("Keep  IDs")),
+            ("/compact AGGRESSIVE\tKeep  IDs", ManualCompactionMode::Aggressive, Some("Keep  IDs")),
+            ("/compact --shake Keep  IDs", ManualCompactionMode::Shake, Some("Keep  IDs")),
+            ("/compact shake", ManualCompactionMode::Shake, None),
+            ("/SHAKE Keep  IDs", ManualCompactionMode::Shake, Some("Keep  IDs")),
+            ("/compact aggressively preserve this", ManualCompactionMode::Summary, Some("aggressively preserve this")),
+        ] {
+            assert_eq!(parse(text), ContextCommand::Compact {
+                mode, instructions: focus.map(str::to_string),
+            });
+        }
+        assert_eq!(parse("/handoff -- -keep  IDs"), ContextCommand::Handoff { focus: "-keep  IDs".into() });
+        assert_eq!(parse("/handoff"), ContextCommand::Handoff { focus: String::new() });
+        for args in ["--report", "--model", "--export somewhere", "--import somewhere", "--unknown"] {
+            assert!(context_from_prompt(&[json!({"type": "text", "text": format!("/handoff {args}")})]).is_err());
+        }
+        for focus in ["x".repeat(4097), "private\0focus".into()] {
+            assert!(context_from_prompt(&[json!({"type": "text", "text": format!("/handoff {focus}")})]).is_err());
+        }
+    }
+
+    #[test]
+    fn resources_attachments_and_similar_names_cannot_gain_command_authority() {
+        for blocks in [
+            vec![json!({"type": "resource", "resource": {"uri": "file:///context", "text": "/shake"}})],
+            vec![json!({"type": "resource_link", "uri": "/compact", "name": "context"})],
+            vec![json!({"type": "text", "text": "Explain /compact"})],
+            vec![json!({"type": "text", "text": "/compactly"})],
+        ] {
+            assert!(context_from_prompt(&blocks).unwrap().is_none());
+        }
+        for command in ["/compact", "/shake", "/handoff"] {
+            for attachment in [
+                json!({"type": "image", "mimeType": "image/png", "data": "YQ=="}),
+                json!({"type": "text", "text": "second authored block"}),
+                json!({"type": "resource", "resource": {"uri": "file:///context", "text": "notes"}}),
+            ] {
+                assert!(context_from_prompt(&[json!({"type": "text", "text": command}), attachment]).is_err());
+            }
+            assert!(reserved(command.trim_start_matches('/')));
+        }
+        assert!(reserved("HANDOFF"));
+        assert!(!reserved("handoff-custom"));
     }
 }

@@ -40,6 +40,14 @@ impl ProviderFixture {
     }
 
     fn with_replies(statuses: Vec<u16>, tools: Vec<Option<(&'static str, Value)>>) -> Self {
+        Self::with_paused_replies(statuses, tools, None)
+    }
+
+    fn with_paused_replies(
+        statuses: Vec<u16>,
+        tools: Vec<Option<(&'static str, Value)>>,
+        response_gate: Option<Arc<AtomicBool>>,
+    ) -> Self {
         assert_eq!(statuses.len(), tools.len());
         let listener = TcpListener::bind("127.0.0.1:0").expect("provider listener");
         listener.set_nonblocking(true).expect("nonblocking accept");
@@ -74,6 +82,15 @@ impl ProviderFixture {
                 let (headers, request) = read_request(&mut stream, deadline);
                 let model = request["model"].as_str().unwrap().to_string();
                 captured.lock().unwrap().push((headers, request));
+                if let Some(gate) = response_gate.as_ref() {
+                    while !gate.load(Ordering::SeqCst) {
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        assert!(Instant::now() < deadline, "paused provider reply timed out");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
                 let (content_type, body) = if status == 200 {
                     let delta = tool.as_ref().map_or_else(
                         || {
@@ -669,7 +686,8 @@ fn dispatcher_fork_saves_before_ack_and_both_sessions_continue_with_independent_
                 "sessionId": source_id, "cwd": cwd,
             })).await;
             assert!(forked.get("error").is_none(), "{forked}");
-            assert_eq!(transcript.len(), before_fork + 1, "fork does not replay history");
+            assert_eq!(transcript.len(), before_fork + 2, "fork publishes native commands without replaying history");
+            assert_eq!(transcript[before_fork]["params"]["update"]["sessionUpdate"], "available_commands_update");
             assert_eq!(provider.requests.lock().unwrap().len(), 1, "fork does not run the provider");
             let fork_id = forked["result"]["sessionId"].as_str().unwrap().to_string();
             assert_ne!(fork_id, source_id);
@@ -4155,4 +4173,318 @@ fn dispatcher_declined_invalid_denied_and_cancelled_forms_never_invent_answers()
         }));
         provider.finish(if outcome == "session-cancel" { 1 } else { 2 });
     }
+}
+
+async fn context_history(root: &Path, cwd: &Path) -> Session {
+    use crate::model::{AssistantMessage, ToolCall};
+    use crate::session::SessionMessage;
+
+    let mut saved = Session::create_with_dir_and_store(Some(root.into()), SessionStoreKind::Jsonl);
+    saved.header.cwd = cwd.display().to_string();
+    saved.set_model_header(Some(PRIMARY_PROVIDER.into()), Some(PRIMARY_MODEL.into()), Some("off".into()));
+    for index in 0..4 {
+        saved.append_message(SessionMessage::User {
+            content: UserContent::Text(format!("Original question {index} with important decisions ").repeat(30)),
+            timestamp: Some(index),
+        });
+        saved.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: format!("historic-read-{index}"), name: "read".into(),
+                    arguments: json!({"path": format!("notes-{index}.txt")}),
+                    thought_signature: None,
+                })],
+                stop_reason: StopReason::ToolUse,
+                ..AssistantMessage::default()
+            },
+        });
+        saved.append_message(SessionMessage::ToolResult {
+            tool_call_id: format!("historic-read-{index}"), tool_name: "read".into(),
+            content: vec![ContentBlock::Text(TextContent::new(format!("bulky-historic-output-{index}\n").repeat(100)))],
+            details: None, is_error: false, timestamp: Some(index),
+        });
+        saved.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(format!("Original answer {index}")))],
+                stop_reason: StopReason::Stop,
+                ..AssistantMessage::default()
+            },
+        });
+    }
+    saved.save().await.unwrap();
+    saved
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatcher_native_context_commands_save_before_ack_and_preserve_original_turns() {
+    for (command, shake) in [
+        ("/compact Keep  migration IDs", false),
+        ("/compact aggressive Keep  migration IDs", false),
+        ("/shake Keep  migration IDs", true),
+        ("/handoff Keep  migration IDs", false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let sessions_root = root.path().join("sessions");
+        let expected_calls = if shake { 1 } else { 2 };
+        let mut provider = ProviderFixture::new(vec![200; expected_calls]);
+        let runtime = runtime();
+        runtime.block_on(bounded_launch_controls(async {
+            let saved = context_history(&sessions_root, &cwd).await;
+            let session_id = saved.header.id.clone();
+            let path = saved.path.clone().unwrap();
+            let original = saved.entries.clone();
+            let original_messages = saved.to_messages_for_current_path();
+            let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+            options.session_dir = Some(sessions_root);
+            options.config.compaction.as_mut().unwrap().keep_recent_tokens = Some(1);
+            options.launch.no_tools = true;
+            options.launch.no_mcp = true;
+            options.launch.no_context_files = true;
+            let (input, incoming) = asupersync::channel::mpsc::channel(16);
+            let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+            let editor = async {
+                let mut transcript = Vec::new();
+                discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({"protocolVersion": 1})).await;
+                let resumed = discovery_request(&input, &outgoing, &mut transcript, 2, "session/resume", json!({
+                    "sessionId": session_id, "cwd": cwd,
+                })).await;
+                assert!(resumed.get("error").is_none(), "{resumed}");
+                let catalog = transcript.iter().find_map(|frame| {
+                    (frame["params"]["update"]["sessionUpdate"] == "available_commands_update")
+                        .then(|| frame["params"]["update"]["availableCommands"].as_array().unwrap())
+                }).unwrap();
+                for name in ["compact", "shake", "handoff"] {
+                    assert_eq!(catalog.iter().filter(|item| item["name"] == name).count(), 1);
+                }
+                let before = transcript.len();
+                let compacted = discovery_request(&input, &outgoing, &mut transcript, 3, "session/prompt", json!({
+                    "sessionId": session_id, "prompt": [{"type": "text", "text": command}],
+                })).await;
+                assert_eq!(compacted["result"]["stopReason"], ACP_STOP_REASON_END_TURN, "{compacted}");
+                assert_eq!(provider.requests.lock().unwrap().len(), usize::from(!shake));
+                let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+                assert_eq!(reopened.header.id, session_id, "maintenance stays in the same session");
+                assert_eq!(serde_json::to_value(&reopened.entries[..original.len()]).unwrap(), serde_json::to_value(&original).unwrap(), "original branch history is retained");
+                let compaction = reopened.entries.iter().rev().find_map(|entry| match entry {
+                    crate::session::SessionEntry::Compaction(entry) => Some(entry),
+                    _ => None,
+                }).expect("native checkpoint must be durable before command acknowledgment");
+                let messages = reopened.to_messages_for_current_path();
+                assert_eq!(
+                    serde_json::to_value(&messages[messages.len() - 4..]).unwrap(),
+                    serde_json::to_value(&original_messages[original_messages.len() - 4..]).unwrap(),
+                    "latest authored turn and full tool pair survive",
+                );
+                assert!(!serde_json::to_value(&reopened.entries).unwrap().to_string().contains(command), "command is not a synthetic conversation turn");
+                if shake {
+                    assert!(compaction.summary.contains("Context Checkpoint (shake)"));
+                    assert!(!compaction.summary.contains("bulky-historic-output-0"));
+                } else {
+                    assert!(compaction.summary.contains("Recovered editor answer"));
+                }
+                let notices: Vec<_> = transcript[before..].iter()
+                    .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str()).collect();
+                assert_eq!(notices.len(), 2, "one progress notice and one settled result");
+                assert!(!notices[0].contains("saved"));
+                assert!(notices[1].contains("compacted"));
+                let continued = discovery_request(&input, &outgoing, &mut transcript, 4, "session/prompt", json!({
+                    "sessionId": session_id, "prompt": [{"type": "text", "text": "Continue after native maintenance"}],
+                })).await;
+                assert_eq!(continued["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+                input.try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string()).unwrap();
+            };
+            let (served, ()) = futures::join!(Box::pin(run(options, incoming, AcpOutput::new(output))), editor);
+            served.unwrap();
+        }));
+        let requests = provider.finish(expected_calls);
+        if !shake {
+            let generation = requests[0].1["messages"].to_string();
+            assert!(generation.contains("Keep  migration IDs"));
+            assert!(!generation.contains("/compact"));
+            assert!(requests[0].1.get("tools").is_none_or(Value::is_null), "maintenance cannot execute model-requested tools");
+        }
+        let continued = requests.last().unwrap().1["messages"].to_string();
+        assert!(continued.contains("Original question 3"));
+        assert!(!continued.contains("bulky-historic-output-0"));
+        assert!(continued.contains("Continue after native maintenance"));
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatcher_context_cancellation_retires_only_its_request_and_returns_unconsumed_input() {
+    for command in ["/compact keep decisions", "/handoff keep decisions"] {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let sessions_root = root.path().join("sessions");
+        let mut provider = ProviderFixture::with_paused_replies(
+            vec![200], vec![None], Some(Arc::new(AtomicBool::new(false))),
+        );
+        let runtime = runtime();
+        runtime.block_on(bounded_launch_controls(async {
+            let saved = context_history(&sessions_root, &cwd).await;
+            let session_id = saved.header.id.clone();
+            let path = saved.path.clone().unwrap();
+            let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+            options.session_dir = Some(sessions_root);
+            options.config.compaction.as_mut().unwrap().keep_recent_tokens = Some(1);
+            options.launch.no_tools = true;
+            options.launch.no_mcp = true;
+            options.launch.no_context_files = true;
+            let (input, incoming) = asupersync::channel::mpsc::channel(16);
+            let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+            let editor = async {
+                let mut transcript = Vec::new();
+                discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({"protocolVersion": 1})).await;
+                discovery_request(&input, &outgoing, &mut transcript, 2, "session/resume", json!({
+                    "sessionId": session_id, "cwd": cwd,
+                })).await;
+                let before = std::fs::read(&path).unwrap();
+                input.try_send(json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {
+                    "sessionId": session_id, "prompt": [{"type": "text", "text": command}],
+                }}).to_string()).unwrap();
+                while provider.requests.lock().unwrap().is_empty() {
+                    sleep(wall_now(), Duration::from_millis(1)).await;
+                }
+                input.try_send(json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {
+                    "sessionId": session_id, "prompt": [{"type": "text", "text": "/shake"}],
+                }}).to_string()).unwrap();
+                input.try_send(json!({"jsonrpc": "2.0", "id": 5, "method": "_session/steering", "params": {
+                    "sessionId": session_id, "prompt": [{"type": "text", "text": "Retain this exact unsent follow-up"}],
+                    "_meta": {"steering": {"queue": "followUp"}},
+                }}).to_string()).unwrap();
+                input.try_send(json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {
+                    "sessionId": session_id,
+                }}).to_string()).unwrap();
+                let mut replies = HashMap::new();
+                while replies.len() < 3 {
+                    let frame = next_planning_frame(&outgoing).await;
+                    if let Some(id) = frame.get("id").and_then(Value::as_u64) {
+                        assert!(matches!(id, 3..=5), "unexpected response: {frame}");
+                        assert!(replies.insert(id, frame).is_none(), "exactly one reply per request");
+                    } else {
+                        assert_eq!(frame["method"], "session/update");
+                        transcript.push(frame);
+                    }
+                }
+                assert_eq!(replies[&3]["result"]["stopReason"], ACP_STOP_REASON_CANCELLED);
+                assert_eq!(replies[&4]["error"]["code"], PROMPT_IN_PROGRESS);
+                assert_eq!(replies[&5]["result"]["outcome"], "promptRequired");
+                assert_eq!(std::fs::read(&path).unwrap(), before, "cancelled generation cannot install a summary or authored command");
+                assert!(transcript.iter().filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
+                    .all(|text| !text.contains("Handoff saved") && !text.contains("Conversation compacted;")));
+                let next = discovery_request(&input, &outgoing, &mut transcript, 6, "session/prompt", json!({
+                    "sessionId": session_id, "prompt": [{"type": "text", "text": "/shake"}],
+                })).await;
+                assert_eq!(next["result"]["stopReason"], ACP_STOP_REASON_END_TURN, "the session owner is restored after cancellation");
+                assert_eq!(provider.requests.lock().unwrap().len(), 1, "no queued input or shake may enter the provider");
+                input.try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string()).unwrap();
+            };
+            let (served, ()) = futures::join!(Box::pin(run(options, incoming, AcpOutput::new(output))), editor);
+            served.unwrap();
+        }));
+        provider.finish(1);
+    }
+}
+
+#[test]
+fn dispatcher_context_commands_reject_attachments_and_handoff_exports_before_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let sessions_root = root.path().join("sessions");
+    let mut provider = ProviderFixture::new(vec![200]);
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let saved = context_history(&sessions_root, &cwd).await;
+        let session_id = saved.header.id.clone();
+        let path = saved.path.clone().unwrap();
+        let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+        options.session_dir = Some(sessions_root);
+        options.config.compaction.as_mut().unwrap().keep_recent_tokens = Some(1);
+        options.launch.no_tools = true;
+        options.launch.no_mcp = true;
+        options.launch.no_context_files = true;
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let editor = async {
+            let mut transcript = Vec::new();
+            discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({"protocolVersion": 1})).await;
+            discovery_request(&input, &outgoing, &mut transcript, 2, "session/resume", json!({
+                "sessionId": session_id, "cwd": cwd,
+            })).await;
+            let before = std::fs::read(&path).unwrap();
+            for (index, blocks) in [
+                json!([{"type": "text", "text": "/compact"}, {"type": "image", "data": PNG, "mimeType": "image/png"}]),
+                json!([{"type": "text", "text": "/shake"}, {"type": "resource", "resource": {"uri": "file:///notes", "text": "keep me"}}]),
+                json!([{"type": "text", "text": "/handoff --export forbidden.json"}]),
+            ].into_iter().enumerate() {
+                let rejected = discovery_request(&input, &outgoing, &mut transcript, 3 + index as u64, "session/prompt", json!({
+                    "sessionId": session_id, "prompt": blocks,
+                })).await;
+                assert_eq!(rejected["error"]["code"], INVALID_PARAMS);
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert!(provider.requests.lock().unwrap().is_empty());
+            }
+            let ordinary = discovery_request(&input, &outgoing, &mut transcript, 6, "session/prompt", json!({
+                "sessionId": session_id, "prompt": [{"type": "resource", "resource": {
+                    "uri": "file:///notes", "mimeType": "text/plain", "text": "/shake is quoted document content",
+                }}],
+            })).await;
+            assert_eq!(ordinary["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert!(!reopened.entries.iter().any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_))), "embedded resource text must never run a command");
+            input.try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string()).unwrap();
+        };
+        let (served, ()) = futures::join!(Box::pin(run(options, incoming, AcpOutput::new(output))), editor);
+        served.unwrap();
+    }));
+    assert!(provider.finish(1)[0].1["messages"].to_string().contains("/shake is quoted document content"));
+}
+
+#[test]
+fn context_command_failed_save_never_claims_completion_or_reenters_the_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let mut provider = ProviderFixture::new(Vec::new());
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let saved = context_history(&root.path().join("sessions"), &cwd).await;
+        let original = saved.entries.clone();
+        let original_path = saved.path.clone().unwrap();
+        let original_bytes = std::fs::read(&original_path).unwrap();
+        let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+        options.config.compaction.as_mut().unwrap().keep_recent_tokens = Some(1);
+        options.launch.no_tools = true;
+        options.launch.no_mcp = true;
+        options.launch.no_context_files = true;
+        let (id, state) = build_acp_session(saved, true, cwd, &options, None).unwrap();
+        let state = Arc::new(Mutex::new(state));
+        let stored = session_store(&state);
+        // Native compaction creates a candidate, then must acknowledge its
+        // durable save. A directory cannot be that candidate's JSONL store.
+        let blocked = root.path().join("directory-not-session.jsonl");
+        std::fs::create_dir(&blocked).unwrap();
+        stored.try_lock().unwrap().path = Some(blocked);
+        let command = commands::context_from_prompt(&[json!({"type": "text", "text": "/shake"})]).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
+        let (_, signal) = AbortHandle::new();
+        let reason = Box::pin(run_prompt(
+            Arc::clone(&state), AcpPrompt::text("/shake"), command, signal,
+            AcpOutput::new(tx), id.clone(), AgentCx::for_current_or_request(),
+        )).await;
+        assert_eq!(reason, ACP_STOP_REASON_ERROR);
+        let notices = rx.try_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()).collect::<Vec<_>>();
+        assert!(notices.iter().any(|frame| frame["params"]["update"]["content"]["text"].as_str().is_some_and(|text| text.contains("Session persistence failed"))));
+        assert!(!notices.iter().any(|frame| frame["params"]["update"]["content"]["text"].as_str().is_some_and(|text| text.contains("Older tool output dropped;"))));
+        assert_eq!(serde_json::to_value(&stored.try_lock().unwrap().entries).unwrap(), serde_json::to_value(&original).unwrap(), "failed installation leaves the original history live");
+        assert_eq!(std::fs::read(original_path).unwrap(), original_bytes);
+        assert!(state.try_lock().unwrap().agent_session.as_ref().unwrap().session().ensure_provider_reentry_allowed().is_err());
+        let (_, signal) = AbortHandle::new();
+        let (later, notices) = prompt(&state, &id, text(), signal).await;
+        assert_eq!(later, ACP_STOP_REASON_ERROR);
+        assert!(notices.iter().any(|frame| frame["params"]["update"]["content"]["text"].as_str().is_some_and(|text| text.contains("Session persistence failed"))));
+    }));
+    provider.finish(0);
 }

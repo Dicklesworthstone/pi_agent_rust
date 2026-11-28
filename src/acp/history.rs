@@ -1202,7 +1202,8 @@ mod tests {
                 assert_eq!(plans.len(), 1);
                 assert_eq!(plans[0]["params"]["sessionId"], saved.header.id);
                 assert_eq!(plans[0]["params"]["update"], expected);
-                assert_eq!(notifications.len(), if replay { 4 } else { 1 });
+                assert_eq!(notifications.len(), if replay { 5 } else { 2 });
+                assert_eq!(notifications.last().unwrap()["params"]["update"]["sessionUpdate"], "available_commands_update");
                 assert!(
                     !serde_json::to_string(&notifications)
                         .unwrap()
@@ -1253,7 +1254,7 @@ mod tests {
             let notifications = rx.try_iter()
                 .map(|line| serde_json::from_str::<Value>(&line).unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(notifications.len(), 1, "fork restores plan without transcript replay");
+            assert_eq!(notifications.len(), 2, "fork restores plan and native commands without transcript replay");
             assert_eq!(notifications[0]["params"]["sessionId"], fork_id);
             assert_eq!(notifications[0]["params"]["update"], json!({
                 "sessionUpdate": "plan", "entries": [
@@ -1283,7 +1284,7 @@ mod tests {
             let notifications = rx.try_iter()
                 .map(|line| serde_json::from_str::<Value>(&line).unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(notifications.len(), 1);
+            assert_eq!(notifications.len(), 2);
             assert_eq!(notifications[0]["params"]["sessionId"], fork_id);
             assert_eq!(notifications[0]["params"]["update"], json!({
                 "sessionUpdate": "plan", "entries": [],

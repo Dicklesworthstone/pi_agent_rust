@@ -946,6 +946,24 @@ out after five minutes and are for implementation decisions, not credentials
 or authentication. Clients without explicit form support do not receive the
 `ask` tool, and `--no-tools` remains authoritative.
 
+**ACP context maintenance.** The editor's command menu includes `/compact
+[focus]`, `/compact aggressive [focus]`, `/shake [focus]`, and `/handoff
+[focus]`. These invoke the native context transactions without creating a user
+message or an ordinary assistant turn. Compaction summarizes older context;
+aggressive compaction retains a smaller recent window. Shake drops bulky older
+tool output without requesting a model summary. Handoff saves a continuation
+brief in the same session using its current model. Recent complete turns and
+tool-call/result pairs retain the native preservation rules.
+
+Send a context command as one standalone text block. Additional text blocks,
+attachments, and embedded resources cannot become command arguments. Native
+command names take precedence over extension registrations. `session/cancel`
+can stop preparation; a save already in progress settles before the command
+returns, and success is reported only after durable installation. An editor
+can send another prompt after completion using the updated context. Handoff
+preview, report, export, and import options remain available through their
+existing terminal and SDK surfaces, rather than these editor commands.
+
 **ACP session forks.** Pi advertises the optional ACP v1 draft
 `sessionCapabilities.fork` capability. A client can create an active branch
 from the source's complete selected conversation:
