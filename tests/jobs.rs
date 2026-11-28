@@ -169,9 +169,9 @@ fn automatic_foreground_completion_preserves_output_and_exit_status() {
 #[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)] // inline bash scripts that set, restore and clear shell state
-fn session_shell_restores_native_state_across_tool_rebuilds_without_replay() {
+fn session_shell_restores_native_state_across_tool_replacements_without_replay() {
     let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
-    let case = "session_shell_restores_native_state_across_tool_rebuilds_without_replay";
+    let case = "session_shell_restores_native_state_across_tool_replacements_without_replay";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
     std::fs::create_dir(root.join("nested")).expect("working directory");
@@ -200,8 +200,8 @@ cd nested
     assert!(!output.is_error, "{}", first_text(&output));
     assert_eq!(first_text(&output), "(no output)");
 
-    // Real surfaces rebuild their registry. A new BashTool with the same live
-    // session id must see the state, not an instance-local cache.
+    // Replacing a BashTool within the same live scope preserves state. A
+    // separately constructed registry must not inherit it from the saved ID.
     let restored = execute(
         &bash_tool_for_session(&root, &owner),
         json!({"background": false, "command": r#"
@@ -274,6 +274,70 @@ if ! alias pi_state_alias >/dev/null 2>&1; then printf alias-removed; fi
         json!({"background": false, "command": "printf '%s' \"${PI_STATE_ARRAY[2]-isolated}\""}),
     );
     assert_eq!(first_text(&isolated), "isolated");
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_shell_isolates_live_registries_with_the_same_saved_session() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "session_shell_isolates_live_registries_with_the_same_saved_session";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    std::fs::create_dir(root.join("first")).expect("first working directory");
+    std::fs::create_dir(root.join("second")).expect("second working directory");
+    let saved_id = format!("same-saved-shell-{}", uuid::Uuid::new_v4().simple());
+    let resolver: pi::jobs::JobSessionIdResolver = std::sync::Arc::new(move || {
+        let saved_id = saved_id.clone();
+        Box::pin(async move { Some(saved_id) })
+    });
+    let mut first = ToolRegistry::from_tools(vec![Box::new(pi::tools::BashTool::new(&root))]);
+    first.bind_job_session_resolver(resolver.clone());
+    let second = ToolRegistry::from_tools(vec![Box::new(pi::tools::BashTool::new(&root))]);
+    second.bind_job_session_resolver(resolver);
+    let run = |registry: &ToolRegistry, command: &str| {
+        let output = block_on_local(registry.get("bash").expect("bash tool").execute(
+            "scope-state",
+            json!({"command": command, "background": false}),
+            None,
+        ))
+        .expect("execute native shell");
+        assert!(!output.is_error, "{}", first_text(&output));
+        first_text(&output).to_string()
+    };
+    let inspect = "printf '%s|' \"${PI_LIVE_SCOPE_VALUE-fresh}\"; pwd";
+    run(&first, "export PI_LIVE_SCOPE_VALUE=first; cd first");
+    let first_state = format!(
+        "first|{}",
+        std::fs::canonicalize(root.join("first"))
+            .expect("first cwd")
+            .display()
+    );
+    let cloned = first.clone_shallow();
+    assert_eq!(run(&cloned, inspect).trim_end(), first_state);
+    first.push(Box::new(pi::tools::BashTool::new(&root)));
+    assert_eq!(run(&first, inspect).trim_end(), first_state);
+
+    // A newly loaded live handle has the same durable ID, shell, prefix and
+    // initial cwd. Neither environment nor cwd may cross that boundary.
+    assert_eq!(
+        run(&second, inspect).trim_end(),
+        format!(
+            "fresh|{}",
+            std::fs::canonicalize(&root).expect("initial cwd").display()
+        )
+    );
+    run(&second, "export PI_LIVE_SCOPE_VALUE=second; cd second");
+    assert_eq!(run(&first, inspect).trim_end(), first_state);
+    assert_eq!(
+        run(&second, inspect).trim_end(),
+        format!(
+            "second|{}",
+            std::fs::canonicalize(root.join("second"))
+                .expect("second cwd")
+                .display()
+        )
+    );
     finish_case(&harness, case);
 }
 
@@ -695,6 +759,330 @@ fn dropping_an_automatic_foreground_call_kills_its_process_tree() {
     assert!(!survived, "dropped foreground command left a live process");
     assert!(pi::jobs::list(&owner).expect("list").is_empty());
     assert!(pi::jobs::take_completion_notices(&owner).is_empty());
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)] // real pipe/PTY trees and retained-handle refusal
+fn scope_shutdown_cancels_and_settles_forced_foreground_bash() {
+    use std::sync::{Arc, Mutex};
+
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "scope_shutdown_cancels_and_settles_forced_foreground_bash";
+    let harness = TestHarness::new(case);
+    for (mode, pty, persistent) in [
+        ("pipe-persistent", "off", true),
+        ("pipe-isolated", "off", false),
+        ("pty-persistent", "always", true),
+    ] {
+        let root = harness.temp_path(mode);
+        std::fs::create_dir(&root).expect("command workspace");
+        let saved_id = format!("direct-close-{mode}-{}", uuid::Uuid::new_v4().simple());
+        let scope = pi::jobs::JobSessionScope::fixed(saved_id.clone());
+        let mut tool = pi::tools::BashTool::new(&root).with_mediation(Some(
+            pi::config::BashSettings {
+                pty: Some(pty.to_string()),
+                persistent: Some(persistent),
+                ..Default::default()
+            },
+        ));
+        tool.bind_job_session_scope(scope.clone());
+        let owner = pi::agent_cx::AgentCx::for_request();
+        let retired = Arc::new(Mutex::new(None));
+        let update_retired = Arc::clone(&retired);
+        let update_scope = scope.clone();
+        let shutdown_sent = std::sync::atomic::AtomicBool::new(false);
+        let output = block_on_local(async {
+            let command = Box::pin(owner.with_current(tool.execute(
+                "close-direct-shell",
+                json!({
+                    "background": false,
+                    "timeout": 2,
+                    "command": "trap '' TERM; sleep 300 & printf '%s' \"$!\" > child.pid; printf '%s' \"$$\" > parent.pid; printf scope-close-ready; wait; printf forbidden > completed"
+                }),
+                Some(Box::new(move |update| {
+                    if update.content.iter().any(|block| {
+                        matches!(block, pi::model::ContentBlock::Text(text)
+                            if text.text.contains("scope-close-ready"))
+                    }) && !shutdown_sent.swap(true, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        *update_retired.lock().expect("shutdown token") =
+                            Some(update_scope.begin_shutdown().expect("close live scope"));
+                    }
+                })),
+            )));
+            let pending = match futures::future::select(
+                Box::pin(scope.wait_for_shutdown()),
+                command,
+            )
+            .await
+            {
+                futures::future::Either::Left(((), pending)) => pending,
+                futures::future::Either::Right((result, _)) => {
+                    panic!("command ended before live-scope shutdown: {result:?}");
+                }
+            };
+            let shutdown = retired
+                .lock()
+                .expect("shutdown token")
+                .take()
+                .expect("streaming readiness retired this scope");
+            let mut finished = Box::pin(shutdown.finish());
+            assert!(
+                futures::poll!(&mut finished).is_pending(),
+                "scope finish must wait while its direct process is still owned"
+            );
+            let (output, finished) = futures::join!(pending, finished);
+            finished.expect("finish confirms native cleanup");
+            output
+        })
+        .expect("cancelled runner must return its settled command result");
+        assert!(
+            !owner.is_cancel_requested(),
+            "{mode}: closing one scope must not cancel the shared caller context"
+        );
+        assert!(output.is_error, "{mode}: cancellation must be an error");
+        assert!(first_text(&output).contains("scope-close-ready"));
+        assert_eq!(
+            output.details.as_ref().expect("cancellation details")["cancellation"]["reason"],
+            "ambient_cancellation",
+            "{mode}: shutdown must cancel the running command before its timeout"
+        );
+        assert!(!root.join("completed").exists());
+
+        let read_pid = |name| {
+            std::fs::read_to_string(root.join(name))
+                .expect("PID file")
+                .trim()
+                .parse::<u32>()
+                .expect("PID")
+        };
+        let parent_pid = read_pid("parent.pid");
+        let child_pid = read_pid("child.pid");
+        let child_is_running = |pid| {
+            #[cfg(target_os = "linux")]
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                && stat
+                    .rsplit_once(')')
+                    .is_some_and(|(_, fields)| fields.split_whitespace().next() == Some("Z"))
+            {
+                return false;
+            }
+            kill_zero(pid)
+        };
+        // finish also waits for the pipe supervisor's asynchronous reaper;
+        // the parent must already have been waited, with no grace poll here.
+        assert!(!kill_zero(parent_pid), "{mode}: finish preceded parent reap");
+        let started = std::time::Instant::now();
+        while child_is_running(child_pid) && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !child_is_running(child_pid),
+            "{mode}: child survived cancellation"
+        );
+        assert!(pi::jobs::list(&saved_id).expect("no managed job").is_empty());
+
+        let error = block_on_local(tool.execute(
+            "retained-closed-tool",
+            json!({"command": "printf forbidden > restarted", "background": false}),
+            None,
+        ))
+        .expect_err("retained tool must refuse a new foreground process");
+        assert!(error.to_string().contains("PI_JOBS_SCOPE_CLOSED"), "{error}");
+        assert!(!root.join("restarted").exists());
+
+        // Loading the same saved session into another live scope remains
+        // available after the first scope and its command were retired.
+        let mut independent = pi::tools::BashTool::new(&root);
+        independent.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(saved_id));
+        let allowed = execute(
+            &independent,
+            json!({"command": "printf independent > independent-started", "background": false}),
+        );
+        assert!(!allowed.is_error, "{}", first_text(&allowed));
+        assert_eq!(
+            std::fs::read(root.join("independent-started")).expect("independent side effect"),
+            b"independent"
+        );
+    }
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_shutdown_preserves_a_foreground_peer_using_the_same_caller_context() {
+    use std::sync::{Arc, Mutex};
+
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "scope_shutdown_preserves_a_foreground_peer_using_the_same_caller_context";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let saved_id = format!("shared-caller-shell-{}", uuid::Uuid::new_v4().simple());
+    let first_scope = pi::jobs::JobSessionScope::fixed(saved_id.clone());
+    let second_scope = pi::jobs::JobSessionScope::fixed(saved_id);
+    let make_tool = |scope| {
+        let mut tool = pi::tools::BashTool::new(&root).with_mediation(Some(
+            pi::config::BashSettings {
+                pty: Some("off".to_string()),
+                persistent: Some(false),
+                ..Default::default()
+            },
+        ));
+        tool.bind_job_session_scope(scope);
+        tool
+    };
+    let first = make_tool(first_scope.clone());
+    let second = make_tool(second_scope);
+    let owner = pi::agent_cx::AgentCx::for_request();
+    let retired = Arc::new(Mutex::new(None));
+    let update_retired = Arc::clone(&retired);
+    let (cancelled, peer) = block_on_local(owner.with_current(async {
+        let cancelled = async {
+            let output = first
+                .execute(
+                    "first-shared-caller",
+                    json!({
+                        "background": false,
+                        "timeout": 5,
+                        "command": "while [ ! -f peer-ready ]; do sleep 0.025; done; printf close-first; sleep 300"
+                    }),
+                    Some(Box::new(move |update| {
+                        if update.content.iter().any(|block| {
+                            matches!(block, pi::model::ContentBlock::Text(text)
+                                if text.text.contains("close-first"))
+                        }) {
+                            let mut retired = update_retired.lock().expect("shutdown token");
+                            if retired.is_none() {
+                                *retired =
+                                    Some(first_scope.begin_shutdown().expect("close first scope"));
+                            }
+                        }
+                    })),
+                )
+                .await;
+            std::fs::write(root.join("release-peer"), "continue").expect("release peer");
+            output
+        };
+        let peer = second.execute(
+            "second-shared-caller",
+            json!({
+                "background": false,
+                "timeout": 10,
+                "command": "printf ready > peer-ready; while [ ! -f release-peer ]; do sleep 0.025; done; sleep 0.1; printf peer-completed; printf completed > peer-completed"
+            }),
+            None,
+        );
+        futures::join!(cancelled, peer)
+    }));
+    let cancelled = cancelled.expect("settled cancelled command");
+    assert!(cancelled.is_error);
+    assert_eq!(
+        cancelled.details.as_ref().expect("cancellation details")["cancellation"]["reason"],
+        "ambient_cancellation"
+    );
+    assert!(
+        !owner.is_cancel_requested(),
+        "scope retirement poisoned the shared Cx"
+    );
+    let peer = peer.expect("independent foreground peer");
+    assert!(!peer.is_error, "{}", first_text(&peer));
+    assert_eq!(first_text(&peer), "peer-completed");
+    assert_eq!(
+        std::fs::read(root.join("peer-completed")).expect("peer side effect"),
+        b"completed"
+    );
+    let shutdown = retired
+        .lock()
+        .expect("shutdown token")
+        .take()
+        .expect("first scope retired");
+    block_on_local(shutdown.finish()).expect("finish first scope");
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_a_direct_bash_future_keeps_scope_cleanup_owned_until_reap() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "dropping_a_direct_bash_future_keeps_scope_cleanup_owned_until_reap";
+    let harness = TestHarness::new(case);
+    for pty in ["off", "always"] {
+        let root = harness.temp_path(pty);
+        std::fs::create_dir(&root).expect("command workspace");
+        let scope = pi::jobs::JobSessionScope::fixed(format!(
+            "direct-drop-{pty}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut tool = pi::tools::BashTool::new(&root).with_mediation(Some(
+            pi::config::BashSettings {
+                pty: Some(pty.to_string()),
+                persistent: Some(false),
+                ..Default::default()
+            },
+        ));
+        tool.bind_job_session_scope(scope.clone());
+        let ready = Arc::new(AtomicBool::new(false));
+        let update_ready = Arc::clone(&ready);
+        block_on_local(async {
+            let command = Box::pin(tool.execute(
+                "abandoned-direct-shell",
+                json!({
+                    "background": false,
+                    "timeout": 30,
+                    "command": "printf '%s' \"$$\" > parent.pid; printf drop-ready; sleep 300"
+                }),
+                Some(Box::new(move |update| {
+                    if update.content.iter().any(|block| {
+                        matches!(block, pi::model::ContentBlock::Text(text)
+                            if text.text.contains("drop-ready"))
+                    }) {
+                        update_ready.store(true, Ordering::Release);
+                    }
+                })),
+            ));
+            let observed = Box::pin(async {
+                let started = std::time::Instant::now();
+                while !ready.load(Ordering::Acquire) {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10),
+                        "shell did not start"
+                    );
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(10),
+                    )
+                    .await;
+                }
+            });
+            let pending = match futures::future::select(observed, command).await {
+                futures::future::Either::Left(((), pending)) => pending,
+                futures::future::Either::Right((result, _)) => {
+                    panic!("foreground shell ended before abandonment: {result:?}");
+                }
+            };
+            let mut finished = Box::pin(scope.begin_shutdown().expect("close scope").finish());
+            assert!(futures::poll!(&mut finished).is_pending());
+            // The future owns an active native process. Drop must transfer its
+            // cleanup lease to the actual reaper, not acknowledge cleanup here.
+            drop(pending);
+            finished
+                .await
+                .expect("scope waits for abandoned process reap");
+        });
+        let parent_pid = std::fs::read_to_string(root.join("parent.pid"))
+            .expect("PID file")
+            .parse::<u32>()
+            .expect("PID");
+        assert!(
+            !kill_zero(parent_pid),
+            "{pty}: finish preceded abandoned process reap"
+        );
+    }
     finish_case(&harness, case);
 }
 

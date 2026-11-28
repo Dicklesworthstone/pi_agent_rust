@@ -9105,6 +9105,8 @@ async fn execute_bash_spawn(
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     use_pty: bool,
     shell_state: Option<&bash_session::ShellTransaction>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+    cleanup: Option<&crate::jobs::JobScopeInvocation>,
 ) -> Result<BashRunResult> {
     if use_pty {
         run_bash_command_pty(
@@ -9115,6 +9117,8 @@ async fn execute_bash_spawn(
             timeout_secs,
             on_update,
             shell_state,
+            cancellation,
+            cleanup,
         )
         .await
     } else {
@@ -9126,6 +9130,8 @@ async fn execute_bash_spawn(
             timeout_secs,
             on_update,
             shell_state,
+            cancellation,
+            cleanup,
             None,
         )
         .await
@@ -9404,6 +9410,8 @@ pub(crate) async fn run_bash_command(
         on_update,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -9437,6 +9445,10 @@ fn check_bash_wait_authority(owner: &AgentCx) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn bash_invocation_cancelled(cancellation: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    cancellation.is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Report cancellation before any shell or extension hook has started.
@@ -9491,6 +9503,8 @@ pub(crate) async fn run_bash_command_with_control_timeout(
         timeout_secs,
         None,
         None,
+        None,
+        None,
         Some(control),
     )
     .await
@@ -9505,6 +9519,8 @@ async fn run_bash_command_with_state(
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     shell_state: Option<&bash_session::ShellTransaction>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+    cleanup: Option<&crate::jobs::JobScopeInvocation>,
     mut control: Option<BashRunControl<'_>>,
 ) -> Result<BashRunResult> {
     let timeout_secs = match timeout_secs {
@@ -9523,6 +9539,7 @@ async fn run_bash_command_with_state(
     if control
         .as_mut()
         .is_some_and(|control| (control.abort_requested)())
+        || bash_invocation_cancelled(cancellation)
         || cx.checkpoint().is_err()
     {
         return Ok(bash_cancelled_before_start(timeout_secs));
@@ -9591,6 +9608,7 @@ async fn run_bash_command_with_state(
     if control
         .as_mut()
         .is_some_and(|control| (control.abort_requested)())
+        || bash_invocation_cancelled(cancellation)
         || cx.checkpoint().is_err()
     {
         return Ok(bash_cancelled_before_start(timeout_secs));
@@ -9613,7 +9631,8 @@ async fn run_bash_command_with_state(
     // parent copies must not keep the Windows writers alive after shell exit.
     drop(cmd);
     let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree)
-        .with_shell_state(shell_state);
+        .with_shell_state(shell_state)
+        .with_scope_invocation(cleanup);
 
     #[cfg(not(windows))]
     let stdout = guard
@@ -9673,6 +9692,7 @@ async fn run_bash_command_with_state(
         if control
             .as_mut()
             .is_some_and(|control| (control.abort_requested)())
+            || bash_invocation_cancelled(cancellation)
         {
             cancelled = true;
             cancellation_reason = Some(BashCancellationReason::AmbientCancellation);
@@ -9959,7 +9979,7 @@ fn assemble_bash_run_result(
 /// interactive shell. The observable tool contract — output truncation,
 /// timeout/tree-kill, cancellation, streaming updates, `BashRunResult` — is
 /// identical to the pipe path.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run_bash_command_pty(
     cwd: &Path,
     shell_path: Option<&str>,
@@ -9968,6 +9988,8 @@ pub(crate) async fn run_bash_command_pty(
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     shell_state: Option<&bash_session::ShellTransaction>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+    cleanup: Option<&crate::jobs::JobScopeInvocation>,
 ) -> Result<BashRunResult> {
     use portable_pty::{CommandBuilder, PtySize};
 
@@ -9977,7 +9999,7 @@ pub(crate) async fn run_bash_command_pty(
         Some(value) => Some(value),
     };
     let cx = AgentCx::for_current_or_request();
-    if cx.checkpoint().is_err() {
+    if bash_invocation_cancelled(cancellation) || cx.checkpoint().is_err() {
         return Ok(bash_cancelled_before_start(timeout_secs));
     }
     check_bash_spawn_authority(&cx)?;
@@ -10026,12 +10048,12 @@ pub(crate) async fn run_bash_command_pty(
     // portable-pty puts the child in its own session (setsid) on unix, so the
     // child pid is its process-group id and the shared tree-kill helpers work
     // exactly as they do for the pipe path's isolated process group.
-    if cx.checkpoint().is_err() {
+    if bash_invocation_cancelled(cancellation) || cx.checkpoint().is_err() {
         return Ok(bash_cancelled_before_start(timeout_secs));
     }
     let child = spawn_pty_command(pair.slave.as_ref(), pty_cmd)
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell} on PTY: {e}")))?;
-    let mut child = PtyProcessGuard::new(child, shell_state);
+    let mut child = PtyProcessGuard::new(child, shell_state, cleanup);
     // Drop our handle to the slave side so the master sees EOF when the child
     // exits; otherwise the pump thread would block forever.
     drop(pair.slave);
@@ -10053,7 +10075,13 @@ pub(crate) async fn run_bash_command_pty(
         pumps
     };
     #[cfg(not(unix))]
-    let pty_thread = thread::spawn(move || pump_stream(reader, "pty", &tx, None));
+    let pty_thread = {
+        let cleanup = cleanup.cloned();
+        thread::spawn(move || {
+            pump_stream(reader, "pty", &tx, None);
+            drop(cleanup);
+        })
+    };
 
     let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
     let mut bash_output = BashOutputState::new(max_chunks_bytes);
@@ -10082,6 +10110,14 @@ pub(crate) async fn run_bash_command_pty(
 
         if updated {
             emit_bash_update(&bash_output, on_update)?;
+        }
+
+        if bash_invocation_cancelled(cancellation) {
+            cancelled = true;
+            cancellation_reason = Some(BashCancellationReason::AmbientCancellation);
+            let _ = child.kill();
+            exit_code = Some(-1);
+            break;
         }
 
         match child.try_wait() {
@@ -10721,17 +10757,51 @@ impl Tool for BashTool {
         owner
             .checkpoint()
             .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
+        let cleanup = self
+            .hub_session_bound
+            .then(|| self.job_session_scope.begin_invocation())
+            .transpose()?;
         let hub = resolve_bound_tool_hub(
             "bash",
             self.hub_session_bound.then_some(&self.job_session_scope),
             &owner,
         )
         .await?;
-        crate::agent_hub::with_registry(
+        let cancellation = self
+            .hub_session_bound
+            .then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let execution = crate::agent_hub::with_registry(
             hub,
-            owner.with_current(self.execute_in_hub(tool_call_id, input, on_update, &owner)),
-        )
-        .await
+            owner.with_current(self.execute_in_hub(
+                tool_call_id,
+                input,
+                on_update,
+                &owner,
+                cancellation.as_ref(),
+                cleanup.as_ref(),
+            )),
+        );
+        if !self.hub_session_bound {
+            return execution.await;
+        }
+        // Direct foreground/PTY calls do not enter the jobs registry. Retire
+        // them with their live scope too, retaining the original future so
+        // its process supervisor can kill, drain and reap during cancellation.
+        // Keep cancellation local: the caller's Cx can own another live
+        // registry whose foreground command must remain available.
+        // Poll shutdown first: a closed scope must not start more work. Normal
+        // completion only drops the observer; promoted jobs keep their owner.
+        let shutdown = self.job_session_scope.wait_for_shutdown();
+        futures::pin_mut!(shutdown, execution);
+        match futures::future::select(shutdown, execution).await {
+            futures::future::Either::Left(((), execution)) => {
+                if let Some(cancellation) = &cancellation {
+                    cancellation.store(true, std::sync::atomic::Ordering::Release);
+                }
+                execution.await
+            }
+            futures::future::Either::Right((output, _)) => output,
+        }
     }
 }
 
@@ -10743,7 +10813,12 @@ impl BashTool {
         input: BashInput,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         owner: &AgentCx,
+        cancellation: Option<&Arc<std::sync::atomic::AtomicBool>>,
+        cleanup: Option<&crate::jobs::JobScopeInvocation>,
     ) -> Result<ToolOutput> {
+        if bash_invocation_cancelled(cancellation.map(Arc::as_ref)) {
+            return Err(Error::tool("bash", "Command cancelled before spawn"));
+        }
         let client_terminal = if input.background == Some(true) {
             None
         } else {
@@ -10814,6 +10889,8 @@ impl BashTool {
                 .is_some_and(|name| name == "bash")
             {
                 match bash_session::acquire(
+                    self.hub_session_bound
+                        .then(|| self.job_session_scope.instance_id()),
                     background_session_id.as_deref().ok_or_else(|| {
                         Error::tool("bash", "session shell scope was not resolved")
                     })?,
@@ -10934,7 +11011,9 @@ impl BashTool {
 
         // Every execution route passes the same mediation gate above.
         if let Some(client) = client_terminal {
-            let command = self.client_terminal_command(&input)?;
+            let mut command = self.client_terminal_command(&input)?;
+            command.cancellation = cancellation.cloned();
+            command.cleanup = cleanup.cloned();
             owner
                 .checkpoint()
                 .map_err(|_| Error::tool("bash", "Command cancelled before client dispatch"))?;
@@ -11025,6 +11104,8 @@ impl BashTool {
             on_update.as_deref(),
             use_pty,
             shell_state.as_ref(),
+            cancellation.map(Arc::as_ref),
+            cleanup,
         )
         .await?;
 
@@ -18222,6 +18303,7 @@ pub(crate) struct ProcessGuard {
     child: Option<std::process::Child>,
     cleanup_mode: ProcessCleanupMode,
     shell_process: Option<bash_session::ShellProcessLease>,
+    scope_invocation: Option<crate::jobs::JobScopeInvocation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18236,11 +18318,17 @@ impl ProcessGuard {
             child: Some(child),
             cleanup_mode,
             shell_process: None,
+            scope_invocation: None,
         }
     }
 
     fn with_shell_state(mut self, state: Option<&bash_session::ShellTransaction>) -> Self {
         self.shell_process = state.map(bash_session::ShellTransaction::retain_process);
+        self
+    }
+
+    fn with_scope_invocation(mut self, cleanup: Option<&crate::jobs::JobScopeInvocation>) -> Self {
+        self.scope_invocation = cleanup.cloned();
         self
     }
 
@@ -18263,7 +18351,9 @@ impl ProcessGuard {
             .map_or(Ok(None), std::process::Child::try_wait)?;
         if status.is_some()
             && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
-            && (cfg!(windows) || self.shell_process.is_some())
+            && (cfg!(windows)
+                || self.shell_process.is_some()
+                || self.scope_invocation.is_some())
             && let Some(child) = &self.child
         {
             // Descendants can retain stdout after their root exits. Close the
@@ -18280,6 +18370,7 @@ impl ProcessGuard {
     pub(crate) fn kill(&mut self) -> Option<std::process::ExitStatus> {
         if let Some(mut child) = self.child.take() {
             let shell_process = self.shell_process.take();
+            let scope_invocation = self.scope_invocation.take();
             match child.try_wait() {
                 Ok(Some(status)) => {
                     if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
@@ -18304,8 +18395,13 @@ impl ProcessGuard {
                 }
             }
             dispatch_process_cleanup(move || {
-                let _ = child.wait();
+                if child.wait().is_err()
+                    && let Some(cleanup) = &scope_invocation
+                {
+                    cleanup.mark_unconfirmed();
+                }
                 drop(shell_process);
+                drop(scope_invocation);
             });
             // A live or unconfirmed child is reaped without blocking callers.
             return None;
@@ -18345,7 +18441,9 @@ impl ProcessGuard {
         // the child handle and its registered Windows Job available.
         let status = child.wait()?;
         if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
-            && (cfg!(windows) || self.shell_process.is_some())
+            && (cfg!(windows)
+                || self.shell_process.is_some()
+                || self.scope_invocation.is_some())
         {
             terminate_reaped_child_discipline(child.id());
             self.cleanup_mode = ProcessCleanupMode::ChildOnly;
@@ -18371,7 +18469,7 @@ impl Drop for ProcessGuard {
             if matches!(status, Ok(Some(_))) {
                 if !cfg!(windows)
                     && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
-                    && self.shell_process.is_some()
+                    && (self.shell_process.is_some() || self.scope_invocation.is_some())
                 {
                     terminate_reaped_child_discipline(child.id());
                 }
@@ -18379,13 +18477,19 @@ impl Drop for ProcessGuard {
             }
             let cleanup_mode = self.cleanup_mode;
             let shell_process = self.shell_process.take();
+            let scope_invocation = self.scope_invocation.take();
             dispatch_process_cleanup(move || {
                 if matches!(status, Ok(None)) {
                     cleanup_child(Some(child.id()), cleanup_mode);
                     let _ = child.kill();
                 }
-                let _ = child.wait();
+                if child.wait().is_err()
+                    && let Some(cleanup) = &scope_invocation
+                {
+                    cleanup.mark_unconfirmed();
+                }
                 drop(shell_process);
+                drop(scope_invocation);
             });
         }
     }
@@ -18435,18 +18539,21 @@ struct PtyProcessGuard {
     process_id: Option<u32>,
     group_active: bool,
     shell_process: Option<bash_session::ShellProcessLease>,
+    scope_invocation: Option<crate::jobs::JobScopeInvocation>,
 }
 
 impl PtyProcessGuard {
     fn new(
         child: Box<dyn portable_pty::Child + Send + Sync>,
         shell_state: Option<&bash_session::ShellTransaction>,
+        cleanup: Option<&crate::jobs::JobScopeInvocation>,
     ) -> Self {
         Self {
             process_id: child.process_id(),
             child: Some(child),
             group_active: true,
             shell_process: shell_state.map(bash_session::ShellTransaction::retain_process),
+            scope_invocation: cleanup.cloned(),
         }
     }
 
@@ -18509,13 +18616,19 @@ impl Drop for PtyProcessGuard {
             }
             let process_id = self.process_id;
             let shell_process = self.shell_process.take();
+            let scope_invocation = self.scope_invocation.take();
             dispatch_process_cleanup(move || {
                 if matches!(status, Ok(None)) {
                     cleanup_child(process_id, ProcessCleanupMode::ProcessGroupTree);
                     let _ = child.kill();
                 }
-                let _ = child.wait();
+                if child.wait().is_err()
+                    && let Some(cleanup) = &scope_invocation
+                {
+                    cleanup.mark_unconfirmed();
+                }
                 drop(shell_process);
+                drop(scope_invocation);
             });
         }
     }
@@ -24764,6 +24877,8 @@ mod tests {
                             None,
                             use_pty,
                             None,
+                            None,
+                            None,
                         ))
                         .await
                         .expect_err("the polling runtime cannot supply missing authority");
@@ -24783,6 +24898,8 @@ mod tests {
                 Some(5),
                 None,
                 false,
+                None,
+                None,
                 None,
             )
             .await
@@ -24822,6 +24939,8 @@ mod tests {
                             None,
                             use_pty,
                             None,
+                            None,
+                            None,
                         ))
                         .await
                         .expect("pre-cancellation must win before shell lookup or PTY startup");
@@ -24841,7 +24960,7 @@ mod tests {
     #[test]
     fn bash_tool_does_not_launch_after_its_session_resolver_cancels_the_owner() {
         asupersync::test_utils::run_test(|| async {
-            for background in [None, Some(true)] {
+            for background in [None, Some(false), Some(true)] {
                 let root = tempfile::tempdir().expect("isolated shell workspace");
                 let artifacts = root.path().join("artifacts");
                 let owner_id = format!("bash-resolver-cancel-{}", uuid::Uuid::new_v4().simple());
@@ -25105,7 +25224,18 @@ mod tests {
 
             for use_pty in [false, true] {
                 let result = if use_pty {
-                    run_bash_command_pty(tmp.path(), None, None, command, Some(1), None, None).await
+                    run_bash_command_pty(
+                        tmp.path(),
+                        None,
+                        None,
+                        command,
+                        Some(1),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
                 } else {
                     run_bash_command(tmp.path(), None, None, command, Some(1), None).await
                 }
@@ -25145,6 +25275,8 @@ mod tests {
                         command,
                         Some(30),
                         Some(&on_update),
+                        None,
+                        None,
                         None,
                     )
                     .await

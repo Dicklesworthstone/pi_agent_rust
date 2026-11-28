@@ -164,12 +164,29 @@ by the preceding call. For example, these two tool calls share state:
 {"command":"build_target; pwd","background":false}
 ```
 
-State is scoped to the captured agent session, configured Bash binary,
-command prefix, and initial workspace directory. Rebuilding a tool registry
-does not discard it. A session switch cannot import another session's state.
-Other file tools continue to use their own workspace directory. If a saved
-directory is renamed or removed, the next Bash call returns to its initial
-workspace directory and retains the other saved state.
+State is scoped to the live tool registry, captured saved-session identity,
+configured Bash binary, command prefix, and initial workspace directory.
+Cloning the registry or replacing tools within that live scope preserves
+state. An independently constructed registry or another live handle loading
+the same saved session starts with fresh shell state; the saved-session ID
+does not grant access to another handle's variables or working directory.
+A session switch within one live registry cannot import another session's
+state. Other file tools continue to use their own workspace directory. If a
+saved directory is renamed or removed, the next Bash call returns to its
+initial workspace directory and retains the other saved state.
+
+Closing the live scope also cancels an active direct foreground or PTY call,
+including `background:false`. The tool keeps awaiting the original command
+while its supervisor performs bounded process cleanup. Retained tools cannot
+start another command after that scope closes. A normally completed tool call
+does not close the scope or cancel jobs that it has placed in the background.
+Other live handles remain available even when they share a caller context.
+SDK shutdown waits for the actual process reaper or editor terminal release
+acknowledgment, including after a tool future is dropped. If cleanup cannot be
+confirmed, the shutdown report records that uncertainty.
+Shutdown completion waits for native process reapers and editor terminal
+release acknowledgments, including after a caller drops the tool future.
+If cleanup cannot be confirmed, shutdown returns an error.
 
 Only one call owns a session's shell state at a time. An automatically
 promoted command keeps that ownership until it settles, and its final state

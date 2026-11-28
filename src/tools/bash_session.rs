@@ -23,6 +23,10 @@ pub(super) const CAPACITY_NOTICE: &str = "The session shell state pool is full. 
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct SessionKey {
+    // Saved session IDs are not live-handle authority. Registry clones share
+    // this discriminator; independent handles must never import each other's
+    // environment or working directory. Unbound tools retain their own scope.
+    instance_id: Option<String>,
     session_id: String,
     shell: String,
     prefix: Option<String>,
@@ -93,6 +97,7 @@ pub(super) enum Acquisition {
 /// never import or publish that command's in-flight session state.
 #[allow(clippy::significant_drop_tightening)] // The pool lock covers the lease handoff.
 pub(super) fn acquire(
+    instance_id: Option<&str>,
     session_id: &str,
     initial_cwd: &Path,
     shell: &str,
@@ -100,6 +105,7 @@ pub(super) fn acquire(
     command: &str,
 ) -> Result<Acquisition> {
     let key = SessionKey {
+        instance_id: instance_id.map(str::to_owned),
         session_id: session_id.to_owned(),
         shell: shell.to_owned(),
         prefix: prefix.map(str::to_owned),

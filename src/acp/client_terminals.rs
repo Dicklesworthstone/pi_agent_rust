@@ -123,6 +123,20 @@ struct Run {
     abandoned: bool,
     exited: bool,
     cleanup_started: bool,
+    cleanup: Option<crate::jobs::JobScopeInvocation>,
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        // Losing the transport cannot prove that the editor stopped a command.
+        // Confirmed release/allocation failure explicitly retire this token;
+        // close or destruction with an outstanding resource remains uncertain.
+        if (self.creating || self.terminal.is_some())
+            && let Some(cleanup) = &self.cleanup
+        {
+            cleanup.mark_unconfirmed();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -176,7 +190,12 @@ impl Requests {
             .map_or(true, |state| state.runs.contains_key(&run))
     }
 
-    fn start(&self, output: &AcpOutput, session: &str) -> Result<Lease> {
+    fn start(
+        &self,
+        output: &AcpOutput,
+        session: &str,
+        cleanup: Option<crate::jobs::JobScopeInvocation>,
+    ) -> Result<Lease> {
         let transport = output
             .shared
             .state
@@ -216,6 +235,7 @@ impl Requests {
                 abandoned: false,
                 exited: false,
                 cleanup_started: false,
+                cleanup,
             },
         );
         Ok(Lease {
@@ -436,9 +456,13 @@ impl Requests {
         let mut discarded = Vec::new();
         if settled {
             if kind == Kind::Create && valid_error {
-                state.runs.remove(&run_id);
+                if let Some(mut run) = state.runs.remove(&run_id) {
+                    drop(run.cleanup.take());
+                }
             } else if kind == Kind::Release && !valid_error {
-                state.runs.remove(&run_id);
+                if let Some(mut run) = state.runs.remove(&run_id) {
+                    drop(run.cleanup.take());
+                }
                 discarded = state
                     .pending
                     .extract_if(|_, pending| pending.run == run_id)
@@ -779,33 +803,44 @@ async fn run_with_deadline<F: Future>(
     owner: &AgentCx,
     abort: &AbortSignal,
     duration: Option<Duration>,
+    cancellation: Option<&AtomicBool>,
     work: F,
 ) -> std::result::Result<F::Output, RequestStop> {
-    if let Some(duration) = duration {
-        return owner
-            .with_current(with_timeout_and_abort(duration, Some(abort), work))
-            .await;
-    }
     // timeout:0 disables the command deadline, not cancellation or bounded
-    // allocation/output/cleanup exchanges. There is no detached waiter.
+    // allocation/output/cleanup exchanges. Scope cancellation belongs only
+    // to this invocation: never cancel an ambient owner shared by other tools.
     if !owner.capabilities().time {
         return Err(RequestStop::TimeUnavailable);
     }
+    let is_cancelled = || {
+        abort.is_aborted()
+            || cancellation.is_some_and(|signal| signal.load(Ordering::Acquire))
+            || owner.checkpoint().is_err()
+    };
     let cancelled = async {
         loop {
-            if abort.is_aborted() || owner.checkpoint().is_err() {
+            if is_cancelled() {
                 return;
             }
             owner.time().sleep(Duration::from_millis(25)).await;
         }
     };
-    match futures::future::select(Box::pin(cancelled), Box::pin(owner.with_current(work))).await {
+    let bounded = async {
+        if let Some(duration) = duration {
+            owner
+                .with_current(with_timeout_and_abort(duration, Some(abort), work))
+                .await
+        } else {
+            Ok(owner.with_current(work).await)
+        }
+    };
+    match futures::future::select(Box::pin(cancelled), Box::pin(bounded)).await {
         futures::future::Either::Left(_) => Err(RequestStop::Cancelled),
         futures::future::Either::Right((result, _)) => {
-            if abort.is_aborted() || owner.checkpoint().is_err() {
+            if is_cancelled() {
                 Err(RequestStop::Cancelled)
             } else {
-                Ok(result)
+                result
             }
         }
     }
@@ -820,6 +855,13 @@ impl TerminalClient for Client {
     ) -> Result<ToolOutput> {
         let owner = AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| Error::Aborted)?;
+        if command
+            .cancellation
+            .as_ref()
+            .is_some_and(|signal| signal.load(Ordering::Acquire))
+        {
+            return Err(Error::Aborted);
+        }
         if !owner.capabilities().io || !owner.capabilities().spawn {
             return Err(failure(
                 "Editor terminals require I/O and spawn capabilities",
@@ -836,12 +878,13 @@ impl TerminalClient for Client {
             .output
             .shared
             .terminals
-            .start(&self.output, &self.session)?;
+            .start(&self.output, &self.session, command.cleanup.clone())?;
         let mut observed = Observed::default();
         let outcome = run_with_deadline(
             &owner,
             &lease.abort,
             command.timeout,
+            command.cancellation.as_deref(),
             self.run(&lease, &owner, &command, &mut observed, on_update),
         )
         .await;

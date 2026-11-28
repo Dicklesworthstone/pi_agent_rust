@@ -76,6 +76,8 @@ impl Fixture {
             env: Vec::new(),
             cwd: self.root.path().to_path_buf(),
             timeout,
+            cancellation: None,
+            cleanup: None,
         }
     }
 
@@ -349,6 +351,10 @@ fn dropped_allocation_cleans_late_reply_and_fences_only_its_session_until_valid_
             drop(pending);
             create
         };
+        let mut finished = Box::pin(
+            fixture.tools.job_session_scope().begin_shutdown().unwrap().finish(),
+        );
+        poll_pending(finished.as_mut()).await;
         drop(fixture.prompt.take());
         assert!(
             fixture
@@ -392,6 +398,7 @@ fn dropped_allocation_cleans_late_reply_and_fences_only_its_session_until_valid_
         assert_eq!(release["params"]["terminalId"], "late-terminal");
         fixture.reply(&kill, json!({}));
         fixture.reply(&release, json!(null));
+        poll_pending(finished.as_mut()).await;
         assert!(
             fixture
                 .output
@@ -400,6 +407,7 @@ fn dropped_allocation_cleans_late_reply_and_fences_only_its_session_until_valid_
                 .has_unsettled("editor-session")
         );
         fixture.reply(&release, json!({}));
+        finished.await.unwrap();
         assert!(!fixture.output.shared.terminals.has_pending());
         assert!(!fixture.route(
             json!({"jsonrpc":"2.0", "id":create["id"], "result":{"terminalId":"duplicate"}})
@@ -444,6 +452,76 @@ fn timeout_zero_remains_cancellable_and_cleanup_acknowledgment_retires_waiters()
 }
 
 #[test]
+fn live_scope_shutdown_releases_only_its_editor_terminal_with_a_shared_request_owner() {
+    asupersync::test_utils::run_test(|| async {
+        for timeout_seconds in [0, 120] {
+            let retired = Fixture::new(true);
+            let peer = Fixture::new(true);
+            for fixture in [&retired, &peer] {
+                fixture.tools.bind_job_session_resolver(Arc::new(|| {
+                    Box::pin(async { Some("same-saved-editor-session".to_string()) })
+                }));
+            }
+            let owner = AgentCx::for_current_or_request();
+            let mut closing = Box::pin(owner.with_current(
+                retired.tools.get("bash").unwrap().execute(
+                    "closing-terminal",
+                    json!({"command":"sleep 60", "timeout":timeout_seconds}),
+                    None,
+                ),
+            ));
+            let (closed_wait, closed_output) = retired.allocate(closing.as_mut()).await;
+            let mut surviving = Box::pin(owner.with_current(
+                peer.tools.get("bash").unwrap().execute(
+                    "surviving-terminal",
+                    json!({"command":"printf peer", "timeout":timeout_seconds}),
+                    None,
+                ),
+            ));
+            let (peer_wait, _) = peer.allocate(surviving.as_mut()).await;
+
+            let shutdown = retired.tools.job_session_scope().begin_shutdown().unwrap();
+            let mut finished = Box::pin(shutdown.finish());
+            poll_pending(finished.as_mut()).await;
+            let kill = retired
+                .await_frame(closing.as_mut(), "terminal/kill")
+                .await;
+            let release = retired
+                .await_frame(closing.as_mut(), "terminal/release")
+                .await;
+            retired.reply(&kill, json!({}));
+            retired.reply(&release, json!({}));
+            let result = closing.await.unwrap();
+            finished.await.unwrap();
+            let details = result.details.as_ref().unwrap();
+            assert!(result.is_error);
+            assert_eq!(details["status"], "cancelled");
+            assert_eq!(details["cleanup"], "released");
+            assert!(!retired.output.shared.terminals.has_pending());
+            assert!(!owner.is_cancel_requested(), "retirement must not cancel a shared caller");
+            assert!(!peer.abort.is_aborted());
+            poll_pending(surviving.as_mut()).await;
+
+            let release = peer
+                .finish(surviving.as_mut(), &peer_wait, json!({"exitCode":0}), "peer")
+                .await;
+            peer.reply(&release, json!({}));
+            let result = surviving.await.unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(result.details.as_ref().unwrap()["status"], "completed");
+            assert!(!peer.output.shared.terminals.has_pending());
+            assert!(!owner.is_cancel_requested());
+            for response in [
+                json!({"jsonrpc":"2.0", "id":closed_wait["id"], "result":{"exitCode":0}}),
+                json!({"jsonrpc":"2.0", "id":closed_output["id"], "result":{"output":"late", "truncated":false}}),
+            ] {
+                assert!(!retired.route(response));
+            }
+        }
+    });
+}
+
+#[test]
 fn command_deadline_kills_and_releases_without_waiting_for_the_client_to_exit() {
     asupersync::test_utils::run_test(|| async {
         let fixture = Fixture::new(true);
@@ -472,11 +550,13 @@ fn command_deadline_kills_and_releases_without_waiting_for_the_client_to_exit() 
 fn unacknowledged_release_is_bounded_aborts_the_prompt_and_remains_session_owned() {
     asupersync::test_utils::run_test(|| async {
         let mut fixture = Fixture::new(true);
+        let scope = crate::jobs::JobSessionScope::fixed("unacknowledged-editor-release");
         let release = {
             let mut client = fixture.client();
             client.cleanup_timeout = Duration::from_millis(20);
-            let mut pending =
-                Box::pin(client.execute(fixture.command(Some(Duration::from_secs(2))), None));
+            let mut command = fixture.command(Some(Duration::from_secs(2)));
+            command.cleanup = Some(scope.begin_invocation().unwrap());
+            let mut pending = Box::pin(client.execute(command, None));
             let (wait, output) = fixture.allocate(pending.as_mut()).await;
             fixture.reply(&output, json!({"output":"done", "truncated":false}));
             poll_pending(pending.as_mut()).await;
@@ -489,6 +569,8 @@ fn unacknowledged_release_is_bounded_aborts_the_prompt_and_remains_session_owned
             assert!(text(&result).contains("may still be running"));
             release
         };
+        let mut finished = Box::pin(scope.begin_shutdown().unwrap().finish());
+        poll_pending(finished.as_mut()).await;
         assert!(fixture.abort.is_aborted());
         drop(fixture.prompt.take());
         let (abort, _) = AbortHandle::new();
@@ -499,6 +581,7 @@ fn unacknowledged_release_is_bounded_aborts_the_prompt_and_remains_session_owned
                 .is_err()
         );
         fixture.reply(&release, json!({}));
+        finished.await.unwrap();
         assert!(!fixture.output.shared.terminals.has_pending());
         let (abort, _) = AbortHandle::new();
         let resumed = fixture
@@ -506,6 +589,38 @@ fn unacknowledged_release_is_bounded_aborts_the_prompt_and_remains_session_owned
             .begin_prompt("editor-session".into(), abort)
             .unwrap();
         drop(resumed);
+    });
+}
+
+#[test]
+fn losing_editor_transport_without_release_acknowledgment_reports_unconfirmed_scope_cleanup() {
+    asupersync::test_utils::run_test(|| async {
+        for allocated in [false, true] {
+            let fixture = Fixture::new(true);
+            let owner = AgentCx::for_current_or_request();
+            let mut pending = Box::pin(owner.with_current(
+                fixture.tools.get("bash").unwrap().execute(
+                    "lost-editor-transport",
+                    json!({"command":"sleep 60", "timeout":0}),
+                    None,
+                ),
+            ));
+            if allocated {
+                fixture.allocate(pending.as_mut()).await;
+            } else {
+                fixture.await_frame(pending.as_mut(), "terminal/create").await;
+            }
+            drop(pending);
+            let mut finished = Box::pin(
+                fixture.tools.job_session_scope().begin_shutdown().unwrap().finish(),
+            );
+            poll_pending(finished.as_mut()).await;
+            fixture.output.shared.terminals.close();
+            let error = finished.await.expect_err("disconnect is not a release acknowledgment");
+            assert!(error.to_string().contains("PI_JOBS_SCOPE_FOREGROUND_UNCONFIRMED"));
+            assert!(!owner.is_cancel_requested());
+            assert!(!fixture.output.shared.terminals.has_pending());
+        }
     });
 }
 
@@ -613,7 +728,7 @@ fn workspace_argument_environment_and_capacity_bounds_precede_publication() {
                     .output
                     .shared
                     .terminals
-                    .start(&fixture.output, "editor-session")
+                    .start(&fixture.output, "editor-session", None)
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -622,7 +737,7 @@ fn workspace_argument_environment_and_capacity_bounds_precede_publication() {
                 .output
                 .shared
                 .terminals
-                .start(&fixture.output, "editor-session")
+                .start(&fixture.output, "editor-session", None)
                 .is_err()
         );
         drop(leases);
@@ -656,6 +771,15 @@ fn editor_allocation_preserves_the_native_owners_spawn_authority_and_cancellatio
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Aborted));
+        let live = AgentCx::for_request();
+        let mut command = fixture.command(None);
+        command.cancellation = Some(Arc::new(AtomicBool::new(true)));
+        let error = live
+            .with_current(client.execute(command, None))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Aborted));
+        assert!(!live.is_cancel_requested());
         assert!(fixture.receiver.try_recv().is_err());
         assert!(!fixture.output.shared.terminals.has_pending());
     });

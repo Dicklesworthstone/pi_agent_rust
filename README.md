@@ -795,12 +795,14 @@ ownership, including during cancellation and cleanup. The low-level SDK's
 explicit durable-owner job observation and teardown APIs remain owner-wide.
 
 SDK handle shutdown and replacement retire only that handle's live job scope,
-including shell jobs, foreground subagents, `/tan`, and persistent workers
-from sessions previously selected within it.
+including shell jobs, foreground shell calls, editor terminals, subagents,
+`/tan`, and persistent workers from sessions previously selected within it.
 The admission fence and cancellation requests are installed before waiting for
 session saves or locks. Dropping shutdown leaves the fence closed. Awaiting it
-waits within bounded budgets for process reaping, output draining, isolated
-writeback disposition, and accepted-result retention; unfinished cleanup is
+waits within bounded budgets for process reaping, output draining, editor
+terminal release, isolated writeback disposition, and accepted-result retention.
+Dropped foreground calls retain cleanup ownership through the native reaper or
+editor release acknowledgment. Unfinished cleanup and lost acknowledgments are
 reported instead of treating a cancelled roster entry as proof of process exit.
 Discarding a replacement candidate cannot stop an active handle's work merely
 because both loaded the same saved session. Bound SDK `read` and `grep` calls

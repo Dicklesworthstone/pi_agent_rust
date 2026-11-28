@@ -12,10 +12,24 @@ pub struct TerminalCommand {
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
     pub timeout: Option<Duration>,
+    /// Optional invocation-local cancellation. A true acquire-load requires
+    /// bounded terminal cleanup without cancelling the shared caller context.
+    /// The original AgentCx still supplies capabilities, budget and deadlines.
+    pub cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Keep this lease until the terminal is confirmed released, including
+    /// after the execute future is dropped or bounded cleanup is unconfirmed.
+    /// Live-scope shutdown waits for the last cleanup owner's clone to retire.
+    pub cleanup: Option<crate::jobs::JobScopeInvocation>,
 }
 
 /// Foreground commands admitted by the native tool policy. Errors must never
 /// cause a local retry: a remote allocation may already have executed the line.
+/// Implementations must observe [`TerminalCommand::cancellation`] throughout
+/// execution and complete bounded termination, output draining and terminal
+/// release before returning a cancelled result. This signal only cancels the
+/// invocation; implementations must not mutate the caller's shared AgentCx.
+/// Transfer [`TerminalCommand::cleanup`] to the terminal's retained resource
+/// owner until release is confirmed, even if this execute future is abandoned.
 #[async_trait]
 pub trait TerminalClient: Send + Sync {
     async fn execute(
@@ -79,6 +93,8 @@ impl BashTool {
                 Some(seconds) => Some(Duration::from_secs(seconds)),
                 None => Some(Duration::from_secs(DEFAULT_BASH_TIMEOUT_SECS)),
             },
+            cancellation: None,
+            cleanup: None,
         })
     }
 }

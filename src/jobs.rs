@@ -25,9 +25,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(all(test, unix))]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,11 +78,13 @@ pub(crate) struct JobScopeLifecycle {
     instance_id: String,
     closed: AtomicBool,
     closed_notify: Notify,
+    active_invocations: AtomicUsize,
+    foreground_unconfirmed: AtomicBool,
 }
 
 impl JobScopeLifecycle {
     pub(crate) fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.closed.load(Ordering::SeqCst)
     }
 
     pub(crate) fn ensure_open(&self) -> Result<()> {
@@ -96,6 +96,55 @@ impl JobScopeLifecycle {
         } else {
             Ok(())
         }
+    }
+
+    fn ensure_cleanup_confirmed(&self) -> Result<()> {
+        if self.foreground_unconfirmed.load(Ordering::Acquire) {
+            Err(Error::tool(
+                "jobs",
+                "PI_JOBS_SCOPE_FOREGROUND_UNCONFIRMED: foreground command cleanup was not confirmed",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Cleanup ownership for one admitted foreground invocation. Cloning retains
+/// the same admission until its last resource owner has finished, including
+/// a native process reaper or an editor terminal awaiting release.
+#[derive(Clone)]
+pub struct JobScopeInvocation {
+    inner: Arc<JobScopeInvocationInner>,
+}
+
+impl JobScopeInvocation {
+    /// Retain uncertainty when a process reaper or terminal connection loses
+    /// its cleanup acknowledgement. Dropping the last owner cannot then
+    /// certify that the resource was released. This evidence is permanent.
+    pub fn mark_unconfirmed(&self) {
+        self.inner
+            .lifecycle
+            .foreground_unconfirmed
+            .store(true, Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for JobScopeInvocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("JobScopeInvocation").finish_non_exhaustive()
+    }
+}
+
+struct JobScopeInvocationInner {
+    lifecycle: Arc<JobScopeLifecycle>,
+}
+
+impl Drop for JobScopeInvocationInner {
+    fn drop(&mut self) {
+        // A zero snapshot also observes any earlier mark_unconfirmed on the
+        // final owner's thread, so lost release evidence cannot disappear.
+        self.lifecycle.active_invocations.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -116,6 +165,8 @@ impl JobSessionScope {
                 instance_id: instance_id.clone(),
                 closed: AtomicBool::new(false),
                 closed_notify: Notify::new(),
+                active_invocations: AtomicUsize::new(0),
+                foreground_unconfirmed: AtomicBool::new(false),
             }),
             instance_id,
             agent_hubs: Arc::new(Mutex::new(HashMap::new())),
@@ -221,6 +272,34 @@ impl JobSessionScope {
         &self.instance_id
     }
 
+    /// Retain foreground cleanup before resolving its owner or creating any
+    /// resource. Closure racing the increment rejects admission and releases
+    /// the temporary count; once returned, every reaper must retain a clone
+    /// until its resource has actually retired.
+    pub(crate) fn begin_invocation(&self) -> Result<JobScopeInvocation> {
+        self.lifecycle.ensure_open()?;
+        self.lifecycle
+            .active_invocations
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| active.checked_add(1))
+            .map_err(|_| {
+                Error::tool(
+                    "jobs",
+                    "PI_JOBS_SCOPE_INVOCATION_LIMIT: too many retained foreground invocations",
+                )
+            })?;
+        let invocation = JobScopeInvocation {
+            inner: Arc::new(JobScopeInvocationInner {
+                lifecycle: Arc::clone(&self.lifecycle),
+            }),
+        };
+        // The close flag and count share a sequentially consistent order with
+        // shutdown's zero snapshot. Both sides cannot observe the old value:
+        // an admitted invocation is counted, or this recheck rejects it before
+        // effects and drops the temporary count.
+        self.lifecycle.ensure_open()?;
+        Ok(invocation)
+    }
+
     /// Wait for this exact live registry to retire. The permanent flag makes
     /// late subscribers ready too; unrelated request cancellation does not
     /// satisfy this signal or consume another subscriber's notification.
@@ -281,7 +360,7 @@ impl JobSessionScope {
     /// Dropping the returned token leaves admissions closed and cancellation
     /// requested; call [`JobScopeShutdown::finish`] to confirm bounded cleanup.
     pub fn begin_shutdown(&self) -> Result<JobScopeShutdown> {
-        self.lifecycle.closed.store(true, Ordering::Release);
+        self.lifecycle.closed.store(true, Ordering::SeqCst);
         self.lifecycle.closed_notify.notify_waiters();
         let locked = registry().lock();
         let mut poisoned = locked.is_err();
@@ -4546,8 +4625,8 @@ pub struct JobScopeShutdown {
 
 impl JobScopeShutdown {
     /// Wait for in-flight spawn publication to stop, then confirm that this
-    /// registry's jobs and native children have completed cancellation, reap,
-    /// output draining and pending worktree disposition.
+    /// registry's jobs, native children and foreground resources have completed
+    /// cancellation, reap, output draining and pending worktree disposition.
     /// Other live registries, including ones loading the same saved session,
     /// remain available throughout this bounded operation.
     pub async fn finish(self) -> Result<()> {
@@ -4569,7 +4648,7 @@ impl JobScopeShutdown {
     }
 
     async fn finish_children(&self, timeout: Duration) -> Result<()> {
-        if scope_children_settled(&self.hubs)? {
+        if scope_children_settled(&self.lifecycle, &self.hubs)? {
             return Ok(());
         }
         let receiver = {
@@ -4577,12 +4656,13 @@ impl JobScopeShutdown {
             let _shutdown_isolation = acquire_shutdown_capacity_read_guard();
             let worker = SessionShutdownWorker::reserve()?;
             let hubs = self.hubs.clone();
+            let lifecycle = Arc::clone(&self.lifecycle);
             let started = Instant::now();
             let (sender, receiver) = futures::channel::oneshot::channel();
             std::thread::Builder::new()
                 .name("pi-scope-child-shutdown".to_string())
                 .spawn(move || {
-                    let result = wait_scope_children(&hubs, started, timeout, || sender.is_canceled());
+                    let result = wait_scope_children(&lifecycle, &hubs, started, timeout, || sender.is_canceled());
                     let _ = sender.send(result);
                     drop(worker);
                 })
@@ -4639,8 +4719,11 @@ impl JobScopeShutdown {
     }
 }
 
-fn scope_children_settled(hubs: &[crate::agent_hub::SharedHub]) -> Result<bool> {
-    let mut settled = true;
+fn scope_children_settled(
+    lifecycle: &JobScopeLifecycle,
+    hubs: &[crate::agent_hub::SharedHub],
+) -> Result<bool> {
+    let mut settled = lifecycle.active_invocations.load(Ordering::SeqCst) == 0;
     for hub in hubs {
         match hub.try_lock() {
             Ok(mut hub) => {
@@ -4659,10 +4742,14 @@ fn scope_children_settled(hubs: &[crate::agent_hub::SharedHub]) -> Result<bool> 
             }
         }
     }
+    if settled {
+        lifecycle.ensure_cleanup_confirmed()?;
+    }
     Ok(settled)
 }
 
 fn wait_scope_children(
+    lifecycle: &JobScopeLifecycle,
     hubs: &[crate::agent_hub::SharedHub],
     started: Instant,
     timeout: Duration,
@@ -4676,13 +4763,14 @@ fn wait_scope_children(
                 "PI_HUB_SCOPE_SHUTDOWN_ABANDONED: native cleanup observer was dropped",
             ));
         }
-        if scope_children_settled(hubs)? {
+        if scope_children_settled(lifecycle, hubs)? {
             return Ok(());
         }
         if Instant::now() >= deadline {
+            lifecycle.ensure_cleanup_confirmed()?;
             return Err(Error::tool(
                 "hub",
-                "PI_HUB_SCOPE_SHUTDOWN_INCOMPLETE: native child execution or process reap remains pending",
+                "PI_HUB_SCOPE_SHUTDOWN_INCOMPLETE: native child execution, process reap or foreground cleanup remains pending",
             ));
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -8784,6 +8872,54 @@ mod tests {
         }
         assert!(registry().lock().unwrap().jobs[&id].cancel_requested);
         registry().lock().unwrap().jobs.remove(&id);
+    }
+
+    #[test]
+    fn scope_shutdown_waits_for_the_last_foreground_cleanup_clone_after_scope_drop() {
+        let _guard = process_test_guard();
+        let scope = JobSessionScope::fixed("retained-foreground-cleanup");
+        let invocation = scope.begin_invocation().unwrap();
+        let process_owner = invocation.clone();
+        let terminal_owner = invocation.clone();
+        assert_eq!(scope.lifecycle.active_invocations.load(Ordering::Acquire), 1);
+        drop(invocation);
+        assert_eq!(scope.lifecycle.active_invocations.load(Ordering::Acquire), 1);
+        let shutdown = scope.begin_shutdown().unwrap();
+        let error = scope.begin_invocation().unwrap_err();
+        assert!(error.to_string().contains("PI_JOBS_SCOPE_CLOSED"));
+        assert_eq!(scope.lifecycle.active_invocations.load(Ordering::Acquire), 1);
+        drop(scope);
+        futures::executor::block_on(async {
+            let error = shutdown.finish_children(Duration::from_millis(20)).await
+                .expect_err("retained foreground resources cannot be certified as drained");
+            assert!(error.to_string().contains("PI_HUB_SCOPE_SHUTDOWN_INCOMPLETE"));
+            drop(process_owner);
+            let mut finish = Box::pin(shutdown.finish());
+            assert!(futures::poll!(&mut finish).is_pending(), "one resource owner still retains this admission");
+            drop(terminal_owner);
+            finish.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn unconfirmed_foreground_cleanup_remains_an_error_after_every_owner_drops() {
+        let _guard = process_test_guard();
+        let scope = JobSessionScope::fixed("uncertain-foreground-cleanup");
+        let independent = JobSessionScope::fixed("uncertain-foreground-cleanup");
+        let invocation = scope.begin_invocation().unwrap();
+        let release_owner = invocation.clone();
+        let shutdown = scope.begin_shutdown().unwrap();
+        release_owner.mark_unconfirmed();
+        drop(invocation);
+        drop(release_owner);
+        assert_eq!(scope.lifecycle.active_invocations.load(Ordering::Acquire), 0);
+        futures::executor::block_on(async {
+            let error = shutdown.finish().await.unwrap_err();
+            assert!(error.to_string().contains("PI_JOBS_SCOPE_FOREGROUND_UNCONFIRMED"));
+            let retry = scope.begin_shutdown().unwrap().finish().await.unwrap_err();
+            assert!(retry.to_string().contains("PI_JOBS_SCOPE_FOREGROUND_UNCONFIRMED"), "retry cannot erase a lost release acknowledgement");
+            independent.begin_shutdown().unwrap().finish().await.unwrap();
+        });
     }
 
     #[test]
