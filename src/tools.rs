@@ -7458,6 +7458,35 @@ impl std::fmt::Debug for SharedToolRegistry {
 // Read Tool
 // ============================================================================
 
+/// A direct SDK tool call has no Agent dispatcher to install its live parent.
+/// Keep the resolver cancellable, and never turn unavailable session authority
+/// into a read from the explicit standalone hub.
+async fn resolve_bound_tool_hub(
+    tool_name: &'static str,
+    scope: Option<&crate::jobs::JobSessionScope>,
+    owner: &AgentCx,
+) -> Result<crate::agent_hub::SharedHub> {
+    let cancelled = || Error::tool(tool_name, "Command cancelled while resolving session authority");
+    owner.checkpoint().map_err(|_| cancelled())?;
+    let Some(scope) = scope else {
+        return Ok(crate::agent_hub::current_registry());
+    };
+    let lookup = owner.with_current(scope.invocation_agent_hub());
+    let cancellation = async {
+        let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+        let _ = receiver.recv(owner.cx()).await;
+        drop(sender);
+    };
+    futures::pin_mut!(lookup, cancellation);
+    let hub = match futures::future::select(lookup, cancellation).await {
+        futures::future::Either::Left((resolved, _)) => resolved?,
+        futures::future::Either::Right(_) => return Err(cancelled()),
+    };
+    // A resolver may cancel its owner and return Ready in the same poll.
+    owner.checkpoint().map_err(|_| cancelled())?;
+    Ok(hub)
+}
+
 /// Input parameters for the read tool.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -7477,6 +7506,7 @@ struct ReadInput {
 pub struct ReadTool {
     cwd: PathBuf,
     text_file_client: TextFileClientScope,
+    job_session_scope: Option<crate::jobs::JobSessionScope>,
     /// Whether to auto-resize images to fit token limits.
     auto_resize: bool,
     block_images: bool,
@@ -7494,6 +7524,7 @@ impl ReadTool {
         Self {
             cwd: cwd.to_path_buf(),
             text_file_client: TextFileClientScope::default(),
+            job_session_scope: None,
             workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
@@ -7515,6 +7546,7 @@ impl ReadTool {
         Self {
             cwd: cwd.to_path_buf(),
             text_file_client: TextFileClientScope::default(),
+            job_session_scope: None,
             workspace: WorkspaceHandle::default(),
             auto_resize,
             block_images,
@@ -7537,6 +7569,7 @@ impl ReadTool {
         Self {
             cwd: cwd.to_path_buf(),
             text_file_client: TextFileClientScope::default(),
+            job_session_scope: None,
             workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
@@ -7554,6 +7587,7 @@ impl ReadTool {
         Self {
             cwd: cwd.to_path_buf(),
             text_file_client: TextFileClientScope::default(),
+            job_session_scope: None,
             workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
@@ -7584,6 +7618,17 @@ where
 }
 
 impl ReadTool {
+    async fn resolve_scheme_document(&self, path: &str) -> Result<crate::url_router::ResolvedDoc> {
+        if !path.starts_with("agent://") {
+            return crate::url_router::resolve(path, &self.cwd);
+        }
+        let owner = AgentCx::for_current_or_request();
+        let hub = resolve_bound_tool_hub("read", self.job_session_scope.as_ref(), &owner).await?;
+        let _hub = crate::agent_hub::enter_registry(hub);
+        let _owner = owner.cx().clone().set_current_restricted();
+        crate::url_router::resolve(path, &self.cwd)
+    }
+
     async fn execute_json_query(
         &self,
         input: &ReadInput,
@@ -7613,7 +7658,8 @@ impl ReadTool {
             }
             outcome.content.into_bytes()
         } else if crate::url_router::has_scheme(&source) {
-            crate::url_router::resolve(&source, &self.cwd)?
+            self.resolve_scheme_document(&source)
+                .await?
                 .content
                 .into_bytes()
         } else {
@@ -7680,7 +7726,7 @@ impl ReadTool {
             })
             .await;
         }
-        let resolved = crate::url_router::resolve(&input.path, &self.cwd)?;
+        let resolved = self.resolve_scheme_document(&input.path).await?;
         let total_lines = resolved.content.lines().count();
         let start_line = input
             .offset
@@ -7983,6 +8029,10 @@ impl Tool for ReadTool {
 
     fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
         self.text_file_client = scope;
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = Some(scope);
     }
 
     fn name(&self) -> &str {
@@ -8826,6 +8876,7 @@ pub struct BashTool {
     command_prefix: Option<String>,
     artifact_root: Option<PathBuf>,
     job_session_scope: crate::jobs::JobSessionScope,
+    hub_session_bound: bool,
     terminal_client: TerminalClientScope,
     /// Mediation settings (`bash.mediation*`, bd-cv653.1.7).
     mediation: Option<crate::config::BashSettings>,
@@ -10169,6 +10220,7 @@ impl BashTool {
             command_prefix: None,
             artifact_root: None,
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
             terminal_client: TerminalClientScope::default(),
             mediation: None,
         }
@@ -10185,6 +10237,7 @@ impl BashTool {
             command_prefix,
             artifact_root: None,
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
             terminal_client: TerminalClientScope::default(),
             mediation: None,
         }
@@ -10511,6 +10564,7 @@ impl BashTool {
             command_prefix: None,
             artifact_root: Some(artifact_root.to_path_buf()),
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
             terminal_client: TerminalClientScope::default(),
             mediation: None,
         }
@@ -10647,13 +10701,13 @@ impl Tool for BashTool {
 
     fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
         self.job_session_scope = scope;
+        self.hub_session_bound = true;
     }
 
     fn bind_terminal_client_scope(&mut self, scope: TerminalClientScope) {
         self.terminal_client = scope;
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         tool_call_id: &str,
@@ -10667,13 +10721,36 @@ impl Tool for BashTool {
         owner
             .checkpoint()
             .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
+        let hub = resolve_bound_tool_hub(
+            "bash",
+            self.hub_session_bound.then_some(&self.job_session_scope),
+            &owner,
+        )
+        .await?;
+        crate::agent_hub::with_registry(
+            hub,
+            owner.with_current(self.execute_in_hub(tool_call_id, input, on_update, &owner)),
+        )
+        .await
+    }
+}
+
+impl BashTool {
+    #[allow(clippy::too_many_lines)]
+    async fn execute_in_hub(
+        &self,
+        tool_call_id: &str,
+        input: BashInput,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        owner: &AgentCx,
+    ) -> Result<ToolOutput> {
         let client_terminal = if input.background == Some(true) {
             None
         } else {
             self.terminal_client.get()?
         };
         if input.background != Some(true) && client_terminal.is_none() {
-            check_bash_wait_authority(&owner)?;
+            check_bash_wait_authority(owner)?;
         }
         // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
         // real pseudo-terminal when `bash.pty` is auto/always; the tool
@@ -10716,7 +10793,7 @@ impl Tool for BashTool {
                 .unwrap_or(true);
         let background_session_id =
             if input.background == Some(true) || auto_background || persistent {
-                Some(self.job_session_scope.session_id().await?)
+                Some(self.job_session_scope.invocation_session_id().await?)
             } else {
                 None
             };
@@ -14664,6 +14741,7 @@ pub struct GrepTool {
     backend: SearchBackend,
     allow_private_urls: bool,
     workspace: WorkspaceHandle,
+    job_session_scope: Option<crate::jobs::JobSessionScope>,
     #[cfg(test)]
     after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -14694,6 +14772,7 @@ impl GrepTool {
             backend,
             allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
+            job_session_scope: None,
             #[cfg(test)]
             after_scope_hook: None,
         }
@@ -14707,6 +14786,7 @@ impl GrepTool {
             backend: SearchBackend::default(),
             allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
+            job_session_scope: None,
             after_scope_hook: None,
         }
     }
@@ -14722,6 +14802,7 @@ impl GrepTool {
             backend: SearchBackend::default(),
             allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
+            job_session_scope: None,
             after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
@@ -14729,7 +14810,11 @@ impl GrepTool {
     /// Resolve through the same admitted document surfaces as ReadTool. The
     /// worker retains the caller's restricted context and cancellation budget;
     /// agent results still use the authenticated immediate-parent resolver.
-    async fn resolve_grep_resource(&self, path: &str) -> Result<GrepResource> {
+    async fn resolve_grep_resource(
+        &self,
+        path: &str,
+        agent_hub: Option<&crate::agent_hub::SharedHub>,
+    ) -> Result<GrepResource> {
         let owner = AgentCx::for_current_or_request();
         owner
             .checkpoint()
@@ -14771,7 +14856,7 @@ impl GrepTool {
         }
         let path_owned = path.to_string();
         let cwd = self.cwd.clone();
-        let hub = crate::agent_hub::current_registry();
+        let hub = agent_hub.map_or_else(crate::agent_hub::current_registry, Arc::clone);
         let resolved = asupersync::runtime::spawn_blocking(move || {
             let _hub_scope = crate::agent_hub::enter_registry(hub);
             let _guard = owner.cx().clone().set_current_restricted();
@@ -14852,12 +14937,21 @@ impl GrepTool {
         let mut lines_truncated = false;
         let mut source_truncated = false;
         let owner = AgentCx::for_current_or_request();
+        // A semicolon batch is one observation. Resolve ownership once so a
+        // session switch between resource workers cannot mix parent results.
+        let agent_hub = if paths.iter().any(|path| path.starts_with("agent://")) {
+            Some(resolve_bound_tool_hub("grep", self.job_session_scope.as_ref(), &owner).await?)
+        } else {
+            None
+        };
 
         for path in paths {
             owner
                 .checkpoint()
                 .map_err(|_| Error::tool("grep", "Command cancelled"))?;
-            let mut resource = self.resolve_grep_resource(path).await?;
+            let mut resource = owner
+                .with_current(self.resolve_grep_resource(path, agent_hub.as_ref()))
+                .await?;
             if resource.content.len() > MAX_GREP_RESOURCE_BYTES {
                 return Err(Error::tool(
                     "grep",
@@ -15568,6 +15662,10 @@ fn rg_exit_failure(status: std::process::ExitStatus, stderr: &str) -> Option<Str
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for GrepTool {
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = Some(scope);
+    }
+
     fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
         Some((&self.cwd, &self.workspace))
     }
@@ -26053,6 +26151,15 @@ mod tests {
             );
             let tool = GrepTool::new(temp.path());
             let path = format!("agent://{}/findings/0/path", accepted.id);
+            let read = ReadTool::new(temp.path())
+                .execute(
+                    "standalone-result",
+                    serde_json::json!({"path":path}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text(&read.content).contains("src/needle.rs"));
             let output = tool
                 .execute(
                     "accepted-result",
@@ -26076,6 +26183,428 @@ mod tests {
                 }), None).await.unwrap_err();
                 assert!(error.to_string().contains(code), "{error}");
             }
+        });
+    }
+
+    fn direct_agent_resource_registry(cwd: &Path, session: &str, dir: &Path) -> ToolRegistry {
+        let registry = ToolRegistry::new(&["read", "grep"], cwd, None);
+        let session = session.to_string();
+        let captured = session.clone();
+        registry.bind_job_session_resolver(Arc::new(move || {
+            let session = captured.clone();
+            Box::pin(async move { Some(session) })
+        }));
+        std::fs::create_dir_all(dir).unwrap();
+        registry
+            .job_session_scope()
+            .agent_hub_for_session(&session)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .set_dir_for_tests(dir.to_path_buf());
+        registry
+    }
+
+    fn publish_direct_agent_resource(
+        hub: &crate::agent_hub::SharedHub,
+        name: &str,
+        marker: &str,
+    ) -> crate::agent_hub::ChildEntry {
+        let entry = {
+            let mut hub = hub.lock().unwrap();
+            let entry = hub.register(name, marker).unwrap();
+            hub.settle(&entry.id, crate::agent_hub::ChildStatus::Done);
+            hub.get(&entry.id).unwrap()
+        };
+        crate::url_router::agent::publish(
+            &entry,
+            marker,
+            Some(&serde_json::json!({
+                "needle": marker,
+                "record.json": {"needle": marker},
+            })),
+            Some(true),
+            None,
+        );
+        entry
+    }
+
+    #[test]
+    fn direct_registry_reads_and_searches_use_their_own_live_parent_results() {
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let first = direct_agent_resource_registry(
+                root.path(),
+                "same-saved-session",
+                &root.path().join("first"),
+            );
+            let second = direct_agent_resource_registry(
+                root.path(),
+                "same-saved-session",
+                &root.path().join("second"),
+            );
+            let first_hub = first.job_session_scope().agent_hub().await.unwrap();
+            let second_hub = second.job_session_scope().agent_hub().await.unwrap();
+            let first_entry =
+                publish_direct_agent_resource(&first_hub, "shared", "first private needle");
+            let second_entry =
+                publish_direct_agent_resource(&second_hub, "shared", "second private needle");
+            let foreign =
+                publish_direct_agent_resource(&first_hub, "first-only", "foreign private needle");
+            assert_eq!(first_entry.id, second_entry.id);
+
+            for (registry, marker, absent) in [
+                (&first, "first private needle", "second private needle"),
+                (&second, "second private needle", "first private needle"),
+            ] {
+                for (name, input) in [
+                    (
+                        "read",
+                        serde_json::json!({"path":format!("agent://{}/needle", first_entry.id)}),
+                    ),
+                    (
+                        "grep",
+                        serde_json::json!({"pattern":"needle", "path":format!("agent://{}/needle", first_entry.id)}),
+                    ),
+                ] {
+                    let output = registry
+                        .get(name)
+                        .unwrap()
+                        .execute("direct-result", input, None)
+                        .await
+                        .unwrap();
+                    let text = get_text(&output.content);
+                    assert!(text.contains(marker), "{name}: {text}");
+                    assert!(!text.contains(absent), "{name}: {text}");
+                }
+            }
+            for name in ["read", "grep"] {
+                let path = format!("agent://{}/needle", foreign.id);
+                let input = if name == "read" {
+                    serde_json::json!({"path":path})
+                } else {
+                    serde_json::json!({"pattern":"needle", "path":path})
+                };
+                let tool = second.get(name).unwrap();
+                let error = crate::agent_hub::with_registry(
+                    Arc::clone(&first_hub),
+                    tool.execute("foreign-context", input, None),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("PI_URL_AGENT_NOT_FOUND"));
+                assert!(!error.to_string().contains("foreign private needle"));
+            }
+
+            // An Agent has already captured its owner before entering the tool.
+            // A later live resolver change must not retarget that invocation.
+            first.bind_job_session_resolver(Arc::new(|| Box::pin(async { None })));
+            let read = first.get("read").unwrap();
+            let output = crate::agent_hub::with_registry(
+                first_hub,
+                read.execute(
+                    "retained-owner",
+                    serde_json::json!({"path":format!("agent://{}/needle", first_entry.id)}),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(get_text(&output.content).contains("first private needle"));
+        });
+    }
+
+    #[test]
+    fn direct_grep_resource_batch_captures_one_parent_before_worker_dispatch() {
+        asupersync::test_utils::run_test(|| async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let root = tempfile::tempdir().unwrap();
+            let registry = direct_agent_resource_registry(
+                root.path(),
+                "first-session",
+                &root.path().join("first"),
+            );
+            let scope = registry.job_session_scope();
+            let first = scope.agent_hub_for_session("first-session").unwrap();
+            let second = scope.agent_hub_for_session("second-session").unwrap();
+            std::fs::create_dir_all(root.path().join("second")).unwrap();
+            second
+                .lock()
+                .unwrap()
+                .set_dir_for_tests(root.path().join("second"));
+            let original = publish_direct_agent_resource(&first, "shared", "original needle");
+            let replacement = publish_direct_agent_resource(&second, "shared", "replacement needle");
+            assert_eq!(original.id, replacement.id);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            scope.bind(Arc::new(move || {
+                let first = observed.fetch_add(1, Ordering::SeqCst) == 0;
+                Box::pin(async move {
+                    Some(
+                        if first { "first-session" } else { "second-session" }
+                            .to_string(),
+                    )
+                })
+            }));
+            let output = registry
+                .get("grep")
+                .unwrap()
+                .execute(
+                    "one-parent",
+                    serde_json::json!({
+                        "pattern":"needle",
+                        "path":format!("agent://{0}/needle;agent://{0}/record.json", original.id),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&output.content);
+            assert!(text.contains("original needle"));
+            assert!(!text.contains("replacement needle"));
+            assert_eq!(
+                output.details.as_ref().unwrap()["resources"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2,
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn direct_tool_session_lookup_fails_closed_and_remains_cancellable() {
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("visible.txt"), "ordinary needle").unwrap();
+            let mut registry = direct_agent_resource_registry(
+                root.path(),
+                "resource-owner",
+                &root.path().join("hub"),
+            );
+            registry.push(Box::new(BashTool::new(root.path())));
+            let scope = registry.job_session_scope();
+            let hub = scope.agent_hub_for_session("resource-owner").unwrap();
+            let entry = publish_direct_agent_resource(&hub, "shared", "private needle");
+            let request = |name: &str| {
+                let path = format!("agent://{}/needle", entry.id);
+                match name {
+                    "read" => serde_json::json!({"path":path}),
+                    "grep" => serde_json::json!({"pattern":"needle", "path":path}),
+                    "bash" => serde_json::json!({"command":"printf forbidden > started", "background":true}),
+                    _ => unreachable!("fixture tool"),
+                }
+            };
+            scope.bind(Arc::new(|| Box::pin(async { None })));
+            for name in ["read", "grep"] {
+                let tool = registry.get(name).unwrap();
+                let error = tool
+                    .execute("unavailable", request(name), None)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("PI_JOBS_SESSION_UNAVAILABLE"));
+                let local = if name == "read" {
+                    serde_json::json!({"path":"visible.txt"})
+                } else {
+                    serde_json::json!({"pattern":"needle", "path":"visible.txt"})
+                };
+                let output = tool.execute("local-resource", local, None).await.unwrap();
+                assert!(get_text(&output.content).contains("ordinary needle"));
+            }
+            let query_error = registry
+                .get("read")
+                .unwrap()
+                .execute(
+                    "query-owner",
+                    serde_json::json!({"path":format!("agent://{}/record.json?q=.needle", entry.id)}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(query_error.to_string().contains("PI_JOBS_SESSION_UNAVAILABLE"));
+            let bash_error = registry
+                .get("bash")
+                .unwrap()
+                .execute("unavailable-shell", request("bash"), None)
+                .await
+                .unwrap_err();
+            assert!(bash_error.to_string().contains("PI_JOBS_SESSION_UNAVAILABLE"));
+
+            for name in ["read", "grep", "bash"] {
+                scope.bind(Arc::new(|| Box::pin(futures::future::pending())));
+                let owner = AgentCx::for_request();
+                let tool = registry.get(name).unwrap();
+                let mut pending = Box::pin(owner.with_current(tool.execute(
+                    "pending-owner",
+                    request(name),
+                    None,
+                )));
+                assert!(futures::poll!(pending.as_mut()).is_pending());
+                owner.set_cancel_requested(true);
+                let std::task::Poll::Ready(Err(error)) = futures::poll!(pending.as_mut()) else {
+                    panic!("cancelled session lookup must retire without waiting for its resolver");
+                };
+                assert!(error.to_string().contains("cancelled"));
+                drop(pending);
+
+                let owner = AgentCx::for_request();
+                let resolver_owner = owner.clone();
+                scope.bind(Arc::new(move || {
+                    resolver_owner.set_cancel_requested(true);
+                    Box::pin(async { Some("resource-owner".to_string()) })
+                }));
+                let error = owner
+                    .with_current(tool.execute("ready-cancelled", request(name), None))
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("cancelled"));
+            }
+            assert!(!root.path().join("started").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_registry_can_read_and_search_a_child_it_actually_launched() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let global = root.path().join("global");
+            std::fs::create_dir_all(global.join("agents")).unwrap();
+            std::fs::write(
+                global.join("agents/scout.md"),
+                "---\nname: scout\ndescription: direct SDK result fixture\n---\nComplete the task.\n",
+            )
+            .unwrap();
+            let child = root.path().join("child.sh");
+            std::fs::write(
+                &child,
+                r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"direct SDK native needle"}]}]}'
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut registry = direct_agent_resource_registry(
+                root.path(),
+                "native-result-owner",
+                &root.path().join("hub"),
+            );
+            registry.push(Box::new(crate::subagents::SubagentTool::with_paths(
+                root.path().to_path_buf(),
+                global,
+                child,
+            )));
+            let output = registry
+                .get("subagent")
+                .unwrap()
+                .execute(
+                    "native-child",
+                    serde_json::json!({"agent":"scout", "task":"return a result"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!output.is_error, "{output:?}");
+            let id = output.details.as_ref().unwrap()["results"][0]["hubId"]
+                .as_str()
+                .unwrap();
+            for (name, input) in [
+                ("read", serde_json::json!({"path":format!("agent://{id}")})),
+                (
+                    "grep",
+                    serde_json::json!({"pattern":"native needle", "path":format!("agent://{id}")}),
+                ),
+            ] {
+                let output = registry
+                    .get(name)
+                    .unwrap()
+                    .execute("native-result", input, None)
+                    .await
+                    .unwrap();
+                assert!(get_text(&output.content).contains("direct SDK native needle"));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_registry_shell_jobs_keep_their_live_parent_authority() {
+        let _guard = crate::jobs::process_test_guard();
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let owner = format!("direct-shell-{}", uuid::Uuid::new_v4());
+            let mut registry = direct_agent_resource_registry(
+                root.path(),
+                &owner,
+                &root.path().join("hub"),
+            );
+            registry.push(Box::new(BashTool::with_artifact_root(
+                root.path(),
+                root.path(),
+            )));
+            registry.push(Box::new(JobsTool::new()));
+            let output = registry
+                .get("bash")
+                .unwrap()
+                .execute(
+                    "direct-shell",
+                    serde_json::json!({"command":"printf owned-shell-result", "background":true, "timeout":5}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!output.is_error, "{output:?}");
+            let id = output.details.as_ref().unwrap()["id"].as_str().unwrap();
+            let result = registry
+                .get("jobs")
+                .unwrap()
+                .execute(
+                    "owned-wait",
+                    serde_json::json!({"action":"wait", "jobId":id, "timeoutMs":5000}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!result.is_error);
+            assert!(get_text(&result.content).contains("owned-shell-result"));
+
+            let mut foreign = JobsTool::new();
+            foreign.bind_job_session_scope(crate::jobs::JobSessionScope::fixed(owner.clone()));
+            let visible = foreign
+                .execute("foreign-list", serde_json::json!({"action":"list"}), None)
+                .await
+                .unwrap();
+            assert!(
+                visible.details.as_ref().unwrap()["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            let error = foreign
+                .execute(
+                    "foreign-wait",
+                    serde_json::json!({"action":"wait", "jobId":id, "timeoutMs":0}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("PI_JOBS_UNKNOWN_ID"));
+
+            let hub = registry
+                .job_session_scope()
+                .agent_hub_for_session(&owner)
+                .unwrap();
+            let notices = crate::agent_hub::with_registry(hub, async {
+                crate::jobs::take_completion_notices(&owner)
+            })
+            .await;
+            assert_eq!(notices.len(), 1);
         });
     }
 

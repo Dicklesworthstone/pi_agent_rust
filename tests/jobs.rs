@@ -66,9 +66,23 @@ fn bash_tool(root: &std::path::Path) -> pi::tools::BashTool {
     bash_tool_for_session(root, TEST_SESSION_ID)
 }
 
+// These helpers model tools mounted in the same live registry. A saved ID
+// alone no longer grants one separately constructed tool another's job access.
+fn job_scope(session_id: &str) -> pi::jobs::JobSessionScope {
+    type Scopes = std::sync::Mutex<std::collections::HashMap<String, pi::jobs::JobSessionScope>>;
+    static SCOPES: std::sync::LazyLock<Scopes> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    SCOPES
+        .lock()
+        .expect("test scopes")
+        .entry(session_id.to_string())
+        .or_insert_with(|| pi::jobs::JobSessionScope::fixed(session_id))
+        .clone()
+}
+
 fn bash_tool_for_session(root: &std::path::Path, session_id: &str) -> pi::tools::BashTool {
     let mut tool = pi::tools::BashTool::new(root);
-    tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(session_id));
+    tool.bind_job_session_scope(job_scope(session_id));
     tool
 }
 
@@ -89,7 +103,7 @@ fn auto_bash_tool(
 
 fn jobs_tool_for_session(session_id: &str) -> pi::tools::JobsTool {
     let mut tool = pi::tools::JobsTool::new();
-    tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(session_id));
+    tool.bind_job_session_scope(job_scope(session_id));
     tool
 }
 

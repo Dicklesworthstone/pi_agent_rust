@@ -148,6 +148,9 @@ pub struct AgentHubRegistry {
     /// Immutable for scoped registries. The explicit standalone hub has no
     /// durable owner and retains its original host-selected owner contract.
     owner_session_id: Option<String>,
+    /// Retained separately from the SDK handle so old tool and worker clones
+    /// cannot admit jobs after their live parent has begun retiring.
+    job_scope: Option<Arc<crate::jobs::JobScopeLifecycle>>,
     entries: BTreeMap<String, ChildEntry>,
     /// Process-control authority ends at reap, even when an accepted result
     /// still awaits ordered worktree application. Entry PIDs remain history.
@@ -325,6 +328,20 @@ impl AgentHubRegistry {
         }
     }
 
+    pub(crate) fn for_job_scope(
+        session_id: &str,
+        scope: Arc<crate::jobs::JobScopeLifecycle>,
+    ) -> Self {
+        Self {
+            job_scope: Some(scope),
+            ..Self::for_session(session_id)
+        }
+    }
+
+    pub(crate) fn job_scope(&self) -> Option<Arc<crate::jobs::JobScopeLifecycle>> {
+        self.job_scope.clone()
+    }
+
     pub(crate) fn admits_native_owner(&self, session_id: &str) -> bool {
         self.owner_session_id
             .as_deref()
@@ -417,6 +434,9 @@ impl AgentHubRegistry {
 
     /// Register a child with an explicit spawn kind.
     pub fn register_kind(&mut self, name: &str, task: &str, kind: ChildKind) -> Result<ChildEntry> {
+        if let Some(scope) = &self.job_scope {
+            scope.ensure_open()?;
+        }
         let seq = self
             .seq
             .checked_add(1)
@@ -526,6 +546,9 @@ impl AgentHubRegistry {
     /// transcript I/O and registers nothing, so a refused preparation leaves
     /// no Starting entry behind.
     pub(crate) fn native_revival_source(&self, id: &str) -> Result<RevivalSource> {
+        if let Some(scope) = &self.job_scope {
+            scope.ensure_open()?;
+        }
         let entry = self
             .entries
             .get(id)

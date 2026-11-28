@@ -7,9 +7,8 @@ use super::{
     JobDelivery, JobEntry, JobSnapshot, JobStatus, JobWaitHandle, MAX_ARTIFACT_BYTES,
     MAX_ARTIFACT_FILES, MAX_TOTAL_ARTIFACT_BYTES, MIN_RETAINED_ARTIFACT_FILES, OUTPUT_TAIL_BYTES,
     TailBuffer, acquire_artifact_budget_lock, capture_session_spawn_generation,
-    create_job_artifact, enforce_artifact_retention, ensure_process_accepting_jobs,
-    ensure_session_spawn_generation, lifecycle_lock, now_ms, registry, reserve_job_slot,
-    session_closing_error, settle_job_and_enqueue_notice, settle_job_without_notice,
+    create_job_artifact, enforce_artifact_retention, lifecycle_lock, now_ms, registry,
+    reserve_job_slot, settle_job_and_enqueue_notice, settle_job_without_notice,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -365,7 +364,7 @@ where
         let mut receiving = Box::pin(receiver.recv(owner.cx()));
         let received = loop {
             check_owner(&owner)?;
-            ensure_session_spawn_generation(&attempt.owner_session_id, attempt.generation())?;
+            attempt.check()?;
             check_task_deadline(started, timeout)?;
             let time = owner.time();
             let remaining = timeout
@@ -408,8 +407,7 @@ impl NativeTaskLaunch {
     fn check(&self) -> Result<()> {
         let setup_error = |error| self.artifact_cleanup.with_partial_cleanup(error);
         check_owner(&self.owner).map_err(setup_error)?;
-        ensure_session_spawn_generation(&self.attempt.owner_session_id, self.attempt.generation())
-            .map_err(setup_error)?;
+        self.attempt.check().map_err(setup_error)?;
         check_task_deadline(self.started, self.timeout).map_err(setup_error)
     }
 
@@ -485,7 +483,7 @@ fn prepare_native_task<F>(
         timeout.min(deadline.saturating_duration_since(started))
     });
     check_task_deadline(started, timeout)?;
-    ensure_session_spawn_generation(&admission.0.owner_session_id, admission.0.generation())?;
+    admission.0.check()?;
     let reservation = reserve_job_slot()?;
     Ok(PreparedNativeTask {
         attempt: Arc::new(admission.0),
@@ -535,7 +533,7 @@ where
                 "PI_JOBS_TASK_CANCELLED: task launch abandoned",
             ));
         }
-        ensure_session_spawn_generation(owner_session_id, attempt.generation())?;
+        attempt.check()?;
         check_task_deadline(started, timeout)
     };
     check_admission()?;
@@ -573,21 +571,14 @@ where
         let mut reg = registry()
             .lock()
             .map_err(|_| setup_error(Error::tool("jobs", "jobs registry poisoned")))?;
-        ensure_process_accepting_jobs(&reg).map_err(setup_error)?;
-        let generation = reg
-            .owner_shutdown_generations
-            .get(owner_session_id)
-            .copied()
-            .unwrap_or_default();
-        if reg.closing_owners.contains_key(owner_session_id) || generation != attempt.generation() {
-            return Err(setup_error(session_closing_error(owner_session_id)));
-        }
+        attempt.check_publication(&reg).map_err(setup_error)?;
         let entry = JobEntry {
             schema: TASK_SCHEMA,
             result: None,
             result_bytes: 0,
             owner_session_id: owner_session_id.to_string(),
             hub_registry: Some(Arc::clone(&work.hub)),
+            scope_lifecycle: attempt.scope_lifecycle.clone(),
             delivery: JobDelivery::Foreground,
             id: id.clone(),
             command: label,
@@ -612,6 +603,7 @@ where
         let handle = JobWaitHandle {
             owner_session_id: owner_session_id.to_string(),
             hub_registry: entry.hub_registry.clone(),
+            scope_lifecycle: entry.scope_lifecycle.clone(),
             id: id.clone(),
             settled_snapshot: Arc::clone(&entry.settled_snapshot),
             settled_notify: Arc::clone(&entry.settled_notify),
@@ -1181,6 +1173,47 @@ mod tests {
         assert!(observed.load(Ordering::Acquire));
         assert!(super::super::list(&session).unwrap().is_empty());
         assert!(!super::super::has_pending_work(&session).unwrap());
+    }
+
+    #[test]
+    fn retired_scope_rejects_queued_native_work_before_its_first_poll() {
+        let _guard = super::super::process_test_guard();
+        let session = owner_id();
+        let root = tempfile::tempdir().unwrap();
+        let scope = super::super::JobSessionScope::fixed(session.clone());
+        let hub = scope.agent_hub_for_session(&session).unwrap();
+        let _hub = crate::agent_hub::enter_registry(Arc::clone(&hub));
+        let admission = admit_owned_task(&session).unwrap();
+        let probe = Arc::new(AdmissionProbe::default());
+        let hook = super::super::tests::install_spawn_background_test_hooks(
+            super::super::SpawnBackgroundTestHooks {
+                owner_session_id: Some(session.clone()),
+                before_native_registry_publication: Some({
+                    let scope = scope.clone();
+                    Arc::new(move || drop(scope.begin_shutdown().unwrap()))
+                }),
+                ..super::super::SpawnBackgroundTestHooks::default()
+            },
+        );
+        let error = super::spawn_owned_task(
+            admission,
+            "scope closure race",
+            AgentCx::for_request(),
+            Duration::from_secs(10),
+            Some(root.path()),
+            privacy(),
+            QueuedWork(Arc::clone(&probe)),
+        )
+        .expect_err("a retained admission cannot publish after scope retirement");
+        drop(hook);
+        assert!(error.to_string().contains("PI_JOBS_SCOPE_CLOSED"));
+        assert!(!probe.polled.load(Ordering::Acquire));
+        assert_eq!(probe.drops.load(Ordering::Acquire), 1);
+        assert!(super::super::list(&session).unwrap().is_empty());
+        assert!(!super::super::has_pending_work(&session).unwrap());
+        assert!(admit_owned_task(&session).is_err());
+        assert!(hub.lock().unwrap().register("late", "must not start").is_err());
+        futures::executor::block_on(scope.begin_shutdown().unwrap().finish()).unwrap();
     }
 
     #[derive(Default)]

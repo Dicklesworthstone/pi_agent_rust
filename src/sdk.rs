@@ -3174,13 +3174,15 @@ impl AgentSessionHandle {
 
     async fn shutdown_runtime_resources(
         self,
-        owner_session_id: Option<&str>,
+        job_shutdown: Result<crate::jobs::JobScopeShutdown>,
         service_shutdown: Result<crate::hub::ServiceShutdown>,
         mut report: SessionResourceShutdown,
     ) -> SessionResourceShutdown {
-        if let Some(owner_session_id) = owner_session_id
-            && let Err(err) = crate::jobs::kill_session(owner_session_id).await
-        {
+        let job_result = match job_shutdown {
+            Ok(shutdown) => shutdown.finish().await,
+            Err(error) => Err(error),
+        };
+        if let Err(err) = job_result {
             let warning = format!("failed to stop session-owned background jobs: {err}");
             tracing::warn!(event = "sdk.session.shutdown.jobs_failed", "{warning}");
             report.fail(warning);
@@ -3250,11 +3252,12 @@ impl AgentSessionHandle {
         session_actions.advance_generation();
         drop(session);
         drop(session_action_permit);
+        let job_shutdown = self.session.agent.job_session_scope().begin_shutdown();
         let service_shutdown = crate::hub::begin_registry_shutdown(
             &self.session.agent.service_owner(&owner_session_id),
         );
         self.shutdown_runtime_resources(
-            Some(owner_session_id.as_str()),
+            job_shutdown,
             service_shutdown,
             SessionResourceShutdown::default(),
         )
@@ -3265,28 +3268,18 @@ impl AgentSessionHandle {
     /// Its session state is intentionally not autosaved, but every owner-scoped
     /// runtime family is still attempted without process-wide job cleanup.
     pub(crate) async fn discard_uncommitted_resources(self) -> SessionResourceShutdown {
-        // Stop this live registry before awaiting even the session lock. A
-        // cancelled discard must not leave its services or late admissions live.
+        // Retire this candidate's live registry without resolving the saved
+        // owner. A same-ID active handle retains its independent resources,
+        // even when the discarded candidate's store cannot be locked.
+        let job_shutdown = self.session.agent.job_session_scope().begin_shutdown();
         let service_shutdown =
             crate::hub::begin_registry_shutdown(&self.session.agent.service_owner(""));
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let mut report = SessionResourceShutdown::default();
-        let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
-            Arc::clone(&self.session.session),
-            cx.cx(),
+        self.shutdown_runtime_resources(
+            job_shutdown,
+            service_shutdown,
+            SessionResourceShutdown::default(),
         )
         .await
-        {
-            Ok(session) => Some(session.header.id.clone()),
-            Err(err) => {
-                let warning = format!("failed to resolve discarded session ownership: {err}");
-                tracing::warn!(event = "sdk.session.discard.owner_failed", "{warning}");
-                report.fail(warning);
-                None
-            }
-        };
-        self.shutdown_runtime_resources(owner_session_id.as_deref(), service_shutdown, report)
-            .await
     }
 
     /// Await shutdown of every runtime resource owned by this session.
@@ -3294,20 +3287,20 @@ impl AgentSessionHandle {
     /// Final driver exit uses this exhaustive seam: persistence or ownership
     /// failures are reported, but they never skip later independent cleanup.
     pub async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
-        // Registry ownership needs no durable-ID lookup. Publish its fence
+        // Registry ownership needs no durable-ID lookup. Publish both fences
         // before the first lock/save await so cancellation cannot skip cleanup.
+        let job_shutdown = self.session.agent.job_session_scope().begin_shutdown();
         let service_shutdown =
             crate::hub::begin_registry_shutdown(&self.session.agent.service_owner(""));
         let mut report = SessionResourceShutdown::default();
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
+        match asupersync::sync::OwnedMutexGuard::lock(
             Arc::clone(&self.session.session),
             cx.cx(),
         )
         .await
         {
             Ok(mut session) => {
-                let owner_session_id = session.header.id.clone();
                 if self.session.save_enabled() {
                     let budget = self.session.agent.cost_budget();
                     // A late-cost journal needs an acknowledged baseline,
@@ -3373,19 +3366,17 @@ impl AgentSessionHandle {
                         }
                     }
                 }
-                Some(owner_session_id)
             }
             Err(err) => {
                 let warning = format!("failed to lock session for resource shutdown: {err}");
                 tracing::warn!(
-                    event = "sdk.session.shutdown.jobs_owner_failed",
+                    event = "sdk.session.shutdown.store_failed",
                     "{warning}"
                 );
                 report.fail(warning);
-                None
             }
-        };
-        self.shutdown_runtime_resources(owner_session_id.as_deref(), service_shutdown, report)
+        }
+        self.shutdown_runtime_resources(job_shutdown, service_shutdown, report)
             .await
     }
 
@@ -12580,7 +12571,14 @@ printf sdk-owned-command-key
                 } else {
                     Box::pin(handle.shutdown_owned_resources())
                 };
-                assert!(futures::poll!(closing.as_mut()).is_pending());
+                let first_poll = futures::poll!(closing.as_mut());
+                if discard {
+                    if let std::task::Poll::Ready(report) = first_poll {
+                        assert!(report.completed_cleanly(), "{report:?}");
+                    }
+                } else {
+                    assert!(first_poll.is_pending());
+                }
                 drop(closing);
                 let stopped = crate::hub::describe(&owner, &launch.name).unwrap();
                 assert!(
@@ -12594,7 +12592,7 @@ printf sdk-owned-command-key
                     .expect_err(
                         "retained registry scope must stay retired after shutdown is dropped",
                     );
-                assert!(error.to_string().contains("PI_HUB_SESSION_RETIRED"));
+                assert!(error.to_string().contains("PI_JOBS_SCOPE_CLOSED"));
                 // Observe cleanup without issuing another stop, which would
                 // conceal a missing retirement in the abandoned future.
                 wait_for_sdk_service_reap(&owner, &launch.name, pid).await;
@@ -12665,8 +12663,189 @@ printf sdk-owned-command-key
     }
 
     #[cfg(unix)]
+    struct SdkJobCleanup(String);
+
+    #[cfg(unix)]
+    impl Drop for SdkJobCleanup {
+        fn drop(&mut self) {
+            // Preserve a bounded cleanup path if a regression assertion fails.
+            if let Ok(jobs) = crate::jobs::list(&self.0) {
+                for job in jobs {
+                    if job.status == crate::jobs::JobStatus::Running.as_str() {
+                        let _ = crate::jobs::cancel(&self.0, &job.id);
+                    }
+                }
+            }
+            let _ = crate::jobs::take_completion_notices(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn sdk_owned_test_jobs(
+        scope: &crate::jobs::JobSessionScope,
+        session_id: &str,
+        directory: &Path,
+    ) -> Vec<crate::jobs::JobSnapshot> {
+        let hub = scope.agent_hub_for_session(session_id).expect("owned hub");
+        let _scope = crate::agent_hub::enter_registry(hub);
+        let shell = crate::jobs::spawn_background(
+            session_id,
+            directory,
+            None,
+            None,
+            "sleep 300",
+            Some(300),
+            Some(directory),
+        )
+        .expect("owned shell job");
+        let native = crate::jobs::spawn_owned_task(
+            crate::jobs::admit_owned_task(session_id).expect("native admission"),
+            "SDK native shutdown fixture",
+            crate::agent_cx::AgentCx::for_testing_with_io(),
+            Duration::from_secs(300),
+            Some(directory),
+            crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(
+                crate::text_completion::AuxiliaryPrivacy::from_settings(None),
+            ),
+            futures::future::pending::<Result<crate::tools::ToolOutput>>(),
+        )
+        .expect("owned native job");
+        vec![shell, native]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sdk_shutdown_and_discard_preserve_same_id_peer_jobs() {
+        let _jobs = crate::jobs::process_test_guard();
+        for discard in [false, true] {
+            let directory = tempdir().expect("tempdir");
+            let active = saving_handle(directory.path());
+            let candidate = saving_handle(directory.path());
+            run_async(async {
+                let path = {
+                    let store = active.session_store();
+                    let mut session = store.try_lock().unwrap();
+                    session.save().await.expect("save active session");
+                    session.path.clone().expect("saved path")
+                };
+                let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+                let session_id = reopened.header.id.clone();
+                *candidate.session_store().try_lock().unwrap() = reopened;
+                let _cleanup = SdkJobCleanup(session_id.clone());
+                let active_scope = active.session.agent.job_session_scope();
+                let candidate_scope = candidate.session.agent.job_session_scope();
+                let candidate_hub = candidate_scope
+                    .agent_hub_for_session(&session_id)
+                    .expect("candidate hub");
+                let active_jobs =
+                    sdk_owned_test_jobs(&active_scope, &session_id, directory.path());
+                let candidate_jobs =
+                    sdk_owned_test_jobs(&candidate_scope, &session_id, directory.path());
+
+                let report = if discard {
+                    // Discard has no persistence responsibility and must not
+                    // wait on a same-file candidate's session store to retire it.
+                    let candidate_store = candidate.session_store();
+                    let held_store = candidate_store.try_lock().unwrap();
+                    let report = asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_secs(15),
+                        candidate.discard_uncommitted_resources(),
+                    )
+                    .await
+                    .expect("discard does not require a session lock");
+                    drop(held_store);
+                    report
+                } else {
+                    candidate.shutdown_owned_resources().await
+                };
+                assert!(report.completed_cleanly(), "{report:?}");
+                for job in candidate_jobs {
+                    let stopped =
+                        crate::jobs::wait(&session_id, &job.id, Duration::ZERO).unwrap();
+                    assert_eq!(stopped.status, crate::jobs::JobStatus::Killed.as_str());
+                }
+                for job in &active_jobs {
+                    let running =
+                        crate::jobs::wait(&session_id, &job.id, Duration::ZERO).unwrap();
+                    assert_eq!(running.status, crate::jobs::JobStatus::Running.as_str());
+                }
+                {
+                    let _scope = crate::agent_hub::enter_registry(candidate_hub);
+                    assert!(crate::jobs::admit_owned_task(&session_id).is_err());
+                    assert!(
+                        crate::jobs::spawn_background(
+                            &session_id,
+                            directory.path(),
+                            None,
+                            None,
+                            "printf must-not-launch",
+                            Some(30),
+                            Some(directory.path()),
+                        )
+                        .is_err()
+                    );
+                }
+                assert!(active.shutdown_owned_resources().await.completed_cleanly());
+                for job in active_jobs {
+                    let stopped =
+                        crate::jobs::wait(&session_id, &job.id, Duration::ZERO).unwrap();
+                    assert_eq!(stopped.status, crate::jobs::JobStatus::Killed.as_str());
+                }
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_sdk_shutdown_retires_jobs_before_waiting_for_the_store() {
+        let _jobs = crate::jobs::process_test_guard();
+        let directory = tempdir().expect("tempdir");
+        let handle = saving_handle(directory.path());
+        let store = handle.session_store();
+        let session_id = store.try_lock().unwrap().header.id.clone();
+        let _cleanup = SdkJobCleanup(session_id.clone());
+        let scope = handle.session.agent.job_session_scope();
+        let hub = scope.agent_hub_for_session(&session_id).unwrap();
+        let jobs = sdk_owned_test_jobs(&scope, &session_id, directory.path());
+
+        run_async(async {
+            let held_store = store.try_lock().unwrap();
+            let mut shutdown = Box::pin(handle.shutdown_owned_resources());
+            assert!(futures::poll!(shutdown.as_mut()).is_pending());
+            drop(shutdown);
+            drop(held_store);
+            for job in jobs {
+                let stopped = crate::jobs::wait_async(
+                    &session_id,
+                    &job.id,
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect("shutdown cancellation continues after future drop");
+                assert_eq!(stopped.status, crate::jobs::JobStatus::Killed.as_str());
+            }
+            let _scope = crate::agent_hub::enter_registry(hub);
+            assert!(crate::jobs::admit_owned_task(&session_id).is_err());
+            assert!(
+                crate::jobs::spawn_background(
+                    &session_id,
+                    directory.path(),
+                    None,
+                    None,
+                    "printf must-not-launch",
+                    Some(30),
+                    Some(directory.path()),
+                )
+                .is_err()
+            );
+        });
+    }
+
+    #[cfg(unix)]
     #[test]
     fn shutdown_stops_background_jobs_owned_by_the_session() {
+        let _jobs = crate::jobs::process_test_guard();
         let tmp = tempdir().expect("tempdir");
         let (warnings, session_id, job_id) = run_async(async {
             let handle = create_agent_session(hermetic_session_options(tmp.path()))
@@ -12682,16 +12861,26 @@ printf sdk-owned-command-key
                 .header
                 .id
                 .clone();
-            let job = crate::jobs::spawn_background(
-                &session_id,
-                tmp.path(),
-                None,
-                None,
-                "sleep 300",
-                Some(300),
-                None,
-            )
-            .expect("spawn session-owned background job");
+            let _cleanup = SdkJobCleanup(session_id.clone());
+            let job = {
+                let hub = handle
+                    .session
+                    .agent
+                    .job_session_scope()
+                    .agent_hub_for_session(&session_id)
+                    .expect("owned hub");
+                let _scope = crate::agent_hub::enter_registry(hub);
+                crate::jobs::spawn_background(
+                    &session_id,
+                    tmp.path(),
+                    None,
+                    None,
+                    "sleep 300",
+                    Some(300),
+                    Some(tmp.path()),
+                )
+                .expect("spawn session-owned background job")
+            };
             let warnings = handle.shutdown_owned_resources().await;
             (warnings, session_id, job.id)
         });

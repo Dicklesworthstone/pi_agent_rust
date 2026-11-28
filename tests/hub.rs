@@ -1361,7 +1361,7 @@ fn hub_jobs_group_wraps_background_jobs() {
 
     // Spawn a background job through the bash tool, then manage it via hub.
     let mut bash = pi::tools::BashTool::new(&root);
-    bash.bind_job_session_scope(pi::jobs::JobSessionScope::fixed("hub-integration-session"));
+    bash.bind_job_session_scope(hub_scope("hub-integration-session"));
     let out = block_on_local(bash.execute(
         "call-1",
         json!({"command": "echo hub-jobs-marker", "background": true, "timeout": 30}),
@@ -1405,7 +1405,7 @@ fn hub_jobs_group_hides_foreign_session_jobs() {
     let owner = format!("hub-owner-{}", uuid::Uuid::new_v4().simple());
     let foreign = format!("hub-foreign-{}", uuid::Uuid::new_v4().simple());
     let mut bash = pi::tools::BashTool::new(&root);
-    bash.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(owner.clone()));
+    bash.bind_job_session_scope(hub_scope(&owner));
     let output = block_on_local(bash.execute(
         "owner-job",
         json!({

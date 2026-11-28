@@ -787,12 +787,21 @@ explicit tool allowlist must include `hub` to enable this capability. A child's
 {"op":"agent","action":"send","name":"parent","text":"I found a blocking dependency."}
 ```
 
-Child controls, parent inboxes, accepted `agent://` results, and native background
+Child controls, parent inboxes, accepted `agent://` results, and background
 job delivery retain their originating live session. Separately loaded handles
 of the same saved session have independent child authority; cloned SDK scopes
 share it. `/hub`, `/tan`, retained workers, and pooled delegation use that same
 ownership, including during cancellation and cleanup. The low-level SDK's
 explicit durable-owner job observation and teardown APIs remain owner-wide.
+
+SDK handle shutdown and replacement retire only that handle's live job scope,
+including shell and native jobs from sessions previously selected within it.
+The admission fence and cancellation requests are installed before waiting for
+session saves or locks. Dropping shutdown leaves the fence closed; awaiting it
+confirms bounded cancellation, process reaping, and output draining. Discarding
+a replacement candidate cannot stop an active handle's jobs merely because
+both loaded the same saved session. Bound SDK `read` and `grep` calls also
+resolve `agent://` results through the same live owner as native delegation.
 
 Sibling messages enter the recipient's steering queue between turns and remain
 available in its inbox. The parent reads child reports with

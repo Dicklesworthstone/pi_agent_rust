@@ -2435,6 +2435,13 @@ impl Agent {
         self.job_session_scope.service_owner(session_id)
     }
 
+    /// Retained runtime identity, independent of the currently selected saved
+    /// session or a resolver that may be waiting for its store lock.
+    #[must_use]
+    pub(crate) fn job_session_scope(&self) -> crate::jobs::JobSessionScope {
+        self.job_session_scope.clone()
+    }
+
     /// Create a new agent over an already-shared tool registry.
     pub fn with_shared_tools(
         provider: Arc<dyn Provider>,

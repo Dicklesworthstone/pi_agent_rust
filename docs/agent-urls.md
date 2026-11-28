@@ -9,7 +9,7 @@ transcript into the parent context:
 {"path":"agent://scout-1/findings/0/path"}
 ```
 
-The first call lists the current parent process's child IDs and statuses. Use
+The first call lists the current live parent session's child IDs and statuses. Use
 an ID from that roster, not just an agent definition name. The second reads
 its final output. The third extracts a JSON field: slash components are literal
 object keys or decimal array indices. Percent-encode `/` inside a key as `%2F`.
@@ -39,6 +39,16 @@ unretained terminal run remains visible by status; projecting its output
 returns `PI_URL_AGENT_OUTPUT_UNAVAILABLE`. Hub transcripts are independent.
 Run IDs are qualified internally by the hub's private namespace, so reusing a
 display ID cannot expose a previous namespace's output.
+
+Tools mounted in one SDK `ToolRegistry` share the same live parent scope.
+A direct `subagent.execute(...)` call can therefore be followed by direct
+`read.execute(...)` or `grep.execute(...)` calls on that registry. Separately
+constructed registries remain independent even when they load the same saved
+session ID. Clone the registry's `JobSessionScope` when manually binding tools
+that should share ownership. A resource batch captures its owner once, so a
+session switch cannot mix results from different parents within one search.
+Unavailable or cancelled session resolution fails before accessing results;
+ordinary filesystem reads and searches do not require a live child hub.
 
 This surface does not yet resolve another process's hub, persist result URLs
 across application restarts, or send messages through `write agent://`.
